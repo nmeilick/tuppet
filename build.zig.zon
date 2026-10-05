@@ -1,0 +1,20 @@
+.{
+    .name = .tuppet,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x606f63c02a5621a1,
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/3924a3255686b2b646d2ee8730ad5528f4542a26.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBC7iQRQVrqpYPtFZe3NAoyFIFd4fNSuGLYBUze_Nb",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+    },
+}
