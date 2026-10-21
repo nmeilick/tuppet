@@ -1,0 +1,51 @@
+.{
+    .name = .tuppet,
+    .version = "0.3.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x606f63c02a5621a1,
+    .dependencies = .{
+        .ghostty = .{
+            .url = "https://github.com/ghostty-org/ghostty/archive/67edd20a0292629da7e01b64973de19d356df487.tar.gz",
+            .hash = "ghostty-1.3.2-dev-5UdBC5-ZfwWp9_Xj0ahOkUHtNOZapriORDYvEH8RLnH_",
+        },
+        // GNU Unifont, the bitmap font of every build; tools/unifont.zig packs it.
+        .unifont = .{
+            .url = "https://unifoundry.com/pub/unifont/unifont-18.0.01/unifont-18.0.01.tar.gz",
+            .hash = "N-V-__8AAOlz0geK6TkC1zYkYWeWs465Swl7GEVT8UuSeisp",
+            .lazy = true,
+        },
+        // JetBrains Mono, the TrueType font of medium and full builds.
+        .jetbrains_mono = .{
+            .url = "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip",
+            .hash = "N-V-__8AADWVlwASf7XCdCqpjVW5Jv_7oogANJ_H4_dIoEp6",
+            .lazy = true,
+        },
+        // JuliaMono, Symbols Nerd Font Mono, and Noto Sans Mono CJK SC, the
+        // further TrueType fonts of full builds.
+        .juliamono = .{
+            .url = "https://github.com/cormullion/juliamono/releases/download/v0.63.2/JuliaMono-ttf.tar.gz",
+            .hash = "N-V-__8AAO_MygLQ2bW05dbe4ZQvvM_U3sloKNQP1s98O_x4",
+            .lazy = true,
+        },
+        .nerd_fonts_symbols = .{
+            .url = "https://github.com/ryanoasis/nerd-fonts/releases/download/v3.5.1/NerdFontsSymbolsOnly.tar.xz",
+            .hash = "N-V-__8AAMlwTwAhAtzTNEG7Eg4j7oI33o0_gzLbwDalYZEE",
+            .lazy = true,
+        },
+        .noto_cjk_sc = .{
+            .url = "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/13_NotoSansMonoCJKsc.zip",
+            .hash = "N-V-__8AABH7_AF4E7anvbCFFVeHufFK2dcPEQ79IkZYP8QQ",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools",
+        "assets",
+        "LICENSE",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+    },
+}

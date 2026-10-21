@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Pinned rather than ubuntu-latest, so that a new runner image cannot
+# change the test environment unannounced; release.yml uses the same one.
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Format, unit and end-to-end tests
+        run: make check
+      - name: Cross-compile all release targets
+        run: zig build matrix
+      - name: Check that the binaries are self-contained
+        run: test/static.sh zig-out/matrix
+
+  # The lean and full font variants: unit tests, all release targets, and
+  # the PNG test against the x86_64 Linux release binary.
+  variant:
+    name: ${{ matrix.fonts }} build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        fonts: [lean, full]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+          cache-key: ${{ matrix.fonts }}
+      - name: Unit tests
+        run: zig build test -Dfonts=${{ matrix.fonts }}
+      - name: Cross-compile all release targets
+        run: zig build matrix -Dfonts=${{ matrix.fonts }}
+      - name: Check that the binaries are self-contained
+        run: test/static.sh zig-out/matrix
+      - name: PNG end-to-end test
+        run: BIN=zig-out/matrix/x86_64-linux-${{ matrix.fonts }}/tuppet TUPPET_CONFIG= test/png.sh

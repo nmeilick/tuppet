@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Pinned, as in ci.yml: the release builds on a known runner image.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Check that the tag matches build.zig.zon
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in build.zig.zon"
+            exit 1
+          fi
+      - name: Format and unit tests
+        run: |
+          make fmt-check test
+          zig build test -Dfonts=lean
+          zig build test -Dfonts=full
+      # Builds all six targets in the three font variants, checks that the
+      # binaries are self-contained, runs the end-to-end tests against the
+      # Linux binaries, and writes the 18 archives and SHA256SUMS.
+      - name: Build release archives
+        run: make dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" zig-out/dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" zig-out/dist/* --title "tuppet ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
