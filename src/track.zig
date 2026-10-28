@@ -790,8 +790,9 @@ pub const Tracker = struct {
 
     fn remap(self: *Tracker, key: Key, st: *ScreenTrack, pages: *PageList, old: *Layout, stamp: *Stamp) !void {
         const gpa = self.gpa;
-        const anchor = old.anchor.?.*;
-        if (anchor.garbage) return error.ScrollbackDropped;
+        // A resize that erased the anchor's row, as when a screen without
+        // scrollback shrinks, leaves the old lines from the top on.
+        const anchor = if (old.anchor.?.garbage) pages.getTopLeft(.screen) else old.anchor.?.*;
         const anchor_y = (pages.pointFromPin(.screen, anchor) orelse return error.ScrollbackDropped).coord().y;
         const active_y = pages.total_rows - pages.rows;
         // The old lines start at the anchor. Rows above it that a resize
