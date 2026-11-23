@@ -301,7 +301,7 @@ to, as `hello` reports it.
 | `until`, `timeout_ms` | Wait for these [conditions](#conditions) too, as `wait` does; `timeout_ms` is required with `until`. Conditions cannot use `since` or a numbered `after_input`, since the session has no seqs yet. |
 | `alerts` | `[{"name":…,"match":…,"icase":false}, …]`: [alerts](#alerts-and-hits) that watch from the program's first byte, at most 32 (more fail with `limit`), with names unique among them. |
 | `like` | A reference to a session, running, ended, or lost, to start again: `argv`, `cwd`, `name`, `cols`, `rows`, `scrollback`, and `alerts` that the request leaves out come from it. Its environment and its hits do not: `env` applies as without `like`, and neither does a box's `over`. A session that gives its name and has ended is replaced, as above. |
-| `over` | Start the session as a [box](#boxes) over another one: `{"session":REF,"title":null,"backdrop":"frozen","grab":"pause","unseen_ms":null}`. Check for the `over` feature first: a daemon without it refuses the field. |
+| `over` | Start the session as a [box](#boxes) over another one: `{"session":REF,"title":null,"backdrop":"frozen","grab":"pause","unseen_ms":null}`. A box takes no `group` (`bad_request`). Check for the `over` feature first: a daemon without it refuses the field. |
 | `colors` | `{"fg":"#rrggbb","bg":"#rrggbb"}`: the default colors the session's terminal reports to its program (OSC 10 and 11) instead of tuppet's own. Without it, a box takes those of the session it is over. `tuppet run -a --drawn` sends the colors of the terminal it runs in. Check for the `colors` feature first: a daemon without it refuses the field. |
 | `group` | Make the session a member of this group (a name, as session names are), with the lowest number no session of the group has, ended ones included. Check for the `groups` feature first. |
 | `label`, `accent`, `mark`, `meta`, `actions` | What a drawn attach of the group shows about the member, as [update](#update) sets them. |
@@ -776,7 +776,7 @@ stays as it is; an empty `label` or `mark` takes it away. The daemon only keeps 
 
 | Field | Meaning |
 | --- | --- |
-| `group` | Move the session into this group, where it gets the lowest number no session of it has; `""` takes it out of its group. A side session takes no group (`bad_request`). |
+| `group` | Move the session into this group, where it gets the lowest number no session of it has; `""` takes it out of its group. A side session or a box takes no group (`bad_request`). |
 | `label` | Shown next to the name, at most 64 bytes once control characters are removed. |
 | `accent` | `true`: show the name inverted at the bar's left end. |
 | `mark` | A short mark next to the member, at most 16 bytes. |

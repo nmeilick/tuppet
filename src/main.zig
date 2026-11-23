@@ -237,7 +237,7 @@ const run_help =
     \\otherwise; the outcome line tells these apart from a program that
     \\exits with 3 or 4 itself. Interrupted, run stops the box first and
     \\exits 128+n; killed, it leaves the box running. --over cannot be
-    \\combined with -a, conditions, or --if-exists.
+    \\combined with -a, conditions, --if-exists, or --group.
     \\
     \\Alerts watch the session from the program's first byte (see 'tuppet
     \\help alert'): the ones --alert gives, and the defaults in the
@@ -1942,7 +1942,8 @@ const attach_help =
     \\the terminal answered; only the member in front writes into this
     \\terminal's scrollback, after a dim line with its name (switch_marks).
     \\An ended member stays dimmed until Enter or x closes (removes) it; r
-    \\is reported as an action. A member another window types in shows
+    \\and the caller's action letters are reported as actions (an action
+    \\on x comes first). A member another window types in shows
     \\read-only until Enter takes it over. F11 ([side] key) steps the side
     \\session ('tuppet run --side-of') through compact (a pane below, or
     \\beside on wide windows, or a strip in the bar; keys stay on the

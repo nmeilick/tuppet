@@ -352,6 +352,7 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     if (attach_now and until.len > 0) return cliFail("-a attaches instead of waiting; drop -a or the conditions", .{});
     if (side_view != null and side_of == null) return cliFail("--side-view goes with --side-of", .{});
     if (side_of != null and group != null) return cliFail("a side session belongs to the session it is tied to; drop --group or --side-of", .{});
+    if (over != null and group != null) return cliFail("a box belongs to the session it is shown over; drop --group or --over", .{});
     if (lease and (attach_now or over != null or until.len > 0)) return cliFail("--lease holds the session until this command ends; it goes without -a, --over, and conditions", .{});
     if (stats and until.len == 0) return cliFail("--stats counts while run waits: give it a condition", .{});
     if (attach_now) try attach_client.checkWriterTerminal("run -a");

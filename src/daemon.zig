@@ -965,6 +965,7 @@ fn runSession(r: *Request) !void {
     var box: ?over.Start = null;
     if (req.over) |o| {
         if (req.if_exists != .fail) return r.fail(.bad_request, null, "bad run request: over goes with if_exists fail only", .{});
+        if (req.group != null) return r.fail(.bad_request, null, "bad run request: a box belongs to the session it is shown over; give no group", .{});
         box = switch (try over.check(r.gpa, o, nullBackdrop(r.value))) {
             .ok => |start| start,
             .bad => |why| return r.fail(.bad_request, null, "bad run request: {s}", .{why}),
@@ -1598,6 +1599,7 @@ fn update(r: *Request) !void {
     defer session.release(s);
     const old = try s.memberOf(r.gpa);
     if (req.group != null and old.side_of != null) return r.fail(.bad_request, try status.of(r.gpa, s), "session {d} is a side session, which belongs to the session it is tied to; it takes no group", .{s.id});
+    if (req.group != null and s.over != null) return r.fail(.bad_request, try status.of(r.gpa, s), "session {d} is a box, which belongs to the session it is shown over; it takes no group", .{s.id});
     var m = switch (try member.apply(r.gpa, old, .{ .group = req.group, .label = req.label, .accent = req.accent, .mark = req.mark, .meta = req.meta, .actions = req.actions })) {
         .ok => |m| m,
         .bad => |why| return r.fail(.bad_request, try status.of(r.gpa, s), "bad update request: {s}", .{why}),

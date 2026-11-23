@@ -2807,18 +2807,22 @@ const Drawn = struct {
         if (d.frontEnded()) {
             const bytes = if (unit == .key) unit.key else return .taken;
             if (d.end_with == d.main.id) return .taken;
-            if (std.mem.eql(u8, bytes, "\r") or std.mem.eql(u8, bytes, "x")) {
+            const m = d.front();
+            const letter: ?u8 = if (bytes.len == 1) bytes[0] else null;
+            // The caller's actions come first, as in the switcher; Enter
+            // always closes.
+            var registered = false;
+            if (m != null and letter != null) for (m.?.st().actions) |a| {
+                if (a.key.len == 1 and a.key[0] == letter.?) registered = true;
+            };
+            if (std.mem.eql(u8, bytes, "\r") or (!registered and letter == 'x')) {
                 if (d.closeFront(now)) |o| return .{ .outcome = o };
                 return .taken;
             }
-            const m = d.front() orelse return .taken;
-            const letter = if (bytes.len == 1) bytes[0] else return .taken;
-            const registered = for (m.st().actions) |a| {
-                if (a.key.len == 1 and a.key[0] == letter) break true;
-            } else false;
+            if (m == null or letter == null) return .taken;
             if (registered or letter == 'r') {
                 var buf: [20]u8 = undefined;
-                d.request(protocol.ActionReq{ .session = std.fmt.bufPrint(&buf, "{d}", .{m.id}) catch unreachable, .key = &.{letter} });
+                d.request(protocol.ActionReq{ .session = std.fmt.bufPrint(&buf, "{d}", .{m.?.id}) catch unreachable, .key = &.{letter.?} });
             }
             return .taken;
         }

@@ -540,8 +540,8 @@ paints, attaches, and passes keys as it says.
   It fails with `ended` for an ended or lost session, and with `bad_request` for a box: boxes over boxes are refused.
 - A session has at most 16 running boxes; one more fails with `limit`. The session underneath reserves room for a box
   that starts, so the limit holds under concurrent starts.
-- `--over` cannot be combined with `-a`, conditions, or an `if_exists` other than `fail`. `--backdrop` with
-  `--grab never` is refused. `restart` and `like` never copy the relation.
+- `--over` cannot be combined with `-a`, conditions, a group, or an `if_exists` other than `fail`. `--backdrop`
+  with `--grab never` is refused. `restart` and `like` never copy the relation.
 - A box started with `run --over` is stopped when the session underneath ends (`ended_by` `under`). This is tied to how
   the box was started, not to being shown over a session.
 - `-t DUR` (`unseen_ms`, 1 ms to 24 h, no default) limits how long the box may run before it is first `held` (first
@@ -908,7 +908,8 @@ the events stream for every session: members, their boxes, and their side sessio
   reaches the front's prompt.
 - **An ended member** stays in front with its last screen, dimmed, and the bar says `ended N · Enter close · r`. Enter
   or `x` removes it (the `remove` request) and goes back to the member in front before; without another member the
-  attach ends with its code. `r` is reported as an action, for the caller to respawn it. `--end-with SESSION` ends the
+  attach ends with its code. `r` is reported as an action, for the caller to respawn it, and so are the caller's
+  action letters; as in the switcher, an action on `x` comes first, and Enter still closes. `--end-with SESSION` ends the
   attach at once when that session ends, with its exit status.
 
 ### The side pane

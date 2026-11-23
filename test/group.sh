@@ -85,12 +85,21 @@ ok '<Esc>'
 view_is p compact
 size_is a 100x31
 
-# An ended member stays dimmed until Enter closes it.
+# An ended member stays dimmed until Enter closes it; the caller's action
+# on x comes before x's closing.
 ok '<F12>' 1
 outer_has 'b>' "b did not come back"
+I update b --action 'x:done' >/dev/null
+I events b -j >"$dir/b-events" &
+b_events=$!
 ok 'exit<Enter>'
 outer_has 'Enter close' "the ended member does not say so"
 sleep 0.6
+ok x
+for _ in $(seq 60); do grep -q '"type":"action"' "$dir/b-events" && break; sleep 0.05; done
+kill "$b_events"
+wait "$b_events" 2>/dev/null || true
+grep -q '"type":"action".*"key":"x"' "$dir/b-events" || fail "x on the ended member was no action: $(cat "$dir/b-events")"
 ok '<Enter>'
 outer_has 'a>' "Enter did not close b and go back"
 count_b() { I list b -j | python3 -c "import json,sys; print(len(json.load(sys.stdin)['sessions']))"; }

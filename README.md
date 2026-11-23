@@ -691,8 +691,8 @@ exits with the program's own code when the program ended by
 itself in a box that was held (shown, with `--grab never`), 3 for `reason=unseen`, and 4 in every other case; a program
 can exit with 3 or 4 itself, so a caller that must tell these apart reads the line. Interrupted, `run --over` stops its
 box first and exits 128+n; killed, it leaves the box running until someone stops it or the session underneath ends. On
-Windows, Ctrl-C ends `run --over` and leaves the box. `--over` cannot be combined with `-a`, conditions, or
-`--if-exists`, and a daemon too old for boxes fails it with a message.
+Windows, Ctrl-C ends `run --over` and leaves the box. `--over` cannot be combined with `-a`, conditions,
+`--if-exists`, or `--group`, and a daemon too old for boxes fails it with a message.
 
 While a box that takes the keyboard runs over a session and nobody types into it, `tuppet list` and the picker show that
 session as `box waits`, marked with `!`, counted among the sessions that need you, and reached with Tab. A plain
@@ -715,8 +715,9 @@ events`, after a second press (`x!:close`), a choice (`s:share:Once|Live|Stop`),
 Letters do nothing for half a second after the switcher opened, so a key meant for the member acts on nothing.
 Ctrl-] twice sends Ctrl-]. After a switch, keys are dropped until the terminal has shown the new screen, and only the
 member in front writes into the terminal's scrollback, after a dim line that names it. When the member in front ends, it
-stays, dimmed, until Enter or `x` closes it, which removes the session, and `r` there is reported as an action;
-`--end-with SESSION` ends the attach instead when that session ends. A member that another window types into shows
+stays, dimmed, until Enter or `x` closes it, which removes the session; `r` and the caller's action letters there are
+reported as actions, and an action on `x` takes that letter from closing. `--end-with SESSION` ends the attach
+instead when that session ends. A member that another window types into shows
 read-only until Enter takes it over. `--title TEXT` gives the switcher's frame a title for people instead of the group's
 name, and `--quiet-detach` leaves out the line on detach that says how to return, for a caller that prints its own.
 

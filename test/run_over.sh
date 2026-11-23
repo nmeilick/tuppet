@@ -37,7 +37,7 @@ outcome() {
 held() { tuppet list -j "$box" | grep -q '"held":true'; }
 
 tuppet run -n under cat >/dev/null
-for opts in "-a" "-m x" "--grab never --backdrop live"; do
+for opts in "-a" "-m x" "--grab never --backdrop live" "--group g"; do
     # shellcheck disable=SC2086
     if tuppet run --over under $opts -- cat >/dev/null 2>&1; then code=0; else code=$?; fi
     [ "$code" = 2 ] || fail "run --over $opts exited $code, not 2"
@@ -58,6 +58,7 @@ tuppet list under | grep -Eq '^! +[0-9]+ +under +box waits ' || fail "no box wai
 "${outer[@]}" "$BIN" run "${inner[@]}" "$BIN" attach "$box" >/dev/null
 poll held || fail "the attach did not hold the box"
 tuppet list under | grep -q 'box waits' && fail "a held box still waits"
+tuppet update "$box" --group g 2>/dev/null && fail "a box joined a group"
 tuppet key "$box" 'x<Enter>'
 if wait "$runner"; then code=0; else code=$?; fi
 outcome "$dir/held" "$code" 7 "ended BOX exit=7 held=yes shown=yes"
