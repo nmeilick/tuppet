@@ -35,9 +35,9 @@ Font icons in matching TrueType fonts (full), or the smallest binary (lean).
 
 | Build | Archive | Built-in fonts | Size |
 | --- | --- | --- | --- |
-| medium | `tuppet-<version>-<platform>` | JetBrains Mono; reads your TrueType, OpenType, and bitmap fonts through FreeType | 14.1 MB |
-| lean | `tuppet-<version>-<platform>-lean` | GNU Unifont only, in 8x16 cells; reads only `.hex`, `.psf`, and `.psf.gz` fonts | 12.6 MB |
-| full | `tuppet-<version>-<platform>-full` | medium's, plus JuliaMono, Symbols Nerd Font Mono, and Noto Sans Mono CJK SC | 34.9 MB |
+| medium | `tuppet-<version>-<platform>` | JetBrains Mono; reads your TrueType, OpenType, and bitmap fonts through FreeType | 15.2 MB |
+| lean | `tuppet-<version>-<platform>-lean` | GNU Unifont only, in 8x16 cells; reads only `.hex`, `.psf`, and `.psf.gz` fonts | 13.9 MB |
+| full | `tuppet-<version>-<platform>-full` | medium's, plus JuliaMono, Symbols Nerd Font Mono, and Noto Sans Mono CJK SC | 36.2 MB |
 
 The sizes are those of the x86_64 Linux binaries. `tuppet --version` names the build.
 
