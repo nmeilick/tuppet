@@ -17,7 +17,7 @@ TARGETS := x86_64-linux aarch64-linux x86_64-macos aarch64-macos x86_64-windows 
 VARIANTS := lean medium full
 DIST := zig-out/dist
 JOBS_FLAG := $(if $(JOBS),-j$(JOBS))
-E2E := test/cli_failures.sh test/dsr_reply.sh test/trace.sh test/daemon_resilience.sh test/supervised.sh test/protocol.sh test/store.sh test/picker.sh test/names.sh test/wait.sh test/sample.sh test/input.sh test/events.sh test/alerts.sh test/sweep.sh test/shutdown.sh test/png.sh
+E2E := test/cli_failures.sh test/dsr_reply.sh test/trace.sh test/daemon_resilience.sh test/supervised.sh test/protocol.sh test/store.sh test/picker.sh test/drawn.sh test/scrollback.sh test/names.sh test/wait.sh test/sample.sh test/input.sh test/events.sh test/alerts.sh test/sweep.sh test/shutdown.sh test/png.sh test/over.sh test/boxes.sh test/run_over.sh test/play.sh test/history.sh test/start.sh test/members.sh test/marks.sh test/group.sh
 
 # The emoji atlas's inputs: Noto Color Emoji 2.057 (release
 # v2026-09-24-unicode18_0) and the Unicode 18.0 emoji sequence files.

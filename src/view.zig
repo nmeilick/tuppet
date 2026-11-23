@@ -55,7 +55,12 @@ pub fn renderLocked(gpa: std.mem.Allocator, s: *Session, opts: Options) !View {
         const start = fitTail(text, text_opts.budget);
         // A cut would lose the HTML header, or the styles VT set before it.
         if (start > 0 and opts.format != .plain) return error.ViewTooLarge;
-        if (opts.styles) try shownRows(gpa, t, opts.scrollback, &rows);
+        if (opts.styles) {
+            try shownRows(gpa, t, opts.scrollback, &rows);
+            var cut_lines = std.mem.count(u8, text[0..start], "\n");
+            if (start > 0 and start == text.len and text[start - 1] != '\n') cut_lines += 1;
+            dropLines(&rows, cut_lines, opts.unwrap);
+        }
         break :blk View{ .text = text[start..], .truncated = start > 0, .cursor = at };
     };
     if (opts.styles) v.styles = try styles_mod.collect(gpa, t, rows.items, opts.budget - text_opts.budget);
@@ -74,6 +79,18 @@ fn shownRows(gpa: std.mem.Allocator, t: *vt.Terminal, scrollback: bool, out: *st
     while (it.next()) |p| : (i += 1) {
         try out.append(gpa, .{ .pin = p, .row = @as(i64, @intCast(i)) - @as(i64, @intCast(above)) + 1 });
     }
+}
+
+/// Leave out of `rows` those of the first `lines` lines of the text, which
+/// a cut dropped. A line is a row, or with `unwrap` the rows that wrap
+/// into each other.
+fn dropLines(rows: *std.ArrayList(styles_mod.ViewRow), lines: usize, unwrap: bool) void {
+    var n: usize = 0;
+    var left = lines;
+    while (left > 0 and n < rows.items.len) : (n += 1) {
+        if (!unwrap or !rows.items[n].pin.rowAndCell().row.wrap) left -= 1;
+    }
+    rows.replaceRangeAssumeCapacity(0, n, &.{});
 }
 
 /// The lines with a row that changed after `since`, each formatted on its
@@ -130,6 +147,7 @@ fn renderChanged(gpa: std.mem.Allocator, s: *Session, opts: Options, since: u64,
     var dropped: usize = 0;
     while (dropped < starts.items.len and starts.items[dropped] < cut) dropped += 1;
     const from = if (dropped < starts.items.len) starts.items[dropped] else text.items.len;
+    if (shown) |list| dropLines(list, dropped, opts.unwrap);
     return .{
         .text = text.items[from..],
         .rows = rows.items[dropped..],
@@ -178,6 +196,25 @@ fn fitTail(text: []const u8, budget: usize) usize {
     if (text[i - 1] == '\n') return i;
     const nl = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse return text.len;
     return nl + 1;
+}
+
+test "the rows of the lines a cut drops are left out" {
+    const gpa = std.testing.allocator;
+    var t = try vt.Terminal.init((vt.TinyIo.init).io(), gpa, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(gpa);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // Row 1 wraps into row 2.
+    stream.nextSlice("abcdefghijklm\r\nx");
+    var rows: std.ArrayList(styles_mod.ViewRow) = .empty;
+    defer rows.deinit(gpa);
+    try shownRows(gpa, &t, false, &rows);
+    dropLines(&rows, 1, true);
+    try std.testing.expectEqual(@as(i64, 3), rows.items[0].row);
+    rows.clearRetainingCapacity();
+    try shownRows(gpa, &t, false, &rows);
+    dropLines(&rows, 1, false);
+    try std.testing.expectEqual(@as(i64, 2), rows.items[0].row);
 }
 
 test "a cut keeps the newest whole lines" {

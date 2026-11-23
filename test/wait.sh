@@ -209,6 +209,9 @@ read -r bytes1 draws1 clears1 <<<"$(counters)"
 line=$("$BIN" do "$sh_id" -s 'printf "\033[H\033[2J\033[3JSETTLED\n"' -k '<Enter>' --settled 200ms -w 5s --stats) || fail "do --settled: $line"
 [[ $line =~ ^met\ settled#0\ $sh_id\ .*\ out_bytes=[1-9][0-9]*\ draws=[1-9][0-9]*\ full_clears=1\ rows_changed=[1-9][0-9]*/[0-9]+\ first_change_ms=[0-9]+$ ]] \
     || fail "do --settled --stats: $line"
+# A step that fails reports itself as without --stats.
+exits 1 "do --stats on no session did not fail" "$BIN" do no-such-session -s x -m y --stats -j
+grep '"code":"no_session"' "$dir/out" | grep '"step":1' | grep -q '"done":0' || fail "do --stats on no session: $(cat "$dir/out" "$dir/err")"
 # --gone: text that came and went, in any case; never text that never came.
 line=$("$BIN" do "$sh_id" -s 'printf "WOR%s\n" KING; sleep 0.3; printf "\\033[H\\033[2J"' -k '<Enter>' --gone working --icase -w 5s) || fail "do --gone: $line"
 [[ $line =~ ^met\ gone#0\  ]] || fail "the gone line: $line"
@@ -253,6 +256,10 @@ loud=$("$BIN" run sh -c 'sleep 0.2; echo ANY-LOUD; exec sleep 30')
 line=$("$BIN" wait "$failed" "$loud" -m ANY-LOUD --any -t 3s 2>/dev/null)
 [[ $line =~ ^met\ match#0\ $loud\  && $line != *$'\n'* ]] || fail "wait --any did not report only the session that met: $line"
 exits 2 "several sessions without --any was not a usage error" "$BIN" wait "$quiet" "$loud" -m x
+# None met: each session's outcome, in order, and exit 3.
+if line=$("$BIN" wait "$quiet" "$loud" -m NEVER --any -t 200ms 2>/dev/null); then code=0; else code=$?; fi
+[[ $code == 3 && $(sed -n 1p <<<"$line") == "timeout - $quiet "* && $(sed -n 2p <<<"$line") == "timeout - $loud "* ]] \
+    || fail "wait --any where none met exited $code: $line"
 # With --any a pattern stands for every session it matches.
 "$BIN" run -n anyp-a sleep 30 >/dev/null
 anyp=$("$BIN" run -n anyp-b sh -c 'sleep 0.2; echo ANY-PATTERN; exec sleep 30')

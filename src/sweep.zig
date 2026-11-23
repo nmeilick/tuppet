@@ -333,7 +333,7 @@ pub fn locate(lines: []const []const u8, cols: u16, text: []const u8, icase: boo
         while (findFrom(line, from, text, icase)) |at| {
             if (spot.count == 0) {
                 const col = cellsOf(line[0..at]) + 1;
-                spot = .{ .state = .at, .row = @intCast(r + 1), .col = @intCast(col), .right = rightOf(cols, col, cellsOf(text)) };
+                spot = .{ .state = .at, .row = @intCast(r + 1), .col = @intCast(@min(col, cols)), .right = rightOf(cols, col, cellsOf(text)) };
             }
             spot.count += 1;
             from = at + text.len;
@@ -527,7 +527,7 @@ const Stream = struct {
                 w.writeAll("exit=stopped") catch {};
             } else if (e.code) |code| {
                 w.print("exit={d}", .{code}) catch {};
-            } else w.print("exit={s}", .{e.signal orelse "-"}) catch {};
+            } else w.print("exit={f}", .{status.cleaned(e.signal orelse "-")}) catch {};
             s.exit_len = w.end;
         }
         if (f.writer != null) s.taken = true;
@@ -733,7 +733,7 @@ const Sweep = struct {
             const reply = try client.request(sw.a, req, protocol.StatusResp);
             if (!reply.parsed.value.ok) failed(sw.a, reply.line);
             sw.scratch = true;
-            sw.id = reply.parsed.value.status.?.id;
+            sw.id = client.replyStatus(reply.parsed.value.status).id;
             sw.ref = try std.fmt.allocPrint(sw.a, "{d}", .{sw.id});
         } else {
             const listed = try client.request(sw.a, protocol.ListReq{ .sessions = &.{sw.o.ref.?} }, protocol.ListResp);
@@ -756,7 +756,9 @@ const Sweep = struct {
 
     fn attach(sw: *Sweep) !void {
         var conn = try client.connect(sw.a);
-        errdefer conn.deinit();
+        // Once sw.stream holds the connection, cleanup closes it.
+        var owned = true;
+        errdefer if (owned) conn.deinit();
         try client.sendRequest(sw.a, &conn, protocol.AttachReq{ .session = sw.ref, .mode = .write, .label = "sweep" });
         const split = try conn.recvLineSplit(sw.a, client.max_reply);
         const reply = try client.parseReply(sw.a, protocol.StatusResp, split.line);
@@ -770,12 +772,13 @@ const Sweep = struct {
             }
             failed(sw.a, reply.line);
         }
-        const st = reply.parsed.value.status.?;
+        const st = reply.parsed.value.status orelse return sw.halt(.failed, "the daemon sent a malformed reply", .{});
         var no_timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
         _ = std.c.setsockopt(conn.posix.socket.handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, @ptrCast(&no_timeout), @sizeOf(std.posix.timeval));
         const s = try sw.a.create(Stream);
         s.* = .{ .conn = conn };
         sw.stream = s;
+        owned = false;
         // The reply counts this attach: a viewer that came meanwhile is
         // in it.
         sw.checkWatchers(st);
@@ -981,8 +984,8 @@ const Sweep = struct {
                 if (r.seq) |seq| sw.resize_seq = seq;
                 return r;
             }
-            if (seen.errors > sw.errors_seen) return sw.halt(.failed, "the resize to {d}x{d} failed: {s}", .{ size.cols, size.rows, seen.errorText() });
-            _ = try sw.check();
+            if (seen.errors > sw.errors_seen) return sw.halt(.failed, "the resize to {d}x{d} failed: {f}", .{ size.cols, size.rows, status.cleaned(seen.errorText()) });
+            try sw.checkSeen(&seen);
             if (io_mod.nowNanos() - sent > resize_answer_ns) return sw.halt(.failed, "the daemon did not answer the resize to {d}x{d}", .{ size.cols, size.rows });
             s.waitFrame(seen.frames, 20);
         }
@@ -1032,7 +1035,7 @@ const Sweep = struct {
             return sw.halt(.failed, "{s}", .{client.errorText(err) orelse @errorName(err)});
         const r = reply.parsed.value;
         if (!r.ok) return sw.refused(reply.line);
-        try sw.checkStatus(r.status.?);
+        try sw.checkStatus(r.status orelse return sw.halt(.failed, "the daemon sent a malformed reply", .{}));
         return .{ .text = r.text, .rows = r.rows, .styles = r.styles, .status = r.status };
     }
 
@@ -1046,28 +1049,33 @@ const Sweep = struct {
 
     /// What ends the sweep early, checked while it waits.
     fn check(sw: *Sweep) Abort!Stream.Seen {
+        const seen = sw.stream.?.seen();
+        try sw.checkSeen(&seen);
+        return seen;
+    }
+
+    /// `check` with `seen`, the stream as the caller read it: a frame
+    /// that came after is not judged before the caller saw it.
+    fn checkSeen(sw: *Sweep, seen: *const Stream.Seen) Abort!void {
         const sig = client.interrupt_signal.load(.acquire);
         if (sig != 0) return sw.halt(.interrupted, "interrupted", .{});
         if (sw.deadline_ns) |d| if (io_mod.nowNanos() >= d) {
             var buf: [32]u8 = undefined;
             return sw.halt(.max_time, "--max-time {s} ran out", .{units.durationText(&buf, sw.o.max_ms)});
         };
-        const s = sw.stream.?;
-        const seen = s.seen();
         if (seen.exit() != null) return error.Ended;
         if (seen.taken) return sw.halt(.taken, "another client took over writing (attach -f)", .{});
-        if (seen.errors > sw.errors_seen) return sw.halt(.failed, "the daemon refused a frame: {s}", .{seen.errorText()});
+        if (seen.errors > sw.errors_seen) return sw.halt(.failed, "the daemon refused a frame: {f}", .{status.cleaned(seen.errorText())});
         if (seen.resizes > sw.resizes_seen) {
-            const r = s.resizeAt(sw.resizes_seen);
+            const r = sw.stream.?.resizeAt(sw.resizes_seen);
             return sw.halt(.resize, "another client resized the session to {d}x{d}", .{ r.cols, r.rows });
         }
         if (seen.end()) |reason| {
             if (std.mem.eql(u8, reason, "shutdown")) return sw.halt(.ended, "the daemon is shutting down", .{});
             if (std.mem.eql(u8, reason, "too_slow")) return sw.halt(.stream, "the daemon ended the stream: the sweep read it too slowly", .{});
-            return sw.halt(.stream, "the daemon ended the stream ({s})", .{reason});
+            return sw.halt(.stream, "the daemon ended the stream ({f})", .{status.cleaned(reason)});
         }
         if (seen.closed) return sw.halt(.stream, "the daemon closed the stream", .{});
-        return seen;
     }
 
     /// A failed reply, as a reason to stop.
@@ -1076,7 +1084,7 @@ const Sweep = struct {
             return sw.halt(.failed, "the daemon sent a malformed reply", .{});
         if (std.mem.eql(u8, failure.code, @tagName(protocol.Code.ended))) return error.Ended;
         if (std.mem.eql(u8, failure.code, @tagName(protocol.Code.no_session))) return sw.halt(.removed, "the session was removed", .{});
-        return sw.halt(.failed, "{s}", .{failure.err});
+        return sw.halt(.failed, "{f}", .{status.cleaned(failure.err)});
     }
 
     /// Stop, for the first reason only.
@@ -1654,6 +1662,17 @@ test "a find is located in cells, wide characters counted as Ghostty counts them
     try testing.expectEqual(@as(u32, 2), spot.count);
     try testing.expectEqual(State.absent, locate(&lines, 20, "TITLE", false).state);
     try testing.expectEqual(State.at, locate(&lines, 20, "TITLE", true).state);
+}
+
+test "a find after more code point widths than a column holds stays on the row" {
+    // A program with grapheme clustering (mode 2027) packs many emoji
+    // into one cell; counted one by one they pass 65535 cells.
+    const line = try testing.allocator.alloc(u8, 40_000 * 4 + 5);
+    defer testing.allocator.free(line);
+    for (0..40_000) |i| @memcpy(line[i * 4 ..][0..4], "\u{1F600}");
+    @memcpy(line[40_000 * 4 ..], "title");
+    const spot = locate(&.{line}, 1000, "title", false);
+    try testing.expectEqual(@as(?u16, 1000), spot.col);
 }
 
 test "an absent find is a prefix or a split where a neighbour had it" {

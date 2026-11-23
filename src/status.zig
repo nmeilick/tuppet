@@ -23,6 +23,9 @@ pub const Exit = struct {
     signal: ?[]const u8 = null,
     /// `stop` ended it.
     stopped: bool = false,
+    /// The program's alternate screen showed when it ended, so what it
+    /// showed last is not on a terminal's normal screen.
+    alt_screen: bool = false,
 };
 
 /// The latest desktop notification the program sent (OSC 9 or OSC 777).
@@ -32,6 +35,85 @@ pub const Notification = struct {
     text: []const u8 = "",
     /// Unix time in milliseconds.
     at_ms: i64 = 0,
+};
+
+/// What a side session shows of itself: a few rows with the session it is
+/// tied to, half the window, or all of it.
+pub const SideView = enum { compact, half, full };
+
+/// Where a shell is, as its prompt marks (OSC 133) say: no marks since it
+/// started or since a command ended, waiting at its primary prompt, or
+/// running a command.
+pub const Shell = enum { unknown, prompt, running };
+
+/// A value a caller keeps with a session, which tuppet does not read.
+pub const MetaValue = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// A key that a drawn attach's switcher offers for a session, which
+/// tuppet only reports as an `action` event.
+pub const Action = struct {
+    /// One printable ASCII character.
+    key: []const u8,
+    name: []const u8,
+    /// A second press is needed while the session's program runs.
+    confirm: bool = false,
+    /// The switcher asks for one of these first; the event carries it.
+    choices: []const []const u8 = &.{},
+    /// The switcher asks for a line of text first, with this hint.
+    input: ?[]const u8 = null,
+};
+
+/// What a caller says about a session as a member of a group of a drawn
+/// attach, and the side session it is.
+pub const Member = struct {
+    group: ?[]const u8 = null,
+    /// Fixed while the session is in its group; the daemon gives it.
+    number: ?u32 = null,
+    label: ?[]const u8 = null,
+    accent: bool = false,
+    mark: ?[]const u8 = null,
+    meta: []const MetaValue = &.{},
+    actions: []const Action = &.{},
+    /// Why the session needs attention, until cleared.
+    attention: ?[]const u8 = null,
+    /// On a side session: the session it is tied to, and its view.
+    side_of: ?u64 = null,
+    side_view: ?SideView = null,
+
+    /// Whether the caller said nothing.
+    pub fn isEmpty(m: Member) bool {
+        return m.group == null and m.number == null and m.label == null and !m.accent and m.mark == null and m.meta.len == 0 and
+            m.actions.len == 0 and m.attention == null and m.side_of == null and m.side_view == null;
+    }
+
+    /// A copy whose strings live in `gpa`.
+    pub fn dupe(m: Member, gpa: std.mem.Allocator) !Member {
+        var out = m;
+        out.group = try dupeOpt(gpa, m.group);
+        out.label = try dupeOpt(gpa, m.label);
+        out.mark = try dupeOpt(gpa, m.mark);
+        out.attention = try dupeOpt(gpa, m.attention);
+        const meta = try gpa.alloc(MetaValue, m.meta.len);
+        for (m.meta, meta) |v, *o| o.* = .{ .key = try gpa.dupe(u8, v.key), .value = try gpa.dupe(u8, v.value) };
+        out.meta = meta;
+        const actions = try gpa.alloc(Action, m.actions.len);
+        for (m.actions, actions) |a, *o| o.* = .{
+            .key = try gpa.dupe(u8, a.key),
+            .name = try gpa.dupe(u8, a.name),
+            .confirm = a.confirm,
+            .choices = try dupeNames(gpa, a.choices),
+            .input = try dupeOpt(gpa, a.input),
+        };
+        out.actions = actions;
+        return out;
+    }
+
+    fn dupeOpt(gpa: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
+        return if (text) |t| try gpa.dupe(u8, t) else null;
+    }
 };
 
 /// What a client last showed of a session, as acks report it: the values
@@ -127,6 +209,30 @@ pub const Recording = struct {
     started_ms: i64 = 0,
 };
 
+/// What a box shows behind it while it has the keyboard.
+pub const Backdrop = enum { frozen, live };
+/// When a box takes the keyboard: once the person pauses, at once, or
+/// never.
+pub const Grab = enum { pause, now, never };
+/// Why the daemon stopped a box on its own: its unseen_ms ran out, or the
+/// session underneath ended.
+pub const EndedBy = enum { unseen, under };
+
+/// How a box is shown over another session, and what became of it.
+pub const Over = struct {
+    /// The session underneath.
+    id: u64 = 0,
+    /// The text on its border, cleaned; null for the session's name.
+    title: ?[]const u8 = null,
+    /// Null exactly with grab never.
+    backdrop: ?Backdrop = null,
+    grab: Grab = .pause,
+    /// A client watched it, and wrote to it, while it ran.
+    shown: bool = false,
+    held: bool = false,
+    ended_by: ?EndedBy = null,
+};
+
 pub const Status = struct {
     id: u64 = 0,
     name: ?[]const u8 = null,
@@ -199,6 +305,61 @@ pub const Status = struct {
     /// 65535x65535 is outside 1..1000"; null when it can. Only `list`,
     /// `ack`, and `remove` work on a damaged session.
     damaged: ?[]const u8 = null,
+    /// On a box, how it is shown over another session; null on others.
+    over: ?Over = null,
+    /// The ids of the running boxes shown over this session, oldest first.
+    under: []const u64 = &.{},
+    /// What a caller says about the session as a member of a group; see
+    /// `Member`.
+    group: ?[]const u8 = null,
+    number: ?u32 = null,
+    label: ?[]const u8 = null,
+    accent: bool = false,
+    mark: ?[]const u8 = null,
+    meta: []const MetaValue = &.{},
+    actions: []const Action = &.{},
+    attention: ?[]const u8 = null,
+    side_of: ?u64 = null,
+    side_view: ?SideView = null,
+    /// The running side session tied to this one.
+    side: ?u64 = null,
+    /// What the shell's prompt marks say; null once the session ended.
+    shell: ?Shell = null,
+    /// Counts the primary prompts the shell showed.
+    prompt_seq: u64 = 0,
+    /// The exit code of the last command the marks reported.
+    last_exit: ?i32 = null,
+    /// The program turned on bracketed paste (mode 2004).
+    paste_mode: bool = false,
+
+    /// The member fields as one `Member`, aliasing the status.
+    pub fn member(st: Status) Member {
+        return .{
+            .group = st.group,
+            .number = st.number,
+            .label = st.label,
+            .accent = st.accent,
+            .mark = st.mark,
+            .meta = st.meta,
+            .actions = st.actions,
+            .attention = st.attention,
+            .side_of = st.side_of,
+            .side_view = st.side_view,
+        };
+    }
+
+    fn setMember(st: *Status, m: Member) void {
+        st.group = m.group;
+        st.number = m.number;
+        st.label = m.label;
+        st.accent = m.accent;
+        st.mark = m.mark;
+        st.meta = m.meta;
+        st.actions = m.actions;
+        st.attention = m.attention;
+        st.side_of = m.side_of;
+        st.side_view = m.side_view;
+    }
 };
 
 /// Labels and other strings that clients or programs supply are kept at
@@ -249,7 +410,7 @@ pub fn ofLocked(gpa: std.mem.Allocator, s: *Session, recording: ?Recording) !Sta
     const smp = s.sampler.last;
     const sampled = !exited and smp.taken_ns != 0;
     const fg_name = s.sampler.foregroundName();
-    return .{
+    var st: Status = .{
         .id = s.id,
         .name = if (s.name.len > 0) try gpa.dupe(u8, s.name) else null,
         .state = if (exited) .exited else .running,
@@ -259,7 +420,7 @@ pub fn ofLocked(gpa: std.mem.Allocator, s: *Session, recording: ?Recording) !Sta
         .rows = s.rows,
         .started_ms = s.started_ms,
         .ended_ms = if (ended_ms != 0) ended_ms else null,
-        .exit = if (exited) try exitOf(gpa, s.exit_code.load(.acquire), s.stopped.load(.acquire)) else null,
+        .exit = if (exited) try exitOf(gpa, s.exit_code.load(.acquire), s.stopped.load(.acquire), s.ended_alt.load(.acquire)) else null,
         .seq = s.track.seq.load(.acquire),
         .start_seq = s.track.start_seq,
         .end_seq = if (end_seq != 0) end_seq else null,
@@ -293,7 +454,37 @@ pub fn ofLocked(gpa: std.mem.Allocator, s: *Session, recording: ?Recording) !Sta
         .draws = if (s.counted) s.track.draws.load(.acquire) else null,
         .full_clears = if (s.counted) s.stream.handler.full_clears else null,
         .history_trimmed = s.history_cap != null,
+        .over = try dupeOver(gpa, s.over),
+        .under = try gpa.dupe(u64, s.boxes.list()),
+        .shell = if (exited) null else s.marks.shell,
+        .prompt_seq = s.marks.prompt_seq,
+        .last_exit = s.marks.last_exit,
+        .paste_mode = !exited and s.terminal.modes.get(.bracketed_paste),
     };
+    const io = io_mod.io();
+    s.member_mutex.lockUncancelable(io);
+    defer s.member_mutex.unlock(io);
+    st.setMember(try s.member.dupe(gpa));
+    st.side = s.side;
+    return st;
+}
+
+/// `over` with its title in `gpa`, cleaned again: a stored one is input.
+pub fn dupeOver(gpa: std.mem.Allocator, over: ?Over) !?Over {
+    var out = over orelse return null;
+    out.title = try boxTitleOf(gpa, out.title);
+    return out;
+}
+
+/// A box's title is kept at most this long.
+pub const max_box_title_len = 64;
+
+/// A box's title as its status shows it; null when nothing is left of it.
+pub fn boxTitleOf(gpa: std.mem.Allocator, title: ?[]const u8) !?[]const u8 {
+    const clean = try cleanText(gpa, title orelse return null, max_box_title_len);
+    if (clean.len > 0) return clean;
+    gpa.free(clean);
+    return null;
 }
 
 fn dupeNames(gpa: std.mem.Allocator, list: []const []const u8) ![]const []const u8 {
@@ -327,7 +518,7 @@ pub fn ofMeta(gpa: std.mem.Allocator, meta: store.Meta, now_ms: i64) !Status {
     const lost = meta.lost or meta.ended_ms == null;
     // Nothing is known about a lost session after its start.
     const last_known = if (lost) meta.started_ms else meta.ended_ms.?;
-    return .{
+    var st: Status = .{
         .id = meta.id,
         .name = if (meta.name.len > 0) meta.name else null,
         .state = if (lost) .lost else .exited,
@@ -337,7 +528,7 @@ pub fn ofMeta(gpa: std.mem.Allocator, meta: store.Meta, now_ms: i64) !Status {
         .rows = meta.rows,
         .started_ms = meta.started_ms,
         .ended_ms = meta.ended_ms,
-        .exit = if (lost) null else try exitOf(gpa, meta.exit_code orelse 0, meta.stopped),
+        .exit = if (lost) null else try exitOf(gpa, meta.exit_code orelse 0, meta.stopped, meta.ended_alt),
         .seq = if (lost) null else meta.seq,
         .start_seq = meta.start_seq,
         .end_seq = if (lost) null else meta.end_seq,
@@ -363,7 +554,10 @@ pub fn ofMeta(gpa: std.mem.Allocator, meta: store.Meta, now_ms: i64) !Status {
         .out_bytes = if (lost) null else meta.out_bytes,
         .draws = if (lost) null else meta.draws,
         .full_clears = if (lost) null else meta.full_clears,
+        .over = try dupeOver(gpa, meta.over),
     };
+    if (meta.member) |m| st.setMember(try m.dupe(gpa));
+    return st;
 }
 
 fn ruleNames(gpa: std.mem.Allocator, rules: []const alert.Rule) ![]const []const u8 {
@@ -373,11 +567,11 @@ fn ruleNames(gpa: std.mem.Allocator, rules: []const alert.Rule) ![]const []const
 }
 
 /// tuppet keeps death by signal n as exit code -n.
-pub fn exitOf(gpa: std.mem.Allocator, code: i32, stopped: bool) !Exit {
+pub fn exitOf(gpa: std.mem.Allocator, code: i32, stopped: bool, alt_screen: bool) !Exit {
     // A code below -255 is no signal (Windows, or damaged data).
-    if (code >= 0 or code <= -256) return .{ .code = code, .stopped = stopped };
+    if (code >= 0 or code <= -256) return .{ .code = code, .stopped = stopped, .alt_screen = alt_screen };
     var buf: [16]u8 = undefined;
-    return .{ .signal = try gpa.dupe(u8, attach.signalName(&buf, @intCast(-code))), .stopped = stopped };
+    return .{ .signal = try gpa.dupe(u8, attach.signalName(&buf, @intCast(-code))), .stopped = stopped, .alt_screen = alt_screen };
 }
 
 fn sinceMs(now: i64, then: i64) u64 {
@@ -481,13 +675,7 @@ pub fn cleanText(gpa: std.mem.Allocator, text: []const u8, cap: usize) ![]u8 {
     errdefer out.deinit(gpa);
     var i: usize = 0;
     while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
-        const decoded: ?u21 = if (len > 0 and i + len <= text.len)
-            std.unicode.utf8Decode(text[i..][0..len]) catch null
-        else
-            null;
-        i += if (decoded != null) len else 1;
-        const cp = decoded orelse 0xfffd;
+        const cp = nextChar(text, &i);
         if (isControl(cp)) continue;
         var buf: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
@@ -497,7 +685,38 @@ pub fn cleanText(gpa: std.mem.Allocator, text: []const u8, cap: usize) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-fn isControl(cp: u21) bool {
+/// `text` for a format string's `{f}`, cleaned as `cleanText` cleans it
+/// but not cut: how a client prints text that came from the daemon.
+pub fn cleaned(text: []const u8) Clean {
+    return .{ .text = text };
+}
+
+pub const Clean = struct {
+    text: []const u8,
+
+    pub fn format(c: Clean, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var i: usize = 0;
+        while (i < c.text.len) {
+            const cp = nextChar(c.text, &i);
+            if (!isControl(cp)) try w.print("{u}", .{cp});
+        }
+    }
+};
+
+/// The character at `i.*`, or U+FFFD for a byte that does not start
+/// one; moves `i` past it.
+fn nextChar(text: []const u8, i: *usize) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(text[i.*]) catch 0;
+    const decoded: ?u21 = if (len > 0 and i.* + len <= text.len)
+        std.unicode.utf8Decode(text[i.*..][0..len]) catch null
+    else
+        null;
+    i.* += if (decoded != null) len else 1;
+    return decoded orelse 0xfffd;
+}
+
+/// C0, C1, and bidi controls, which `cleanText` removes.
+pub fn isControl(cp: u21) bool {
     return cp < 0x20 or (cp >= 0x7f and cp <= 0x9f) or
         cp == 0x061c or cp == 0x200e or cp == 0x200f or
         (cp >= 0x202a and cp <= 0x202e) or (cp >= 0x2066 and cp <= 0x2069);
@@ -521,12 +740,15 @@ test "an OSC 7 report gives a decoded path and its host" {
 
 test "program and client strings lose controls and are capped" {
     const gpa = std.testing.allocator;
-    const clean = try cleanText(gpa, "a\x1b[31mb\u{202e}c\u{85}d\xffé", 64);
-    defer gpa.free(clean);
-    try std.testing.expectEqualStrings("a[31mbcd\u{fffd}é", clean);
+    const out = try cleanText(gpa, "a\x1b[31mb\u{202e}c\u{85}d\xffé", 64);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("a[31mbcd\u{fffd}é", out);
     const cut = try cleanText(gpa, "abé", 3);
     defer gpa.free(cut);
     try std.testing.expectEqualStrings("ab", cut);
+    const printed = try std.fmt.allocPrint(gpa, "<{f}>", .{cleaned("a\x1b[31mb\u{202e}c\u{9b}d\xff")});
+    defer gpa.free(printed);
+    try std.testing.expectEqualStrings("<a[31mbcd\u{fffd}>", printed);
 }
 
 test "an ack moves seen up to what was shown, never past now and never back" {

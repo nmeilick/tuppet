@@ -10,6 +10,7 @@ const mouse = @import("mouse.zig");
 const protocol = @import("protocol.zig");
 const plat = @import("plat.zig");
 const attach_client = @import("attach_client.zig");
+const drawn_mod = @import("drawn.zig");
 const names = @import("names.zig");
 const status = @import("status.zig");
 const units = @import("units.zig");
@@ -21,6 +22,8 @@ const config_mod = @import("config.zig");
 const store = @import("store.zig");
 const fonts = @import("fonts.zig");
 const limits = @import("limits.zig");
+const over_mod = @import("over.zig");
+const start_run = @import("start_run.zig");
 
 const Status = status.Status;
 
@@ -92,9 +95,7 @@ var usage_hint_buf: [64]u8 = undefined;
 /// Print `tuppet: <message>` to stderr and exit 1: a runtime failure, such
 /// as an unusable environment, that no change of arguments fixes.
 pub fn runtimeFail(comptime fmt: []const u8, args: anytype) noreturn {
-    attach_client.restoreTerminal();
-    stderrPrint("tuppet: " ++ fmt ++ "\n", args) catch {};
-    std.process.exit(exit_code.failed);
+    runtimeFailWith(exit_code.failed, fmt, args);
 }
 
 /// Anchor a possibly-relative path at the client's working directory.
@@ -157,7 +158,11 @@ fn checkRef(ref: []const u8) error{UsageError}!void {
     if (names.refError(ref)) |why| return cliFail("invalid session '{s}': {s}", .{ ref, why });
 }
 
-const run_usage = "usage: tuppet run [-a] [-n NAME] [-s WxH] [-C DIR] [--scrollback SIZE] [-r [--record-format cast|trace] | --record-file FILE] [--alert NAME=TEXT]... [--no-default-alerts] [--if-exists fail|keep|replace] [conditions] [--stats] [-j] [--] <cmd...>";
+const run_usage = "usage: tuppet run [-a [--drawn | --no-drawn] [--no-detach] [--alt-screen] [--pass LIST] [-k KEY] | --over <session> [--title TEXT] [--backdrop frozen|live] [--grab pause|now|never]] [-n NAME] [-s WxH] [-C DIR] [--scrollback SIZE] [-r [--record-format cast|trace] | --record-file FILE] [--alert NAME=TEXT]... [--no-default-alerts] [--if-exists fail|keep|replace] [conditions] [--stats] [-j] [--] <cmd...>";
+
+/// A box's size without --size: its program's area, inside the border.
+const box_cols: u16 = 64;
+const box_rows: u16 = 12;
 
 pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var name: ?[]const u8 = null;
@@ -166,10 +171,16 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var cwd: ?[]const u8 = null;
     var sized = false;
     var attach_now = false;
+    var drawn_flag: ?bool = null;
+    var alt_screen = false;
+    var pass: ?config_mod.Pass = null;
+    var no_detach = false;
+    var key_flag: ?u8 = null;
     var json = false;
     var scrollback: ?u64 = null;
     var record = false;
     var record_path: ?[]const u8 = null;
+    var passwords = false;
     var record_format: ?protocol.RecordFormat = null;
     var if_exists: protocol.IfExists = .fail;
     var flags: ConditionFlags = .{};
@@ -179,10 +190,33 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     defer alerts.deinit(gpa);
     var default_alerts = true;
     var stats = false;
+    var over: ?protocol.RunOver = null;
+    var title: ?[]const u8 = null;
+    var backdrop: ?status.Backdrop = null;
+    var grab: ?status.Grab = null;
+    // -t limits a wait, or with --over how long the box may go unheld.
+    var timeout_flag: []const u8 = "";
+    var timeout_ms: ?u64 = null;
+    var group: ?[]const u8 = null;
+    var label: ?[]const u8 = null;
+    var accent = false;
+    var mark: ?[]const u8 = null;
+    var meta: std.ArrayList(status.MetaValue) = .empty;
+    defer meta.deinit(gpa);
+    var actions: std.ArrayList(status.Action) = .empty;
+    defer actions.deinit(gpa);
+    var side_of: ?[]const u8 = null;
+    var side_view: ?status.SideView = null;
+    var lease = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (isOpt(a, "--timeout", "-t")) {
+            timeout_flag = a;
+            timeout_ms = try durationValue(args, &i, 0);
+            continue;
+        }
         if (try flags.take(gpa, args, &i)) continue;
         if (std.mem.eql(u8, a, "--")) {
             // Everything after `--` is the command, even if it starts
@@ -203,6 +237,20 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
             cwd = try optValue(args, &i);
         } else if (isOpt(a, "--attach", "-a")) {
             attach_now = true;
+        } else if (std.mem.eql(u8, a, "--drawn") or std.mem.eql(u8, a, "--no-drawn")) {
+            drawn_flag = std.mem.eql(u8, a, "--drawn");
+        } else if (std.mem.eql(u8, a, "--no-detach")) {
+            no_detach = true;
+        } else if (std.mem.eql(u8, a, "--alt-screen")) {
+            alt_screen = true;
+        } else if (std.mem.eql(u8, a, "--pass")) {
+            const spec = try optValue(args, &i);
+            pass = config_mod.parsePass(spec) orelse
+                return cliFail("invalid --pass '{s}' (use a list of bell, notifications, clipboard, and links, or none)", .{spec});
+        } else if (isOpt(a, "--detach-key", "-k")) {
+            const spec = try optValue(args, &i);
+            key_flag = config_mod.parseDetachKey(spec) orelse
+                return cliFail("invalid detach key '{s}' (use ^X, <C-x>, or one character)", .{spec});
         } else if (isOpt(a, "--json", "-j")) {
             json = true;
         } else if (std.mem.eql(u8, a, "--scrollback")) {
@@ -213,6 +261,8 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, a, "--record-file")) {
             record = true;
             record_path = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--passwords")) {
+            passwords = true;
         } else if (std.mem.eql(u8, a, "--record-format")) {
             const value = try optValue(args, &i);
             record_format = std.meta.stringToEnum(protocol.RecordFormat, value) orelse
@@ -229,6 +279,42 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
             default_alerts = false;
         } else if (std.mem.eql(u8, a, "--stats")) {
             stats = true;
+        } else if (std.mem.eql(u8, a, "--over")) {
+            const ref = try optValue(args, &i);
+            try checkRef(ref);
+            over = .{ .session = ref };
+        } else if (std.mem.eql(u8, a, "--title")) {
+            title = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--backdrop")) {
+            const value = try optValue(args, &i);
+            backdrop = std.meta.stringToEnum(status.Backdrop, value) orelse
+                return cliFail("invalid --backdrop '{s}' (choose frozen or live)", .{value});
+        } else if (std.mem.eql(u8, a, "--grab")) {
+            const value = try optValue(args, &i);
+            grab = std.meta.stringToEnum(status.Grab, value) orelse
+                return cliFail("invalid --grab '{s}' (choose pause, now, or never)", .{value});
+        } else if (std.mem.eql(u8, a, "--group")) {
+            const g = try optValue(args, &i);
+            if (names.nameErrorOf(g, "group name")) |why| return cliFail("invalid group '{s}': {s}", .{ g, why });
+            group = g;
+        } else if (std.mem.eql(u8, a, "--label")) {
+            label = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--accent")) {
+            accent = true;
+        } else if (std.mem.eql(u8, a, "--mark")) {
+            mark = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--meta")) {
+            try meta.append(gpa, try metaValue(args, &i));
+        } else if (std.mem.eql(u8, a, "--action")) {
+            try actions.append(gpa, try actionValue(gpa, args, &i));
+        } else if (std.mem.eql(u8, a, "--side-of")) {
+            const ref = try optValue(args, &i);
+            try checkRef(ref);
+            side_of = ref;
+        } else if (std.mem.eql(u8, a, "--side-view")) {
+            side_view = try sideViewValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--lease")) {
+            lease = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
             return unknownOption(a, run_usage);
         } else {
@@ -239,8 +325,34 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     if (rest.len == 0) return cliFail("missing command to run", .{});
     if (rest[0].len == 0) return cliFail("the command to run is empty", .{});
     if (attach_now and json) return cliFail("--json prints the status, which an attach cannot; use one or the other", .{});
+    if (!attach_now and (drawn_flag != null or no_detach or alt_screen or pass != null or key_flag != null)) return cliFail("{s} goes with -a", .{if (no_detach) "--no-detach" else if (alt_screen) "--alt-screen" else if (pass != null) "--pass" else if (key_flag != null) "--detach-key" else if (drawn_flag.?) "--drawn" else "--no-drawn"});
+    if (drawn_flag == true) try attach_client.checkDrawnSupported();
+    if (over == null) {
+        if (title != null or backdrop != null or grab != null) return cliFail("{s} goes with --over", .{if (title != null) "--title" else if (backdrop != null) "--backdrop" else "--grab"});
+        if (timeout_ms) |ms| {
+            if (ms > max_wait_ms) return cliFail("{s} must be at most 10m", .{timeout_flag});
+            flags.timeout_ms = ms;
+        }
+    }
     const until = try flags.finish(gpa);
+    if (over) |*o| {
+        if (attach_now) return cliFail("--over shows the session in a box instead of attaching to it; drop -a or --over", .{});
+        if (until.len > 0) return cliFail("--over waits until the box's program has ended; drop the conditions", .{});
+        if (backdrop != null and grab == .never) return cliFail("--backdrop cannot be combined with --grab never: such a box never takes the keyboard", .{});
+        if (if_exists != .fail) return cliFail("--over always starts a new box; drop --if-exists", .{});
+        if (timeout_ms) |ms| {
+            if (ms == 0) return cliFail("{s} must be at least 1ms", .{timeout_flag});
+            if (ms > over_mod.max_unseen_ms) return cliFail("{s} must be at most 24h", .{timeout_flag});
+        }
+        o.title = title;
+        o.backdrop = backdrop;
+        o.grab = grab orelse .pause;
+        o.unseen_ms = timeout_ms;
+    }
     if (attach_now and until.len > 0) return cliFail("-a attaches instead of waiting; drop -a or the conditions", .{});
+    if (side_view != null and side_of == null) return cliFail("--side-view goes with --side-of", .{});
+    if (side_of != null and group != null) return cliFail("a side session belongs to the session it is tied to; drop --group or --side-of", .{});
+    if (lease and (attach_now or over != null or until.len > 0)) return cliFail("--lease holds the session until this command ends; it goes without -a, --over, and conditions", .{});
     if (stats and until.len == 0) return cliFail("--stats counts while run waits: give it a condition", .{});
     if (attach_now) try attach_client.checkWriterTerminal("run -a");
     if (flags.since != null) return cliFail("--since needs a session that has started; use it with tuppet wait", .{});
@@ -255,6 +367,8 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     }
     if (record_format != null and (!record or record_path != null)) return cliFail("--record-format goes with -r; --record-file takes the format from the file name", .{});
     if (record_path) |path| record_format = try recordFileFormat("--record-file", path);
+    if (passwords and !record) return cliFail("--passwords goes with -r or --record-file", .{});
+    if (passwords) try needPasswords(gpa);
     var config: ?config_mod.Config = null;
     defer if (config) |*c| c.deinit();
     if (default_alerts) {
@@ -272,9 +386,31 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
     }
     if (alerts.items.len > alert.max_alerts) return cliFail("a session takes at most {d} alerts, defaults included", .{alert.max_alerts});
     // The size: --size, else this terminal's for -a (instead of a resize
-    // right away), else TUPPET_SIZE, else 120x40.
+    // right away), else 64x12 for a box, else TUPPET_SIZE, else 120x40.
     if (attach_now) attach_client.checkSupported();
-    const attach_settings = if (attach_now) try attach_client.settingsFor(gpa, null) else null;
+    var attach_settings = if (attach_now) try attach_client.settingsFor(gpa, key_flag) else null;
+    if (attach_settings) |*settings| {
+        settings.drawn = drawn_flag orelse settings.drawn;
+        settings.no_detach = no_detach;
+        if (no_detach and !settings.drawn) return cliFail("--no-detach needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+        if (alt_screen and !settings.drawn) return cliFail("--alt-screen needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+        if (pass != null and !settings.drawn) return cliFail("--pass needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+        settings.paint_alt = settings.paint_alt or alt_screen;
+        settings.pass = pass orelse settings.pass;
+        // A drawn attach that cannot work fails before the session starts.
+        if (settings.drawn) if (try drawn_mod.unsupported(gpa)) |message| {
+            plat.stderrWriteAll(message) catch {};
+            std.process.exit(exit_code.failed);
+        };
+        // The session it starts reports this terminal's colors to the
+        // program, which then picks a light or dark look that fits.
+        if (settings.drawn) settings.colors = drawn_mod.queryColors();
+    }
+    var color_text: [2][7]u8 = undefined;
+    const run_colors: ?protocol.RunColors = if (attach_settings) |s| if (s.colors) |c| (if (try daemonSupports(gpa, "colors")) .{
+        .fg = std.fmt.bufPrint(&color_text[0], "#{x:0>2}{x:0>2}{x:0>2}", .{ c[0].r, c[0].g, c[0].b }) catch unreachable,
+        .bg = std.fmt.bufPrint(&color_text[1], "#{x:0>2}{x:0>2}{x:0>2}", .{ c[1].r, c[1].g, c[1].b }) catch unreachable,
+    } else null) else null else null;
     // An explicit --size stays; attaching must not resize to the terminal.
     const keep_size = sized;
     if (!sized) {
@@ -283,7 +419,10 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
             rows = size[1];
             sized = true;
         };
-        if (!sized) if (std.c.getenv("TUPPET_SIZE")) |env| {
+        if (over != null) {
+            cols = box_cols;
+            rows = box_rows;
+        } else if (!sized) if (std.c.getenv("TUPPET_SIZE")) |env| {
             const value = std.mem.span(env);
             const size = sizeValue(value) orelse return cliFail("invalid TUPPET_SIZE '{s}' (expected WxH, each " ++ limits.size_range ++ ")", .{value});
             cols = size[0];
@@ -307,19 +446,32 @@ pub fn cmdRun(gpa: std.mem.Allocator, args: []const []const u8) !void {
         .cwd = cwd_abs,
         .env = env,
         .scrollback = scrollback,
-        .record = if (record) .{ .path = record_abs, .format = record_format orelse .cast } else null,
+        .record = if (record) .{ .path = record_abs, .format = record_format orelse .cast, .passwords = if (passwords) true else null } else null,
         .if_exists = if_exists,
         .argv = rest,
         .until = if (until.len > 0) until else null,
         .timeout_ms = if (until.len > 0) flags.timeout() else null,
         .alerts = if (alerts.items.len > 0) alerts.items else null,
+        .over = over,
+        .colors = run_colors,
+        .group = group,
+        .label = label,
+        .accent = if (accent) true else null,
+        .mark = mark,
+        .meta = if (meta.items.len > 0) meta.items else null,
+        .actions = if (actions.items.len > 0) actions.items else null,
+        .side_of = side_of,
+        .side_view = side_view,
+        .lease = if (lease) true else null,
     };
+    if (lease) return holdLease(gpa, req, json);
     if (until.len > 0) return runAndWait(gpa, req, json, stats);
+    if (over != null) return runOver(gpa, req, json);
     const reply = try call(gpa, req, protocol.StatusResp);
     defer reply.deinit();
     if (json) return printJson(gpa, reply.line);
     var buf: [32]u8 = undefined;
-    const id = std.fmt.bufPrint(&buf, "{d}", .{reply.parsed.value.status.?.id}) catch unreachable;
+    const id = std.fmt.bufPrint(&buf, "{d}", .{replyStatus(reply.parsed.value.status).id}) catch unreachable;
     if (attach_now) {
         const hint = try std.fmt.allocPrint(gpa, "tuppet: session {s} is running, but attaching to it failed; 'tuppet attach {s}' retries\n", .{ id, id });
         defer gpa.free(hint);
@@ -359,7 +511,7 @@ fn runAndWait(gpa: std.mem.Allocator, req: protocol.RunReq, json: bool, stats: b
     defer gpa.free(first.rest);
     defer started.deinit();
     if (!started.parsed.value.ok) failReply(gpa, started.line, false);
-    const id = started.parsed.value.status.?.id;
+    const id = replyStatus(started.parsed.value.status).id;
     if (json) try printJson(gpa, started.line) else try stdoutPrint("{d}\n", .{id});
     var id_buf: [20]u8 = undefined;
     const ref = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
@@ -382,7 +534,7 @@ fn runAndWait(gpa: std.mem.Allocator, req: protocol.RunReq, json: bool, stats: b
     }
     // A new session's counters start at 0; one that if_exists kept
     // counts from its status in the first reply.
-    const first_status = started.parsed.value.status.?;
+    const first_status = replyStatus(started.parsed.value.status);
     const base: ?StatsBase = if (!stats) null else if (req.if_exists == .keep) .{
         .out_bytes = first_status.out_bytes,
         .draws = first_status.draws,
@@ -394,6 +546,129 @@ fn runAndWait(gpa: std.mem.Allocator, req: protocol.RunReq, json: bool, stats: b
     if (code == exit_code.ok) return;
     if (running) try stderrPrint(hint, .{ id, id });
     std.process.exit(code);
+}
+
+/// Start a box over another session, print its id, and wait until its
+/// program has ended; then remove the box and print how it ended (with
+/// `json`, the final wait's reply). Interrupted, it stops the box first.
+fn runOver(gpa: std.mem.Allocator, req: protocol.RunReq, json: bool) !void {
+    if (!try daemonSupports(gpa, "over")) runtimeFail("the daemon on {s} is an older tuppet without boxes (run --over); stop that daemon and let this tuppet start its own", .{daemon_path});
+    // Windows has no way to wake the wait below, so Ctrl-C ends run there.
+    if (builtin.os.tag != .windows) installInterruptHandlers();
+    const reply = try call(gpa, req, protocol.StatusResp);
+    defer reply.deinit();
+    const id = replyStatus(reply.parsed.value.status).id;
+    if (json) try printJson(gpa, reply.line) else try stdoutPrint("{d}\n", .{id});
+    var id_buf: [20]u8 = undefined;
+    const ref = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
+    var signal: u8 = 0;
+    const waited = awaitEnd(gpa, ref, &signal) catch |err| switch (@as(anyerror, err)) {
+        // The daemon is gone, and the box with it.
+        error.Eof, error.ConnectionResetByPeer, error.DaemonGone, error.NoDaemon => {
+            try stderrPrint("tuppet: {s}\n", .{errorText(error.DaemonGone).?});
+            if (!json) try stdoutPrint("lost {d}\n", .{id});
+            std.process.exit(if (signal != 0) 128 + signal else exit_code.ended);
+        },
+        else => {
+            stderrPrint("tuppet: box {d} may keep running; 'tuppet stop {d}' ends it\n", .{ id, id }) catch {};
+            return err;
+        },
+    };
+    defer waited.deinit();
+    const resp = waited.parsed.value;
+    const removed = if (resp.ok) resp.outcome == .removed else failedWith(gpa, waited.line, .no_session);
+    if (!resp.ok and !removed) failReply(gpa, waited.line, false);
+    const st = if (removed) null else resp.status;
+    if (st != null) removeBox(gpa, ref);
+    const end = try boxEnd(gpa, st, id);
+    defer gpa.free(end.line);
+    if (json) try printJson(gpa, waited.line) else try stdoutWrite(end.line);
+    const code = if (signal != 0) 128 + signal else end.code;
+    if (code != exit_code.ok) std.process.exit(code);
+}
+
+/// Wait until session `ref` has ended, in waits of at most 10 minutes.
+/// An interrupt meanwhile stops the session, and `signal` says which was
+/// the first; a stop that failed is tried again at the next interrupt.
+/// After an interrupt, the end must come within a request's timeout.
+fn awaitEnd(gpa: std.mem.Allocator, ref: []const u8, signal: *u8) !Reply(protocol.WaitResp) {
+    const req: protocol.WaitReq = .{ .session = ref, .until = &.{.{ .ended = true }}, .timeout_ms = max_wait_ms };
+    var stopped = false;
+    var stop_deadline: ?i64 = null;
+    while (true) {
+        var conn = try ensureDaemon(gpa);
+        defer conn.deinit();
+        try sendRequest(gpa, &conn, req);
+        if (builtin.os.tag != .windows) {
+            const deadline = io_mod.nowNanos() + waitReplyNs(req.timeout_ms);
+            var pfd = [1]std.c.pollfd{.{ .fd = conn.posix.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
+            while (true) {
+                const sig = interrupt_signal.swap(0, .acq_rel);
+                if (sig != 0) {
+                    if (signal.* == 0) signal.* = sig;
+                    if (stop_deadline == null) stop_deadline = io_mod.nowNanos() + ipc.request_timeout_ns;
+                    if (!stopped) stopped = stopBox(gpa, ref);
+                }
+                if (std.c.poll(&pfd, 1, 100) > 0) break;
+                if (io_mod.nowNanos() >= @min(deadline, stop_deadline orelse deadline)) return error.ReadTimeout;
+            }
+        }
+        const split = try conn.recvLineAfter(gpa, max_reply, "", waitReplyNs(req.timeout_ms));
+        gpa.free(split.rest);
+        const reply = try parseReply(gpa, protocol.WaitResp, split.line);
+        if (!reply.parsed.value.ok or reply.parsed.value.outcome != .timeout) return reply;
+        reply.deinit();
+    }
+}
+
+/// Whether the daemon took the stop of session `ref`.
+fn stopBox(gpa: std.mem.Allocator, ref: []const u8) bool {
+    const reply = request(gpa, protocol.StopReq{ .sessions = &.{ref} }, protocol.ResultsResp) catch return false;
+    defer reply.deinit();
+    const resp = reply.parsed.value;
+    return resp.ok and resp.results.len == 1 and resp.results[0].ok;
+}
+
+/// Remove the ended box `ref`, so that ended boxes do not collect. Sent
+/// once: a daemon that is shutting down keeps it, and starts no other.
+fn removeBox(gpa: std.mem.Allocator, ref: []const u8) void {
+    const reply = requestOnce(gpa, protocol.RemoveReq{ .sessions = &.{ref} }, protocol.ResultsResp, ipc.request_timeout_ns) catch |err| {
+        stderrPrint("tuppet: cannot remove box {s}: {s}\n", .{ ref, errorText(err) orelse @errorName(err) }) catch {};
+        return;
+    };
+    defer reply.deinit();
+    const resp = reply.parsed.value;
+    if (resp.ok and (resp.results.len != 1 or resp.results[0].ok)) return;
+    const text = (if (resp.ok) gpa.dupe(u8, resp.results[0].err orelse "the request failed") else failureText(gpa, reply.line)) catch return;
+    defer gpa.free(text);
+    stderrPrint("tuppet: cannot remove box {s}: {f}\n", .{ ref, status.cleaned(text) }) catch {};
+}
+
+const BoxEnd = struct { line: []u8, code: u8 };
+
+/// How box `id` ended, from its final status (null once it is gone): the
+/// outcome line, and the exit code. Only a program that ended by itself
+/// in a box that was held (shown, with grab never) passes its own code.
+fn boxEnd(gpa: std.mem.Allocator, final: ?Status, id: u64) !BoxEnd {
+    const st = final orelse return .{ .line = try std.fmt.allocPrint(gpa, "lost {d}\n", .{id}), .code = exit_code.ended };
+    if (st.state == .lost) return .{ .line = try std.fmt.allocPrint(gpa, "lost {d}\n", .{id}), .code = exit_code.ended };
+    const over = st.over orelse status.Over{};
+    const seen = .{ if (over.held) "yes" else "no", if (over.shown) "yes" else "no" };
+    const exit = st.exit orelse status.Exit{};
+    if (over.ended_by != null or exit.stopped) {
+        const reason = if (over.ended_by) |by| @tagName(by) else "stopped";
+        return .{
+            .line = try std.fmt.allocPrint(gpa, "stopped {d} reason={s} held={s} shown={s}\n", .{ id, reason, seen[0], seen[1] }),
+            .code = if (over.ended_by == .unseen) exit_code.timeout else exit_code.ended,
+        };
+    }
+    var exit_buf: [32]u8 = undefined;
+    const exit_text = if (exit.code) |code| std.fmt.bufPrint(&exit_buf, "{d}", .{code}) catch unreachable else exit.signal orelse "-";
+    const own: u8 = if (exit.code) |code| @truncate(@as(u32, @bitCast(code))) else @truncate(128 + @as(u32, attach_client.signalNumber(exit.signal orelse "")));
+    return .{
+        .line = try std.fmt.allocPrint(gpa, "ended {d} exit={f} held={s} shown={s}\n", .{ id, status.cleaned(exit_text), seen[0], seen[1] }),
+        .code = if (over_mod.seenEnough(over)) own else exit_code.ended,
+    };
 }
 
 /// The daemon's sessions, for the picker.
@@ -418,14 +693,21 @@ pub fn cmdList(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const reply = try call(gpa, protocol.ListReq{ .sessions = if (refs.items.len > 0) refs.items else null }, protocol.ListResp);
     defer reply.deinit();
     if (json) return printJson(gpa, reply.line);
-    const table = try listTable(gpa, reply.parsed.value.sessions, nowMillis());
+    const sessions = reply.parsed.value.sessions;
+    // Whether a box waits over a session depends on the box's status.
+    const others = for (sessions) |s| {
+        if (refs.items.len > 0 and s.under.len > 0) break try call(gpa, protocol.ListReq{}, protocol.ListResp);
+    } else null;
+    defer if (others) |r| r.deinit();
+    const table = try listTable(gpa, sessions, if (others) |r| r.parsed.value.sessions else sessions, nowMillis());
     defer gpa.free(table);
     try stdoutWrite(table);
 }
 
 /// The sessions as `tuppet list` prints them: one aligned table with a
-/// header, the same in a terminal and in a pipe.
-fn listTable(gpa: std.mem.Allocator, sessions: []const Status, now_ms: i64) ![]u8 {
+/// header, the same in a terminal and in a pipe. `all` holds them and
+/// the boxes over them.
+fn listTable(gpa: std.mem.Allocator, sessions: []const Status, all: []const Status, now_ms: i64) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -436,10 +718,10 @@ fn listTable(gpa: std.mem.Allocator, sessions: []const Status, now_ms: i64) ![]u
         var buf: [64]u8 = undefined;
         var cmd_buf: [4096]u8 = undefined;
         row.* = .{
-            .mark = if (words.needsAttention(s)) "!" else "",
+            .mark = if (words.needsAttention(s, all)) "!" else "",
             .id = try std.fmt.allocPrint(a, "{d}", .{s.id}),
             .name = s.name orelse "-",
-            .state = try a.dupe(u8, words.stateWord(&buf, s)),
+            .state = try a.dupe(u8, words.stateWord(&buf, s, all)),
             .age = try a.dupe(u8, words.ageSince(&buf, s.started_ms, now_ms)),
             .cmd = try a.dupe(u8, words.commandText(&cmd_buf, s.argv)),
         };
@@ -477,10 +759,11 @@ const TableRow = struct {
 test "the list table aligns its columns" {
     const gpa = std.testing.allocator;
     const now: i64 = 1_000_000;
-    const table = try listTable(gpa, &.{
+    const sessions: []const Status = &.{
         .{ .id = 3, .name = "web", .state = .running, .argv = &.{ "npm", "start" }, .started_ms = now - 120_000 },
         .{ .id = 12, .state = .exited, .exit = .{ .code = 2 }, .argv = &.{"make"}, .started_ms = now - 5_000 },
-    }, now);
+    };
+    const table = try listTable(gpa, sessions, sessions, now);
     defer gpa.free(table);
     try std.testing.expectEqualStrings(
         \\!  ID  NAME  STATE     AGE  CMD
@@ -532,7 +815,11 @@ pub fn cmdRename(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var json = false;
     var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(gpa);
-    for (args) |a| {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--")) {
+            try rest.appendSlice(gpa, args[i..]);
+            break;
+        }
         if (isOpt(a, "--json", "-j")) json = true else try rest.append(gpa, a);
     }
     const ops = try takeOperands(rest.items, 2, "usage: tuppet rename <session> <name> [-j] ('' takes the name away)");
@@ -542,6 +829,289 @@ pub fn cmdRename(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const reply = try call(gpa, protocol.RenameReq{ .session = ops[0], .name = name }, protocol.StatusResp);
     defer reply.deinit();
     if (json) return printJson(gpa, reply.line);
+}
+
+/// KEY=VALUE of --meta; an empty value takes the key away in an update.
+fn metaValue(args: []const []const u8, i: *usize) !status.MetaValue {
+    const spec = try optValue(args, i);
+    const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return cliFail("invalid --meta '{s}' (expected KEY=VALUE)", .{spec});
+    if (names.nameErrorOf(spec[0..eq], "meta key")) |why| return cliFail("invalid --meta '{s}': {s}", .{ spec, why });
+    return .{ .key = spec[0..eq], .value = spec[eq + 1 ..] };
+}
+
+/// An --action spec: KEY[!]:NAME, then optionally :CHOICE|CHOICE... for a
+/// choice the switcher asks for, or :?HINT for a line of text.
+pub fn parseAction(gpa: std.mem.Allocator, spec: []const u8) !?status.Action {
+    var parts = std.mem.splitScalar(u8, spec, ':');
+    const head = parts.next().?;
+    const name = parts.next() orelse return null;
+    const rest = parts.rest();
+    if (head.len == 0 or head.len > 2 or (head.len == 2 and head[1] != '!') or name.len == 0) return null;
+    var out: status.Action = .{ .key = head[0..1], .name = name, .confirm = head.len == 2 };
+    if (parts.index != null) {
+        if (std.mem.startsWith(u8, rest, "?")) {
+            out.input = rest[1..];
+        } else {
+            var choices: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, rest, '|');
+            while (it.next()) |c| {
+                if (c.len == 0) return null;
+                try choices.append(gpa, c);
+            }
+            out.choices = choices.items;
+        }
+    }
+    return out;
+}
+
+fn actionValue(gpa: std.mem.Allocator, args: []const []const u8, i: *usize) !status.Action {
+    const spec = try optValue(args, i);
+    return try parseAction(gpa, spec) orelse cliFail("invalid --action '{s}' (expected KEY[!]:NAME, KEY:NAME:CHOICE|CHOICE..., or KEY:NAME:?HINT)", .{spec});
+}
+
+fn sideViewValue(args: []const []const u8, i: *usize) !status.SideView {
+    const value = try optValue(args, i);
+    return std.meta.stringToEnum(status.SideView, value) orelse cliFail("invalid view '{s}' (choose compact, half, or full)", .{value});
+}
+
+test "an action spec gives its key, a second press, choices, or a hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const close = (try parseAction(a, "x!:close")).?;
+    try std.testing.expectEqualStrings("x", close.key);
+    try std.testing.expect(close.confirm);
+    const share = (try parseAction(a, "s:share:Once|Live|Stop")).?;
+    try std.testing.expectEqual(@as(usize, 3), share.choices.len);
+    try std.testing.expectEqualStrings("Live", share.choices[1]);
+    try std.testing.expectEqualStrings("[user@]host", (try parseAction(a, "o:open:?[user@]host")).?.input.?);
+    for ([_][]const u8{ "s", "s:", "xy:name", "s:share:a||b" }) |bad| try std.testing.expect(try parseAction(a, bad) == null);
+}
+
+/// Send `req`, whose connection the daemon keeps as the session's lease,
+/// print the session's id (the reply with -j), and hold the lease until
+/// the session ends and the daemon closes it. Ending this command earlier
+/// stops the session.
+fn holdLease(gpa: std.mem.Allocator, req: anytype, json: bool) !void {
+    try checkProtocol(gpa);
+    var conn = try ensureDaemon(gpa);
+    defer conn.deinit();
+    try sendRequest(gpa, &conn, req);
+    const first = try conn.recvLineAfter(gpa, max_reply, "", ipc.request_timeout_ns);
+    defer gpa.free(first.rest);
+    const reply = try parseReply(gpa, protocol.StatusResp, first.line);
+    defer reply.deinit();
+    if (!reply.parsed.value.ok) failReply(gpa, reply.line, false);
+    if (json) try printJson(gpa, reply.line) else try stdoutPrint("{d}\n", .{replyStatus(reply.parsed.value.status).id});
+    // Nothing more comes: the stream's end is the session's.
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = std.c.read(conn.posix.socket.handle, &buf, buf.len);
+        if (n == 0) return;
+        if (n < 0) switch (std.posix.errno(n)) {
+            .INTR, .AGAIN => continue,
+            else => return,
+        };
+    }
+}
+
+const update_usage = "usage: tuppet update <session> [--label TEXT] [--accent | --no-accent] [--mark M | --no-mark] [--group G] [--meta K=V]... [--action SPEC]... [--no-actions] [-j]";
+
+/// Change what a caller says about a session as a member of a group.
+pub fn cmdUpdate(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var req: protocol.UpdateReq = .{ .session = "" };
+    var json = false;
+    var ref: ?[]const u8 = null;
+    var meta: std.ArrayList(status.MetaValue) = .empty;
+    defer meta.deinit(gpa);
+    var actions: std.ArrayList(status.Action) = .empty;
+    defer actions.deinit(gpa);
+    var no_actions = false;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--label")) {
+            req.label = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--accent") or std.mem.eql(u8, a, "--no-accent")) {
+            req.accent = std.mem.eql(u8, a, "--accent");
+        } else if (std.mem.eql(u8, a, "--mark")) {
+            req.mark = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--no-mark")) {
+            req.mark = "";
+        } else if (std.mem.eql(u8, a, "--group")) {
+            const g = try optValue(args, &i);
+            if (g.len > 0) if (names.nameErrorOf(g, "group name")) |why| return cliFail("invalid group '{s}': {s}", .{ g, why });
+            req.group = g;
+        } else if (std.mem.eql(u8, a, "--meta")) {
+            try meta.append(gpa, try metaValue(args, &i));
+        } else if (std.mem.eql(u8, a, "--action")) {
+            try actions.append(gpa, try actionValue(arena.allocator(), args, &i));
+        } else if (std.mem.eql(u8, a, "--no-actions")) {
+            no_actions = true;
+        } else if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, update_usage);
+        } else if (ref != null) {
+            return cliFail(update_usage, .{});
+        } else {
+            try checkRef(a);
+            ref = a;
+        }
+    }
+    req.session = ref orelse return cliFail(update_usage, .{});
+    if (no_actions and actions.items.len > 0) return cliFail("--no-actions takes the actions away; drop it or --action", .{});
+    if (meta.items.len > 0) req.meta = meta.items;
+    if (actions.items.len > 0 or no_actions) req.actions = actions.items;
+    const reply = try call(gpa, req, protocol.StatusResp);
+    defer reply.deinit();
+    if (json) return printJson(gpa, reply.line);
+}
+
+const side_usage = "usage: tuppet side <session> --view compact|half|full [-j] | side <session> --request [-j]";
+
+/// Set a side session's view, or report that one was asked for.
+pub fn cmdSide(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var req: protocol.SideReq = .{ .session = "" };
+    var json = false;
+    var ref: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--view")) {
+            req.view = try sideViewValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--request")) {
+            req.request = true;
+        } else if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, side_usage);
+        } else if (ref != null) {
+            return cliFail(side_usage, .{});
+        } else {
+            try checkRef(a);
+            ref = a;
+        }
+    }
+    req.session = ref orelse return cliFail(side_usage, .{});
+    if ((req.view != null) == req.request) return cliFail(side_usage, .{});
+    const reply = try call(gpa, req, protocol.StatusResp);
+    defer reply.deinit();
+    if (json) return printJson(gpa, reply.line);
+}
+
+const flag_usage = "usage: tuppet flag <session> --attention TEXT | --clear [-j]";
+
+/// Flag a session as needing attention, or clear the flag.
+pub fn cmdFlag(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var req: protocol.FlagReq = .{ .session = "" };
+    var json = false;
+    var ref: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--attention")) {
+            req.attention = try optValue(args, &i);
+        } else if (std.mem.eql(u8, a, "--clear")) {
+            req.clear = true;
+        } else if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, flag_usage);
+        } else if (ref != null) {
+            return cliFail(flag_usage, .{});
+        } else {
+            try checkRef(a);
+            ref = a;
+        }
+    }
+    req.session = ref orelse return cliFail(flag_usage, .{});
+    if ((req.attention != null) == req.clear) return cliFail(flag_usage, .{});
+    const reply = try call(gpa, req, protocol.StatusResp);
+    defer reply.deinit();
+    if (json) return printJson(gpa, reply.line);
+}
+
+/// Keep a session alive while this command runs.
+pub fn cmdLease(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var json = false;
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(gpa);
+    for (args) |a| {
+        if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, "usage: tuppet lease <session> [-j]");
+        } else try rest.append(gpa, a);
+    }
+    const ops = try takeOperands(rest.items, 1, "usage: tuppet lease <session> [-j]");
+    try checkRef(ops[0]);
+    return holdLease(gpa, protocol.LeaseReq{ .session = ops[0] }, json);
+}
+
+const respawn_usage = "usage: tuppet respawn <session> [--env NAME=VALUE]... [-j]";
+
+/// Start an ended session's program again, in a session that takes its
+/// place: its screen, name, group, number, and side session.
+pub fn cmdRespawn(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var env: std.ArrayList([]const u8) = .empty;
+    defer env.deinit(gpa);
+    var json = false;
+    var ref: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--env")) {
+            const entry = try optValue(args, &i);
+            if (std.mem.indexOfScalar(u8, entry, '=') == null) return cliFail("invalid --env '{s}' (expected NAME=VALUE)", .{entry});
+            try env.append(gpa, entry);
+        } else if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, respawn_usage);
+        } else if (ref != null) {
+            return cliFail(respawn_usage, .{});
+        } else {
+            try checkRef(a);
+            ref = a;
+        }
+    }
+    const reply = try call(gpa, protocol.RespawnReq{ .session = ref orelse return cliFail(respawn_usage, .{}), .env = env.items }, protocol.StatusResp);
+    defer reply.deinit();
+    if (json) return printJson(gpa, reply.line);
+    try stdoutPrint("{d}\n", .{replyStatus(reply.parsed.value.status).id});
+}
+
+const commands_usage = "usage: tuppet commands <session> [N] [-j]";
+
+/// The latest commands a session's shell marks reported.
+pub fn cmdCommands(gpa: std.mem.Allocator, args: []const []const u8) !void {
+    var json = false;
+    var rest: std.ArrayList([]const u8) = .empty;
+    defer rest.deinit(gpa);
+    for (args) |a| {
+        if (isOpt(a, "--json", "-j")) {
+            json = true;
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, commands_usage);
+        } else try rest.append(gpa, a);
+    }
+    if (rest.items.len < 1 or rest.items.len > 2) return cliFail(commands_usage, .{});
+    try checkRef(rest.items[0]);
+    var last: ?u32 = null;
+    if (rest.items.len == 2) last = protocol.parseDecimal(u32, rest.items[1]) orelse return cliFail("invalid count '{s}' (expected 1 to 50)", .{rest.items[1]});
+    const reply = try call(gpa, protocol.CommandsReq{ .session = rest.items[0], .last = last }, protocol.CommandsResp);
+    defer reply.deinit();
+    if (json) return printJson(gpa, reply.line);
+    for (reply.parsed.value.commands) |c| {
+        var code_buf: [16]u8 = undefined;
+        const code = if (c.exit) |e| std.fmt.bufPrint(&code_buf, "{d}", .{e}) catch "-" else "-";
+        try stdoutPrint("{d} exit={s} {f}\n", .{ c.n, code, status.cleaned(c.command) });
+        var lines = std.mem.splitScalar(u8, c.output, '\n');
+        while (lines.next()) |line| if (c.output.len > 0) try stdoutPrint("  {f}\n", .{status.cleaned(line)});
+    }
 }
 
 const alert_usage = "usage: tuppet alert add <session> NAME=TEXT [--icase] [-j] | alert list [<session>...] [-j] | alert remove <session> NAME [-j]";
@@ -641,7 +1211,9 @@ pub fn cmdRestart(gpa: std.mem.Allocator, args: []const []const u8) !void {
     for (args) |a| {
         if (isOpt(a, "--json", "-j")) {
             json = true;
-        } else if (std.mem.startsWith(u8, a, "-") or ref != null) {
+        } else if (std.mem.startsWith(u8, a, "-")) {
+            return unknownOption(a, usage);
+        } else if (ref != null) {
             return cliFail("unexpected argument '{s}' ({s})", .{ a, usage });
         } else ref = a;
     }
@@ -657,7 +1229,7 @@ pub fn cmdRestart(gpa: std.mem.Allocator, args: []const []const u8) !void {
     const reply = try call(gpa, protocol.RunReq{ .like = std.fmt.bufPrint(&id_buf, "{d}", .{old.id}) catch unreachable, .env = env }, protocol.StatusResp);
     defer reply.deinit();
     if (json) return printJson(gpa, reply.line);
-    try stdoutPrint("{d}\n", .{reply.parsed.value.status.?.id});
+    try stdoutPrint("{d}\n", .{replyStatus(reply.parsed.value.status).id});
 }
 
 /// The one session `ref` picks among `found`, or a failure that says why.
@@ -716,7 +1288,11 @@ pub fn cmdResize(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var json = false;
     var rest: std.ArrayList([]const u8) = .empty;
     defer rest.deinit(gpa);
-    for (args) |a| {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--")) {
+            try rest.appendSlice(gpa, args[i..]);
+            break;
+        }
         if (isOpt(a, "--json", "-j")) json = true else try rest.append(gpa, a);
     }
     const ops = try takeOperands(rest.items, 2, usage);
@@ -792,7 +1368,7 @@ pub fn stylesText(gpa: std.mem.Allocator, st: protocol.Styles, limit: usize) ![]
     try w.writeAll("\n");
     if (st.truncated) try w.writeAll("(runs of the rows above were left out to fit the reply)\n");
     for (st.runs[0..@min(st.runs.len, limit)]) |run| {
-        try w.print("{d}:{d}-{d}", .{ run.row, run.col, run.col + run.cols -| 1 });
+        try w.print("{d}:{d}-{d}", .{ run.row, run.col, run.col +| (run.cols -| 1) });
         _ = try writeAttrs(w, run.attrs, st.base);
         try w.writeAll(" \"");
         for (run.text) |c| {
@@ -803,6 +1379,14 @@ pub fn stylesText(gpa: std.mem.Allocator, st: protocol.Styles, limit: usize) ![]
     }
     if (st.runs.len > limit) try w.print("... {d} more runs; 'tuppet view --styles -j' lists them all\n", .{st.runs.len - limit});
     return out.toOwnedSlice();
+}
+
+test "a style run at the end of the u32 range prints" {
+    const gpa = std.testing.allocator;
+    const run: protocol.Styles = .{ .runs = &.{.{ .row = 1, .col = std.math.maxInt(u32), .cols = 2, .text = "x", .attrs = .{ .bold = true } }} };
+    const text = try stylesText(gpa, run, 1);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("base: default\n1:4294967295-4294967295 bold \"x\"\n", text);
 }
 
 /// ` key=value` for each attribute of `attrs` that differs from `base`;
@@ -844,6 +1428,10 @@ pub fn cmdPng(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (std.mem.eql(u8, a, "--")) {
+            try rest.appendSlice(gpa, args[i..]);
+            break;
+        }
         if (isOpt(a, "--fonts", "-f")) {
             spec = try optValue(args, &i);
         } else if (std.mem.eql(u8, a, "--font-size")) {
@@ -1032,6 +1620,7 @@ pub fn cmdRecord(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var mark: ?[]const u8 = null;
     var stop = false;
     var input = false;
+    var passwords = false;
     var json = false;
     var max_ms: ?u64 = null;
     var conditions = false;
@@ -1052,6 +1641,8 @@ pub fn cmdRecord(gpa: std.mem.Allocator, args: []const []const u8) !void {
             stop = true;
         } else if (std.mem.eql(u8, a, "--input")) {
             input = true;
+        } else if (std.mem.eql(u8, a, "--passwords")) {
+            passwords = true;
         } else if (isOpt(a, "--json", "-j")) {
             json = true;
         } else if (std.mem.startsWith(u8, a, "-")) {
@@ -1077,9 +1668,10 @@ pub fn cmdRecord(gpa: std.mem.Allocator, args: []const []const u8) !void {
         2 => return cliFail("{s} and {s} conflict: give one of them", .{ actions[0], actions[1] }),
         else => return cliFail("--start, --mark, and --stop conflict: give one of them", .{}),
     }
-    if (start == null and (conditions or max_ms != null or input)) {
-        return cliFail("conditions, -t, and --input go with --start", .{});
+    if (start == null and (conditions or max_ms != null or input or passwords)) {
+        return cliFail("conditions, -t, --input, and --passwords go with --start", .{});
     }
+    if (passwords) try needPasswords(gpa);
     var req: protocol.RecordReq = .{ .session = session, .mark = mark, .stop = stop };
     if (start) |path| {
         const format = try recordFileFormat("--start", path);
@@ -1088,6 +1680,7 @@ pub fn cmdRecord(gpa: std.mem.Allocator, args: []const []const u8) !void {
             .path = try absolutePath(gpa, path),
             .format = format,
             .input = input,
+            .passwords = if (passwords) true else null,
             .until = if (until.len > 0) until else null,
             .max_ms = max_ms,
         };
@@ -1180,6 +1773,7 @@ pub fn waitDuration(args: []const []const u8, i: *usize) !u64 {
 const ConditionFlags = struct {
     until: std.ArrayList(protocol.Condition) = .empty,
     icase: bool = false,
+    regex: bool = false,
     after_input: bool = false,
     since: ?u64 = null,
     after_hit: ?u64 = null,
@@ -1211,6 +1805,8 @@ const ConditionFlags = struct {
             f.after_hit = try hitNumber(args, i);
         } else if (std.mem.eql(u8, a, "--icase")) {
             f.icase = true;
+        } else if (std.mem.eql(u8, a, "--regex")) {
+            f.regex = true;
         } else if (std.mem.eql(u8, a, "--after-input")) {
             f.after_input = true;
         } else if (std.mem.eql(u8, a, "--since")) {
@@ -1227,6 +1823,7 @@ const ConditionFlags = struct {
         if (f.after_input and f.since != null) return cliFail("--after-input and --since cannot be combined", .{});
         if (f.until.items.len == 0) {
             if (f.icase) return cliFail("--icase needs -m TEXT or --gone TEXT", .{});
+            if (f.regex) return cliFail("--regex needs -m TEXT or --gone TEXT", .{});
             // Alone, they wait for any text change after that point.
             if (f.after_input or f.since != null) {
                 try f.until.append(gpa, .{});
@@ -1239,6 +1836,12 @@ const ConditionFlags = struct {
         if (f.icase) for (f.until.items) |c| {
             if (c.match != null) break;
         } else return cliFail("--icase needs -m TEXT or --gone TEXT", .{});
+        if (f.regex) {
+            for (f.until.items) |c| {
+                if (c.match != null) break;
+            } else return cliFail("--regex needs -m TEXT or --gone TEXT", .{});
+            try needRegex(gpa);
+        }
         if (f.after_hit != null) for (f.until.items) |c| {
             if (c.hit != null) break;
         } else return cliFail("--after-hit needs --hit NAME", .{});
@@ -1246,7 +1849,10 @@ const ConditionFlags = struct {
             if (c.absent) return cliFail("--gone counts from the wait's start; it cannot be combined with {s}", .{if (f.after_input) "--after-input" else "--since"});
         };
         for (f.until.items) |*c| {
-            if (c.match != null) c.icase = f.icase;
+            if (c.match != null) {
+                c.icase = f.icase;
+                c.regex = f.regex;
+            }
             if (c.hit) |*h| h.after_hit = f.after_hit;
             if (f.after_input) c.after_input = .latest;
             c.since = f.since;
@@ -1259,7 +1865,7 @@ const ConditionFlags = struct {
     }
 };
 
-const wait_usage = "usage: tuppet wait <session>... [-m TEXT] [--gone TEXT] [-e] [-i DUR] [--settled DUR] [--hidden-input] [--hit NAME] [--icase] [--after-input] [--since SEQ] [--after-hit N] [-t DUR] [--any] [--view] [--stats] [-j]";
+const wait_usage = "usage: tuppet wait <session>... [-m TEXT] [--gone TEXT] [-e] [-i DUR] [--settled DUR] [--hidden-input] [--hit NAME] [--icase] [--regex] [--after-input] [--since SEQ] [--after-hit N] [-t DUR] [--any] [--view] [--stats] [-j]";
 
 pub fn cmdWait(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var flags: ConditionFlags = .{};
@@ -1367,7 +1973,20 @@ const StatsBase = struct {
     fn of(gpa: std.mem.Allocator, ref: []const u8, since: ?u64, after_input: bool) !StatsBase {
         const listed = try call(gpa, protocol.ListReq{ .sessions = &.{ref} }, protocol.ListResp);
         defer listed.deinit();
-        const st = try onlyOne(gpa, ref, listed.parsed.value.sessions);
+        return at(try onlyOne(gpa, ref, listed.parsed.value.sessions), since, after_input);
+    }
+
+    /// As `of`, but null when the list fails or `ref` picks no one
+    /// session: the request that follows says why.
+    fn find(gpa: std.mem.Allocator, ref: []const u8, since: ?u64, after_input: bool) !?StatsBase {
+        const listed = try request(gpa, protocol.ListReq{ .sessions = &.{ref} }, protocol.ListResp);
+        defer listed.deinit();
+        const found = listed.parsed.value.sessions;
+        if (!listed.parsed.value.ok or found.len != 1) return null;
+        return at(found[0], since, after_input);
+    }
+
+    fn at(st: Status, since: ?u64, after_input: bool) StatsBase {
         const seq = st.seq orelse st.start_seq;
         return .{
             .out_bytes = st.out_bytes,
@@ -1441,61 +2060,129 @@ const Stats = struct {
 
 /// One wait per session, each on its own connection; the first session
 /// to meet a condition wins, and leaving closes the others' connections,
-/// which ends their waits.
+/// which ends their waits. Waits that a stopping daemon refused go again,
+/// to the next daemon.
 fn waitAny(gpa: std.mem.Allocator, template: protocol.WaitReq, refs: []const []const u8, out: WaitOutput) !void {
-    // Checked once, before the threads share the connection state.
-    try checkProtocol(gpa);
+    var retried = false;
+    round: while (true) {
+        try checkProtocol(gpa);
+        const waits = try AnyWaits.start(gpa, template, refs);
+        defer waits.release();
+        var left = refs.len;
+        while (left > 0) {
+            const count = waits.finished.load(.acquire);
+            for (waits.slots) |*slot| {
+                if (slot.seen or !slot.ready.load(.acquire)) continue;
+                slot.seen = true;
+                left -= 1;
+                if (slot.err) |err| return err;
+                const line = slot.line.?;
+                slot.line = null;
+                slot.reply = try parseReply(gpa, protocol.WaitResp, line);
+                const reply = slot.reply.?;
+                if (!reply.parsed.value.ok) {
+                    if (!retried and try nextDaemon(gpa, reply.line, true)) {
+                        retried = true;
+                        continue :round;
+                    }
+                    failReply(gpa, reply.line, false);
+                }
+                // The other waits end with their connections.
+                if (reply.parsed.value.outcome == .met) std.process.exit(try reportWait(gpa, reply, slot.req, out));
+            }
+            if (left == 0) break;
+            io_mod.io().futexWaitTimeout(u32, &waits.finished.raw, count, .{
+                .duration = .{ .raw = .fromMilliseconds(100), .clock = .boot },
+            }) catch {};
+        }
+        // None was met: each session's outcome, in order.
+        var exit: u8 = exit_code.ended;
+        for (waits.slots) |*slot| {
+            if (try reportWait(gpa, slot.reply.?, slot.req, out) == exit_code.timeout) exit = exit_code.timeout;
+        }
+        std.process.exit(exit);
+    }
+}
+
+/// The waits of `wait --any`: sent from the command's thread, and each
+/// read on a thread of its own that touches nothing but its slot. The
+/// last holder frees them, so the command may leave while some are still
+/// read.
+const AnyWaits = struct {
+    gpa: std.mem.Allocator,
+    slots: []Slot,
+    /// The command, and each reader that has not finished.
+    holders: std.atomic.Value(u32) = .init(1),
+    /// Readers finished.
+    finished: std.atomic.Value(u32) = .init(0),
+
     const Slot = struct {
+        /// The reader's, which closes it.
+        conn: ipc.Conn,
         req: protocol.WaitReq,
-        reply: ?Reply(protocol.WaitResp) = null,
+        /// Set by the reader before `ready`.
+        line: ?[]u8 = null,
         err: ?anyerror = null,
         ready: std.atomic.Value(bool) = .init(false),
+        /// The command's, after `ready`.
         seen: bool = false,
+        reply: ?Reply(protocol.WaitResp) = null,
     };
-    const Finished = struct {
-        count: std.atomic.Value(u32) = .init(0),
 
-        fn one(finished: *@This(), slot: *Slot, a: std.mem.Allocator) void {
-            if (requestWait(a, slot.req)) |reply| slot.reply = reply else |err| slot.err = err;
-            slot.ready.store(true, .release);
-            _ = finished.count.fetchAdd(1, .acq_rel);
-            io_mod.io().futexWake(u32, &finished.count.raw, 1);
+    /// Send a wait for each of `refs`, on a connection of its own, and
+    /// start a reader for each. The connection state is the command's: it
+    /// was checked before.
+    fn start(gpa: std.mem.Allocator, template: protocol.WaitReq, refs: []const []const u8) !*AnyWaits {
+        const waits = sent: {
+            const waits = try gpa.create(AnyWaits);
+            errdefer gpa.destroy(waits);
+            waits.* = .{ .gpa = gpa, .slots = try gpa.alloc(Slot, refs.len) };
+            errdefer gpa.free(waits.slots);
+            var opened: usize = 0;
+            errdefer for (waits.slots[0..opened]) |*slot| slot.conn.deinit();
+            for (refs, waits.slots) |ref, *slot| {
+                slot.* = .{ .conn = try ensureDaemon(gpa), .req = template };
+                opened += 1;
+                slot.req.session = ref;
+                try sendRequest(gpa, &slot.conn, slot.req);
+            }
+            break :sent waits;
+        };
+        for (waits.slots, 0..) |*slot, i| {
+            _ = waits.holders.fetchAdd(1, .monotonic);
+            const thread = std.Thread.spawn(.{}, read, .{ waits, slot }) catch |err| {
+                _ = waits.holders.fetchSub(1, .monotonic);
+                for (waits.slots[i..]) |*rest| rest.conn.deinit();
+                waits.release();
+                return err;
+            };
+            thread.detach();
         }
-    };
-    const slots = try gpa.alloc(Slot, refs.len);
-    defer gpa.free(slots);
-    var finished: Finished = .{};
-    for (refs, slots) |ref, *slot| {
-        slot.* = .{ .req = template };
-        slot.req.session = ref;
-        const thread = try std.Thread.spawn(.{}, Finished.one, .{ &finished, slot, gpa });
-        thread.detach();
+        return waits;
     }
-    var exit: u8 = exit_code.ended;
-    var left = refs.len;
-    while (left > 0) {
-        const count = finished.count.load(.acquire);
-        for (slots) |*slot| {
-            if (slot.seen or !slot.ready.load(.acquire)) continue;
-            slot.seen = true;
-            left -= 1;
-            if (slot.err) |err| return err;
-            const reply = slot.reply.?;
-            if (!reply.parsed.value.ok) failReply(gpa, reply.line, false);
-            // The other waits end with their connections.
-            if (reply.parsed.value.outcome == .met) std.process.exit(try reportWait(gpa, reply, slot.req, out));
+
+    fn read(waits: *AnyWaits, slot: *Slot) void {
+        if (slot.conn.recvLineAfter(waits.gpa, max_reply, "", waitReplyNs(slot.req.timeout_ms))) |split| {
+            waits.gpa.free(split.rest);
+            slot.line = split.line;
+        } else |err| slot.err = err;
+        slot.conn.deinit();
+        slot.ready.store(true, .release);
+        _ = waits.finished.fetchAdd(1, .acq_rel);
+        io_mod.io().futexWake(u32, &waits.finished.raw, 1);
+        waits.release();
+    }
+
+    fn release(waits: *AnyWaits) void {
+        if (waits.holders.fetchSub(1, .acq_rel) != 1) return;
+        for (waits.slots) |*slot| {
+            if (slot.reply) |reply| reply.deinit();
+            if (slot.line) |line| waits.gpa.free(line);
         }
-        if (left == 0) break;
-        io_mod.io().futexWaitTimeout(u32, &finished.count.raw, count, .{
-            .duration = .{ .raw = .fromMilliseconds(100), .clock = .boot },
-        }) catch {};
+        waits.gpa.free(waits.slots);
+        waits.gpa.destroy(waits);
     }
-    // None was met: each session's outcome, in order.
-    for (slots) |*slot| {
-        if (try reportWait(gpa, slot.reply.?, slot.req, out) == exit_code.timeout) exit = exit_code.timeout;
-    }
-    std.process.exit(exit);
-}
+};
 
 /// Send a wait request, whose reply may take as long as its timeout.
 fn requestWait(gpa: std.mem.Allocator, req: protocol.WaitReq) !Reply(protocol.WaitResp) {
@@ -1504,7 +2191,7 @@ fn requestWait(gpa: std.mem.Allocator, req: protocol.WaitReq) !Reply(protocol.Wa
 }
 
 /// How long the reply to a wait may take: its timeout, and some slack.
-fn waitReplyNs(timeout_ms: u64) i64 {
+pub fn waitReplyNs(timeout_ms: u64) i64 {
     return @as(i64, @intCast(timeout_ms)) * std.time.ns_per_ms + 10 * std.time.ns_per_s;
 }
 
@@ -1589,7 +2276,7 @@ pub fn statusLine(gpa: std.mem.Allocator, word: []const u8, what: []const u8, st
         // As list says it: whoever stopped it knows the signal.
         if (exit.stopped) {
             try w.writeAll(" exit=stopped");
-        } else if (exit.code) |code| try w.print(" exit={d}", .{code}) else try w.print(" exit={s}", .{exit.signal orelse "-"});
+        } else if (exit.code) |code| try w.print(" exit={d}", .{code}) else try w.print(" exit={f}", .{status.cleaned(exit.signal orelse "-")});
     }
     try w.print("{s}\n", .{suffix});
     return out.toOwnedSlice();
@@ -1685,7 +2372,7 @@ fn eachSession(gpa: std.mem.Allocator, args: []const []const u8, comptime action
         if (force and code == .no_session) continue;
         const this = exitFor(@tagName(code));
         exit = if (exit == exit_code.ok or exit == this) this else exit_code.failed;
-        if (!json) try stderrPrint("tuppet: {s}\n", .{result.err orelse @tagName(action) ++ " failed"});
+        if (!json) try stderrPrint("tuppet: {f}\n", .{status.cleaned(result.err orelse @tagName(action) ++ " failed")});
     }
     if (json) try printJson(gpa, reply.line);
     if (exit != exit_code.ok) std.process.exit(exit);
@@ -1768,7 +2455,7 @@ fn shutdownOn(gpa: std.mem.Allocator, path: []const u8, reset: bool, json: bool)
         defer gpa.free(text);
         try stdoutPrint("{s}\n", .{text});
     }
-    for (resp.failed) |failure| try stderrPrint("tuppet: {s}\n", .{failure.err});
+    for (resp.failed) |failure| try stderrPrint("tuppet: {f}\n", .{status.cleaned(failure.err)});
     if (!gone) return notGone(path);
     return if (resp.failed.len > 0) exit_code.failed else exit_code.ok;
 }
@@ -1883,6 +2570,10 @@ const EventFrame = struct {
     status: ?Status = null,
     reason: ?[]const u8 = null,
     hit: ?protocol.Hit = null,
+    key: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    code: ?i32 = null,
+    view: ?status.SideView = null,
 };
 
 const EventsOutput = struct {
@@ -1905,7 +2596,7 @@ pub fn cmdEvents(gpa: std.mem.Allocator, args: []const []const u8) !void {
         const a = args[i];
         if (isOpt(a, "--idle", "-i")) {
             idle_ms = try durationValue(args, &i, 1);
-            if (idle_ms.? > std.time.ms_per_day) return cliFail("{s} must be at most 1d", .{a});
+            if (idle_ms.? > std.time.ms_per_day) return cliFail("{s} must be at most 24h", .{a});
         } else if (std.mem.eql(u8, a, "--count")) {
             const value = try optValue(args, &i);
             count = protocol.parseDecimal(u64, value) orelse 0;
@@ -1923,18 +2614,26 @@ pub fn cmdEvents(gpa: std.mem.Allocator, args: []const []const u8) !void {
             try refs.append(gpa, a);
         }
     }
-    const deadline: ?i64 = if (timeout_ms) |ms| io_mod.nowNanos() + @as(i64, @intCast(@min(ms, std.math.maxInt(i32)))) * std.time.ns_per_ms else null;
-    var conn = try connect(gpa);
-    defer conn.deinit();
-    try sendRequest(gpa, &conn, protocol.EventsReq{ .sessions = if (refs.items.len > 0) refs.items else null, .idle_ms = idle_ms });
-    const first = try conn.recvLineAfter(gpa, max_reply, "", ipc.request_timeout_ns);
-    var rest = first.rest;
-    defer gpa.free(rest);
-    {
+    // A duration fits in i64 nanoseconds; the deadline after now may not.
+    const deadline: ?i64 = if (timeout_ms) |ms| io_mod.nowNanos() +| @as(i64, @intCast(ms)) * std.time.ns_per_ms else null;
+    var retried = false;
+    var conn, var rest = while (true) {
+        var conn = try connect(gpa);
+        errdefer conn.deinit();
+        try sendRequest(gpa, &conn, protocol.EventsReq{ .sessions = if (refs.items.len > 0) refs.items else null, .idle_ms = idle_ms });
+        const first = try conn.recvLineAfter(gpa, max_reply, "", ipc.request_timeout_ns);
+        errdefer gpa.free(first.rest);
         const reply = try parseReply(gpa, protocol.EventsResp, first.line);
         defer reply.deinit();
-        if (!reply.parsed.value.ok) failReply(gpa, reply.line, false);
-    }
+        if (reply.parsed.value.ok) break .{ conn, first.rest };
+        // Refused by a daemon that was shutting down: follow the next.
+        if (retried or !try nextDaemon(gpa, reply.line, refs.items.len > 0)) failReply(gpa, reply.line, false);
+        gpa.free(first.rest);
+        conn.deinit();
+        retried = true;
+    };
+    defer conn.deinit();
+    defer gpa.free(rest);
     var known: std.AutoHashMapUnmanaged(u64, []u8) = .empty;
     defer {
         var it = known.valueIterator();
@@ -1946,9 +2645,8 @@ pub fn cmdEvents(gpa: std.mem.Allocator, args: []const []const u8) !void {
     while (true) {
         const left = if (deadline) |d| d - io_mod.nowNanos() else std.time.ns_per_day;
         if (left <= 0) eventsTimedOut(count, changes, timeout_ms.?);
-        const split = conn.recvLineAfter(gpa, max_reply, rest, left) catch |err| switch (err) {
+        const split = conn.recvLineAfter(gpa, max_reply, rest, @min(left, std.time.ns_per_day)) catch |err| switch (err) {
             error.ReadTimeout => {
-                if (deadline != null) eventsTimedOut(count, changes, timeout_ms.?);
                 gpa.free(rest);
                 rest = try gpa.alloc(u8, 0);
                 continue;
@@ -1970,7 +2668,7 @@ pub fn cmdEvents(gpa: std.mem.Allocator, args: []const []const u8) !void {
             const reason = frame.reason orelse "";
             if (std.mem.eql(u8, reason, "too_slow")) runtimeFail("the daemon ended the stream: this command took too long to read it", .{});
             if (std.mem.eql(u8, reason, "shutdown")) eventsShutDown(count, changes);
-            runtimeFail("the daemon ended the stream ({s})", .{reason});
+            runtimeFail("the daemon ended the stream ({f})", .{status.cleaned(reason)});
         }
         if (std.mem.eql(u8, frame.type, "synced")) {
             synced = true;
@@ -2033,8 +2731,8 @@ fn eventText(gpa: std.mem.Allocator, frame: EventFrame, known: std.AutoHashMapUn
     const w = &out.writer;
     var clock_buf: [16]u8 = undefined;
     const id = frame.id orelse 0;
-    var who_buf: [96]u8 = undefined;
-    const who = std.fmt.bufPrint(&who_buf, "{s}  {d} {s}  ", .{ clockText(&clock_buf), id, known.get(id) orelse "-" }) catch unreachable;
+    const who = try std.fmt.allocPrint(gpa, "{s}  {d} {f}  ", .{ clockText(&clock_buf), id, status.cleaned(known.get(id) orelse "-") });
+    defer gpa.free(who);
     const kind = frame.type;
     const st = frame.status orelse Status{};
     var buf: [4096]u8 = undefined;
@@ -2057,6 +2755,14 @@ fn eventText(gpa: std.mem.Allocator, frame: EventFrame, known: std.AutoHashMapUn
         const alerts = try std.mem.join(gpa, ",", hit.alerts);
         defer gpa.free(alerts);
         try w.print("{s}hit {d} {s}: {s}\n", .{ who, hit.n, alerts, hit.line });
+    } else if (std.mem.eql(u8, kind, "action")) {
+        if (frame.value) |v| try w.print("{s}action {f} {f}\n", .{ who, status.cleaned(frame.key orelse ""), status.cleaned(v) }) else try w.print("{s}action {f}\n", .{ who, status.cleaned(frame.key orelse "") });
+    } else if (std.mem.eql(u8, kind, "side-requested")) {
+        try w.print("{s}side-requested\n", .{who});
+    } else if (std.mem.eql(u8, kind, "side-view")) {
+        try w.print("{s}side-view {s}\n", .{ who, if (frame.view) |v| @tagName(v) else "-" });
+    } else if (std.mem.eql(u8, kind, "command-ended")) {
+        if (frame.code) |c| try w.print("{s}command-ended {d}\n", .{ who, c }) else try w.print("{s}command-ended -\n", .{who});
     } else if (std.mem.eql(u8, kind, "seen")) {
         if (verbose) try w.print("{s}seen\n", .{who});
     } else if (std.mem.eql(u8, kind, "changed")) {
@@ -2065,6 +2771,19 @@ fn eventText(gpa: std.mem.Allocator, frame: EventFrame, known: std.AutoHashMapUn
         try w.print("{s}{s}\n", .{ who, kind });
     }
     return out.toOwnedSlice();
+}
+
+test "an event line fits the longest name and id, and drops the name's controls" {
+    const gpa = std.testing.allocator;
+    var known: std.AutoHashMapUnmanaged(u64, []u8) = .empty;
+    defer known.deinit(gpa);
+    var name: [64]u8 = @splat('n');
+    name[63] = 0x1b;
+    try known.put(gpa, std.math.maxInt(u64), &name);
+    const text = try eventText(gpa, .{ .type = "removed", .id = std.math.maxInt(u64) }, known, false);
+    defer gpa.free(text);
+    const shown: [63]u8 = @splat('n');
+    try std.testing.expect(std.mem.endsWith(u8, text, "  18446744073709551615 " ++ shown ++ "  removed\n"));
 }
 
 fn changedText(w: *std.Io.Writer, who: []const u8, field: []const u8, st: Status, verbose: bool) !void {
@@ -2145,7 +2864,7 @@ fn printJson(gpa: std.mem.Allocator, line: []const u8) !void {
 
 // ---- do --------------------------------------------------------------
 
-const do_usage = "usage: tuppet do <session> STEP... [-t DUR] [--if-input-seq N] [--reply-to N] [--unless-attached] [--any-input] [--record-file FILE] [--stats] [-j]";
+const do_usage = "usage: tuppet do <session> STEP... [-t DUR] [--if-input-seq N] [--reply-to N] [--at-prompt SEQ] [--unless-attached] [--any-input] [--record-file FILE] [--stats] [-j]\n       tuppet do <session> [-t DUR] [--unless-attached] --use NAME [ARG...]";
 
 /// What `do` runs, in order.
 const Unit = union(enum) {
@@ -2204,6 +2923,7 @@ const DoPlan = struct {
     const Conds = struct {
         until: std.ArrayList(protocol.Condition) = .empty,
         icase: bool = false,
+        regex: bool = false,
         after_hit: ?u64 = null,
         within_ms: ?u64 = null,
     };
@@ -2266,11 +2986,20 @@ const DoPlan = struct {
         if (c.icase) for (c.until.items) |x| {
             if (x.match != null) break;
         } else return cliFail("--icase needs -m TEXT or --gone TEXT in its condition step", .{});
+        if (c.regex) {
+            for (c.until.items) |x| {
+                if (x.match != null) break;
+            } else return cliFail("--regex needs -m TEXT or --gone TEXT in its condition step", .{});
+            try needRegex(p.a);
+        }
         if (c.after_hit != null) for (c.until.items) |x| {
             if (x.hit != null) break;
         } else return cliFail("--after-hit needs --hit NAME in its condition step", .{});
         for (c.until.items) |*x| {
-            if (x.match != null) x.icase = c.icase;
+            if (x.match != null) {
+                x.icase = c.icase;
+                x.regex = c.regex;
+            }
             if (x.hit) |*h| h.after_hit = c.after_hit;
             // Gone counts from the wait's start, which is before the input.
             // After a resize, the run counts from its reflow instead.
@@ -2318,13 +3047,29 @@ pub fn cmdDo(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var run: DoRun = .{ .gpa = a, .target = undefined };
     var ref: ?[]const u8 = null;
     var record_path: ?[]const u8 = null;
+    var passwords = false;
     var stdin_taken = false;
     // Reported once the arguments are known to be well-formed.
     var unset_secret: ?struct { name: []const u8, empty: bool } = null;
+    var secret_names: std.ArrayList([]const u8) = .empty;
+    var timeout_given: ?u64 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (isOpt(arg, "--keys", "-k")) {
+        if (std.mem.eql(u8, arg, "--use")) {
+            // The words after it are the block's arguments, as given.
+            var j: usize = 0;
+            while (j < i) : (j += 1) {
+                if (isOpt(args[j], "--timeout", "-t")) {
+                    j += 1;
+                } else if (args[j].len > 0 and args[j][0] == '-' and !std.mem.eql(u8, args[j], "--unless-attached")) {
+                    return cliFail("--use runs the steps of a block, so of the other options only -t and --unless-attached go with it, not '{s}'", .{args[j]});
+                }
+            }
+            if (i + 1 >= args.len) return cliFail("--use needs the name of a block: tuppet do <session> --use NAME [ARG...]", .{});
+            const session = ref orelse return cliFail("the session comes before --use: tuppet do <session> --use NAME [ARG...]", .{});
+            return start_run.doUse(gpa, session, args[i + 1], args[i + 2 ..], timeout_given, run.unless_attached);
+        } else if (isOpt(arg, "--keys", "-k")) {
             var tokens: std.ArrayList([]const u8) = .empty;
             try appendKeys(a, &tokens, try optValue(args, &i));
             try plan.input(&.{.{ .keys = tokens.items }}, false);
@@ -2341,12 +3086,16 @@ pub fn cmdDo(gpa: std.mem.Allocator, args: []const []const u8) !void {
                 else => runtimeFail("cannot read standard input", .{}),
             };
             if (text.len == 0) return cliFail("--stdin has nothing to paste: standard input is empty", .{});
+            // Input travels in a JSON string, which carries UTF-8 only.
+            if (!std.unicode.utf8ValidateSlice(text)) return cliFail("--stdin pastes text, but standard input is not valid UTF-8", .{});
             try plan.input(&.{.{ .paste = text }}, false);
         } else if (std.mem.eql(u8, arg, "--secret")) {
             const name = try optValue(args, &i);
+            try secret_names.append(a, name);
             const env = std.c.getenv(try a.dupeSentinel(u8, name, 0));
             const value: []const u8 = if (env) |v| std.mem.span(v) else "";
             if (value.len == 0 and unset_secret == null) unset_secret = .{ .name = name, .empty = env != null };
+            if (!std.unicode.utf8ValidateSlice(value)) runtimeFail("--secret {s}: environment variable {s} is not valid UTF-8", .{ name, name });
             try plan.input(&.{.{ .text = value, .secret = true }}, true);
         } else if (std.mem.eql(u8, arg, "--sleep")) {
             try plan.sleep(try durationValue(args, &i, 0));
@@ -2381,12 +3130,15 @@ pub fn cmdDo(gpa: std.mem.Allocator, args: []const []const u8) !void {
             c.after_hit = try hitNumber(args, &i);
         } else if (std.mem.eql(u8, arg, "--icase")) {
             (try plan.open(arg)).icase = true;
+        } else if (std.mem.eql(u8, arg, "--regex")) {
+            (try plan.open(arg)).regex = true;
         } else if (isOpt(arg, "--within", "-w")) {
             const c = try plan.open(arg);
             if (c.within_ms != null) return cliFail("{s} is given twice for one condition step", .{arg});
             c.within_ms = try waitDuration(args, &i);
         } else if (isOpt(arg, "--timeout", "-t")) {
             run.timeout_ms = try waitDuration(args, &i);
+            timeout_given = run.timeout_ms;
         } else if (std.mem.eql(u8, arg, "--if-input-seq")) {
             const value = try optValue(args, &i);
             run.if_input_seq = protocol.parseDecimal(u64, value) orelse return cliFail("invalid --if-input-seq '{s}' (expected an input_seq, such as one a wait printed)", .{value});
@@ -2394,10 +3146,15 @@ pub fn cmdDo(gpa: std.mem.Allocator, args: []const []const u8) !void {
             run.reply_to = try hitNumber(args, &i);
         } else if (std.mem.eql(u8, arg, "--unless-attached")) {
             run.unless_attached = true;
+        } else if (std.mem.eql(u8, arg, "--at-prompt")) {
+            const value = try optValue(args, &i);
+            run.at_prompt = protocol.parseDecimal(u64, value) orelse return cliFail("invalid --at-prompt '{s}' (expected a prompt_seq from the status)", .{value});
         } else if (std.mem.eql(u8, arg, "--any-input")) {
             run.any_input = true;
         } else if (std.mem.eql(u8, arg, "--record-file")) {
             record_path = try optValue(args, &i);
+        } else if (std.mem.eql(u8, arg, "--passwords")) {
+            passwords = true;
         } else if (isOpt(arg, "--json", "-j")) {
             run.json = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
@@ -2411,25 +3168,29 @@ pub fn cmdDo(gpa: std.mem.Allocator, args: []const []const u8) !void {
             ref = arg;
         }
     }
+    daemon_env_drop = secret_names.items;
     run.target = SessionTarget.init(ref orelse return cliFail(do_usage, .{}));
     run.units = try plan.finish();
     if (run.units.len == 0) return cliFail("do needs a step: -k KEYS, -s TEXT, -p TEXT, --stdin, --secret VAR, --sleep DUR, --mouse SPEC X Y, --focus on|off, --resize WxH, or a condition", .{});
     if (record_path) |path| _ = try recordFileFormat("--record-file", path);
+    if (passwords and record_path == null) return cliFail("--passwords goes with --record-file", .{});
+    if (passwords) try needPasswords(gpa);
     if (unset_secret) |s| runtimeFail("--secret {s}: environment variable {s} is {s}", .{ s.name, s.name, if (s.empty) "empty" else "not set" });
     const path = record_path orelse {
         const code = try run.all();
         if (code != exit_code.ok) std.process.exit(code);
         return;
     };
-    try recordDo(a, &run, try absolutePath(a, path));
+    try recordDo(a, &run, try absolutePath(a, path), passwords);
 }
 
 /// Run `run` while recording to `path` (asciicast for .cast, a trace for .trace),
 /// and stop the recording on every way out, Ctrl-C included.
-fn recordDo(a: std.mem.Allocator, run: *DoRun, path: []const u8) !void {
+fn recordDo(a: std.mem.Allocator, run: *DoRun, path: []const u8, passwords: bool) !void {
     const format = try recordFileFormat("--record-file", path);
-    const started = try call(a, protocol.RecordReq{ .session = run.target.ref(), .start = .{ .path = path, .format = format, .input = true } }, protocol.RecordResp);
-    run.target.pin(started.parsed.value.status.?.id);
+    const started = try call(a, protocol.RecordReq{ .session = run.target.ref(), .start = .{ .path = path, .format = format, .input = true, .passwords = if (passwords) true else null } }, protocol.RecordResp);
+    run.target.pin(replyStatus(started.parsed.value.status).id);
+    var recording: DoRecording = .{ .endpoint = try a.dupe(u8, daemon_path), .session = run.target.ref() };
     installInterruptHandlers();
     // Requests block in reads that a signal does not end: the steps run on
     // their own thread, and this one stops the recording.
@@ -2450,12 +3211,16 @@ fn recordDo(a: std.mem.Allocator, run: *DoRun, path: []const u8) !void {
         }
     };
     var worker: Worker = .{ .run = run };
-    const thread = try std.Thread.spawn(.{}, Worker.main, .{&worker});
+    do_recording = &recording;
+    const thread = std.Thread.spawn(.{}, Worker.main, .{&worker}) catch |err| {
+        do_recording = null;
+        recording.stop(null);
+        return err;
+    };
     const code = while (true) {
         const sig = interrupt_signal.load(.acquire);
         if (sig != 0) {
-            recordRequest(.{ .session = run.target.ref(), .mark = "interrupted" });
-            recordRequest(.{ .session = run.target.ref(), .stop = true });
+            recording.stop("interrupted");
             stderrPrint("tuppet: interrupted; the recording is stopped\n", .{}) catch {};
             std.process.exit(128 + sig);
         }
@@ -2465,16 +3230,47 @@ fn recordDo(a: std.mem.Allocator, run: *DoRun, path: []const u8) !void {
         }) catch {};
     };
     thread.join();
-    recordRequest(.{ .session = run.target.ref(), .stop = true });
+    do_recording = null;
+    recording.stop(null);
     if (code != exit_code.ok) std.process.exit(code);
 }
 
-/// A record request whose failure must not hide what went wrong before.
-/// The steps' thread may still use their arena: this one allocates apart.
-fn recordRequest(req: protocol.RecordReq) void {
-    const reply = request(std.heap.page_allocator, req, protocol.RecordResp) catch return;
-    reply.deinit();
-}
+/// The recording of a `do --record-file`, stopped by whichever thread
+/// leaves first: this one after the steps or at an interrupt, or the
+/// steps' thread when a failure ends the command. Its requests go
+/// straight to the daemon that took it, apart from the connection state
+/// the steps use.
+const DoRecording = struct {
+    endpoint: []const u8,
+    session: []const u8,
+    taken: std.atomic.Value(bool) = .init(false),
+
+    /// Stop the recording, after `mark` when given. Only the first call
+    /// does; one that comes second, on the other thread, waits for the
+    /// first to end the command.
+    fn stop(r: *DoRecording, mark: ?[]const u8) void {
+        if (r.taken.swap(true, .acq_rel)) while (true) std.Io.sleep(io_mod.io(), .fromMilliseconds(1000), .boot) catch {};
+        if (mark) |text| r.send(.{ .session = r.session, .mark = text });
+        r.send(.{ .session = r.session, .stop = true });
+    }
+
+    /// A request whose failure must not hide what went wrong before; its
+    /// reply is awaited, not read. The steps' thread may still use their
+    /// arena: this one allocates apart.
+    fn send(r: *DoRecording, req: protocol.RecordReq) void {
+        const gpa = std.heap.page_allocator;
+        var conn = ipc.Conn.connect(r.endpoint) catch return;
+        defer conn.deinit();
+        sendRequest(gpa, &conn, req) catch return;
+        const split = conn.recvLineAfter(gpa, max_reply, "", ipc.request_timeout_ns) catch return;
+        gpa.free(split.line);
+        gpa.free(split.rest);
+    }
+};
+
+/// The recording that a failure which ends the command stops first, set
+/// while the steps of a recording `do` run on their own thread.
+var do_recording: ?*DoRecording = null;
 
 /// The signal that interrupted a recording `do` or a sweep, 0 while none
 /// has.
@@ -2526,7 +3322,7 @@ fn mouseSteps(a: std.mem.Allocator, spec: []const u8, x_text: []const u8, y_text
         }
     }.of;
     if (action) |act| return a.dupe(protocol.Step, &.{step(button, act, mods, x, y)});
-    if (event.button == .four or event.button == .five) return a.dupe(protocol.Step, &.{step(button, "press", mods, x, y)});
+    if (event.button) |b| if (mouse.isWheel(b)) return a.dupe(protocol.Step, &.{step(button, "press", mods, x, y)});
     return a.dupe(protocol.Step, &.{ step(button, "press", mods, x, y), step(button, "release", mods, x, y) });
 }
 
@@ -2538,6 +3334,8 @@ const DoRun = struct {
     timeout_ms: u64 = default_wait_ms,
     if_input_seq: ?u64 = null,
     reply_to: ?u64 = null,
+    /// The guard of the first batch: the shell waits at this prompt.
+    at_prompt: ?u64 = null,
     unless_attached: bool = false,
     any_input: bool = false,
     /// Print each condition step's reply, and a failure, as JSON.
@@ -2577,6 +3375,7 @@ const DoRun = struct {
                 .unattended = d.unless_attached,
                 .input_seq = if (first) d.if_input_seq else null,
                 .reply_to = if (first) d.reply_to else null,
+                .prompt = if (first) d.at_prompt else null,
                 .hidden_input = b.secret and !d.any_input,
             },
             .until = if (b.until) |u| u.until else null,
@@ -2584,8 +3383,8 @@ const DoRun = struct {
         };
         var base: ?StatsBase = null;
         if (d.stats and b.until != null) {
-            base = try StatsBase.of(d.gpa, d.target.ref(), null, false);
-            base.?.from_input = true;
+            base = try StatsBase.find(d.gpa, d.target.ref(), null, false);
+            if (base) |*found| found.from_input = true;
         }
         var retried = false;
         var conn, const typed, const reply = while (true) {
@@ -2608,7 +3407,7 @@ const DoRun = struct {
             const done = failure.done orelse 0;
             return d.failed(failure, reply.line, b.origins[@min(done, b.origins.len - 1)]);
         }
-        d.target.pin(reply.parsed.value.status.?.id);
+        d.target.pin(replyStatus(reply.parsed.value.status).id);
         const until = b.until orelse return exit_code.ok;
         const second = try conn.recvLineAfter(d.gpa, max_reply, typed.rest, waitReplyNs(timeout_ms.?));
         return d.report(try parseReply(d.gpa, protocol.WaitResp, second.line), until, timeout_ms.?, base);
@@ -2616,7 +3415,7 @@ const DoRun = struct {
 
     fn wait(d: *DoRun, w: DoWait) !u8 {
         const timeout_ms = w.within_ms orelse d.timeout_ms;
-        const base: ?StatsBase = if (d.stats) try StatsBase.of(d.gpa, d.target.ref(), d.resize_since, false) else null;
+        const base: ?StatsBase = if (d.stats) try StatsBase.find(d.gpa, d.target.ref(), d.resize_since, false) else null;
         const until = if (d.resize_since) |seq| try d.sinceResize(w.until, seq) else w.until;
         return d.report(try requestWait(d.gpa, .{ .session = d.target.ref(), .until = until, .timeout_ms = timeout_ms }), w, timeout_ms, base);
     }
@@ -2625,7 +3424,7 @@ const DoRun = struct {
     /// reflow on. A resize that leaves the size as it is meets them at
     /// once: the program gets no SIGWINCH, so nothing would come.
     fn resize(d: *DoRun, r: DoResize) !u8 {
-        var base: ?StatsBase = if (d.stats and r.until != null) try StatsBase.of(d.gpa, d.target.ref(), null, false) else null;
+        var base: ?StatsBase = if (d.stats and r.until != null) try StatsBase.find(d.gpa, d.target.ref(), null, false) else null;
         const req: protocol.ResizeReq = .{
             .session = d.target.ref(),
             .cols = r.cols,
@@ -2634,7 +3433,7 @@ const DoRun = struct {
         };
         const reply = try request(d.gpa, req, protocol.ResizeResp);
         if (!reply.parsed.value.ok) return d.failed(parseFailure(d.gpa, reply.line), reply.line, r.step);
-        const st = reply.parsed.value.status.?;
+        const st = replyStatus(reply.parsed.value.status);
         d.target.pin(st.id);
         const seq = reply.parsed.value.resize_seq orelse {
             d.resize_since = null;
@@ -2682,8 +3481,8 @@ const DoRun = struct {
             if (parsed.value == .object) {
                 const obj = &parsed.value.object;
                 _ = obj.orderedRemove("ok");
-                try obj.put(d.gpa, "step", .{ .integer = step });
-                try obj.put(d.gpa, "done", .{ .integer = step - 1 });
+                try obj.put(parsed.arena.allocator(), "step", .{ .integer = step });
+                try obj.put(parsed.arena.allocator(), "done", .{ .integer = step - 1 });
             }
             const out = try protocol.stringifyAlloc(d.gpa, parsed.value);
             try stdoutWrite(out);
@@ -2694,7 +3493,7 @@ const DoRun = struct {
             const text = try statusLine(d.gpa, if (guard) "guard" else "error", if (guard) failure.guard orelse "-" else failure.code, failure.status, d.target.ref(), suffix);
             try stdoutWrite(text);
         }
-        try stderrPrint("tuppet: {s}\n", .{failure.err});
+        try stderrPrint("tuppet: {f}\n", .{status.cleaned(failure.err)});
         const removed = d.target.id != null and std.mem.eql(u8, failure.code, @tagName(protocol.Code.no_session));
         return if (removed) exit_code.ended else exitFor(failure.code);
     }
@@ -2794,6 +3593,26 @@ var daemon_features: []const u8 = "";
 var daemon_variant_buf: [16]u8 = undefined;
 var daemon_variant: []const u8 = "";
 
+/// Whether the daemon, started if need be, reports `feature` in hello.
+pub fn daemonSupports(gpa: std.mem.Allocator, feature: []const u8) !bool {
+    try checkProtocol(gpa);
+    return daemonHas(feature);
+}
+
+/// Fail unless the daemon can record passwords as typed: an older one
+/// would write markers without saying so.
+fn needPasswords(gpa: std.mem.Allocator) !void {
+    if (!try daemonSupports(gpa, "passwords"))
+        runtimeFail("the daemon on {s} is an older tuppet that cannot record passwords; stop it ('tuppet shutdown') and let this tuppet start its own", .{daemon_path});
+}
+
+/// Fail unless the daemon takes regex conditions: an older one refuses
+/// them with a less helpful error.
+pub fn needRegex(gpa: std.mem.Allocator) !void {
+    if (!try daemonSupports(gpa, "regex"))
+        runtimeFail("the daemon on {s} is an older tuppet that cannot match a regex; stop it ('tuppet shutdown') and let this tuppet start its own", .{daemon_path});
+}
+
 /// Whether the daemon checked last reports `feature` in hello.
 fn daemonHas(feature: []const u8) bool {
     var it = std.mem.splitScalar(u8, daemon_features, ',');
@@ -2845,6 +3664,11 @@ fn call(gpa: std.mem.Allocator, req: anytype, comptime Resp: type) !Reply(Resp) 
     failReply(gpa, reply.line, false);
 }
 
+/// The session status that a successful reply must carry.
+pub fn replyStatus(st: ?Status) Status {
+    return st orelse runtimeFail("the daemon sent a malformed reply", .{});
+}
+
 /// Report a failed reply and exit with the code its code calls for.
 /// With `pinned`, the request named a session by the id an earlier reply
 /// gave, so no_session means it was removed meanwhile: exit 4.
@@ -2853,7 +3677,7 @@ fn failReply(gpa: std.mem.Allocator, line: []const u8, pinned: bool) noreturn {
         runtimeFail("the daemon sent a malformed reply", .{});
     const code = parsed.value.code;
     const removed = pinned and std.mem.eql(u8, code, @tagName(protocol.Code.no_session));
-    runtimeFailWith(if (removed) exit_code.ended else exitFor(code), "{s}", .{parsed.value.err});
+    runtimeFailWith(if (removed) exit_code.ended else exitFor(code), "{f}", .{status.cleaned(parsed.value.err)});
 }
 
 /// The exit code for a failed reply.
@@ -2867,6 +3691,7 @@ pub fn failureExit(gpa: std.mem.Allocator, line: []const u8) u8 {
 pub fn runtimeFailWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     attach_client.restoreTerminal();
     stderrPrint("tuppet: " ++ fmt ++ "\n", args) catch {};
+    if (do_recording) |recording| recording.stop(null);
     std.process.exit(code);
 }
 
@@ -2875,7 +3700,7 @@ pub fn failureText(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(protocol.ErrorReply, gpa, line, .{ .ignore_unknown_fields = true }) catch
         return gpa.dupe(u8, "the daemon sent a malformed reply");
     defer parsed.deinit();
-    return gpa.dupe(u8, if (parsed.value.err.len > 0) parsed.value.err else "the request failed");
+    return std.fmt.allocPrint(gpa, "{f}", .{status.cleaned(if (parsed.value.err.len > 0) parsed.value.err else "the request failed")});
 }
 
 pub fn request(gpa: std.mem.Allocator, req: anytype, comptime Resp: type) !Reply(Resp) {
@@ -2995,7 +3820,7 @@ fn namesSessions(req: anytype) bool {
     if (T == protocol.HelloReq) return false;
     // A listed session is often acted on next.
     if (T == protocol.ListReq) return req.sessions != null;
-    if (T == protocol.RunReq) return req.like != null;
+    if (T == protocol.RunReq) return req.like != null or req.over != null;
     return true;
 }
 
@@ -3158,6 +3983,10 @@ fn reportDaemonLog(log_path: [:0]const u8, start: std.c.off_t, heading: []const 
 /// and stderr in the log file. Windows: no console of its own, so the
 /// caller's Ctrl-C does not reach it. Returns the daemon's pid when it is
 /// known.
+/// Variables a daemon this process starts must not have, such as the
+/// passwords of `tuppet start`.
+pub var daemon_env_drop: []const []const u8 = &.{};
+
 fn spawnDaemon(gpa: std.mem.Allocator, log_path: ?[:0]const u8) !?std.c.pid_t {
     const io = io_mod.io();
     var exe_buf: [4096]u8 = undefined;
@@ -3166,10 +3995,11 @@ fn spawnDaemon(gpa: std.mem.Allocator, log_path: ?[:0]const u8) !?std.c.pid_t {
     // clients) inherit the daemon's, so it gets a usable TERM too.
     var env_map = try std.process.Environ.createMap(io_mod.environ, gpa);
     defer env_map.deinit();
+    for (daemon_env_drop) |name| _ = env_map.swapRemove(name);
     try env_map.put("TERM", "xterm-256color");
 
     if (builtin.os.tag == .windows) {
-        try spawnDaemonWindows(gpa, exe_buf[0..exe_len]);
+        try spawnDaemonWindows(gpa, exe_buf[0..exe_len], &env_map);
         return null;
     }
 
@@ -3237,19 +4067,21 @@ fn spawnDaemon(gpa: std.mem.Allocator, log_path: ?[:0]const u8) !?std.c.pid_t {
 /// process group, and out of the caller's job object when the job allows
 /// it, so a CI runner or terminal that kills its job on exit does not
 /// take the daemon along.
-fn spawnDaemonWindows(gpa: std.mem.Allocator, exe: []const u8) !void {
+fn spawnDaemonWindows(gpa: std.mem.Allocator, exe: []const u8, env_map: *const std.process.Environ.Map) !void {
     const win32 = @import("win32.zig");
     const cmd = try std.fmt.allocPrint(gpa, "\"{s}\" daemon", .{exe});
     defer gpa.free(cmd);
     const cmd_w = try std.unicode.utf8ToUtf16LeAllocZ(gpa, cmd);
     defer gpa.free(cmd_w);
+    const env_block = try env_map.createWindowsBlock(gpa, .{});
+    defer env_block.deinit(gpa);
     const breakaway: win32.DWORD = 0x01000000; // CREATE_BREAKAWAY_FROM_JOB
-    const base = win32.CREATE_NO_WINDOW | win32.CREATE_NEW_PROCESS_GROUP;
+    const base = win32.CREATE_NO_WINDOW | win32.CREATE_NEW_PROCESS_GROUP | win32.CREATE_UNICODE_ENVIRONMENT;
     for ([_]win32.DWORD{ base | breakaway, base }) |flags| {
         var si = std.mem.zeroes(win32.STARTUPINFOW);
         si.cb = @sizeOf(win32.STARTUPINFOW);
         var pi = std.mem.zeroes(win32.PROCESS_INFORMATION);
-        if (win32.CreateProcessW(null, cmd_w.ptr, null, null, 0, flags, null, null, &si, &pi) != 0) {
+        if (win32.CreateProcessW(null, cmd_w.ptr, null, null, 0, flags, @ptrCast(@constCast(env_block.slice.ptr)), null, &si, &pi) != 0) {
             _ = win32.CloseHandle(pi.hThread);
             _ = win32.CloseHandle(pi.hProcess);
             return;

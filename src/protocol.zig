@@ -22,7 +22,7 @@ pub const protocol_version = 2;
 
 /// Optional capabilities reported by hello, so clients can check before
 /// using them.
-pub const features = [_][]const u8{ "alerts", "shutdown", "limits", "fonts" };
+pub const features = [_][]const u8{ "alerts", "shutdown", "limits", "fonts", "redraw_on_resize", "over", "pass", "play", "no_keys", "history", "colors", "passwords", "regex", "echo", "groups", "side", "lease", "marks", "respawn" };
 
 /// Why a request failed, for programs to act on; `err` says it for people.
 pub const Code = enum {
@@ -84,14 +84,126 @@ pub const RunReq = struct {
     like: ?[]const u8 = null,
     /// Alerts that watch from the program's first byte.
     alerts: ?[]const Alert = null,
+    /// Start the session as a box over another one.
+    over: ?RunOver = null,
+    /// The default colors the session's terminal reports; null for
+    /// tuppet's own, or with `over` the session underneath's.
+    colors: ?RunColors = null,
+    /// A member of this group, with the next free number in it.
+    group: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    accent: ?bool = null,
+    mark: ?[]const u8 = null,
+    meta: ?[]const status.MetaValue = null,
+    actions: ?[]const status.Action = null,
+    /// The side session of the session this picks, shown first at
+    /// `side_view` (compact when left out).
+    side_of: ?[]const u8 = null,
+    side_view: ?status.SideView = null,
+    /// Keep the connection as the session's lease after the reply: the
+    /// daemon stops the session when it closes.
+    lease: ?bool = null,
 };
 
+/// Change what the caller says about a session; a field left out stays,
+/// an empty text takes it away.
+pub const UpdateReq = struct {
+    cmd: []const u8 = "update",
+    session: []const u8,
+    group: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    accent: ?bool = null,
+    mark: ?[]const u8 = null,
+    /// Sets these keys; an empty value takes a key away.
+    meta: ?[]const status.MetaValue = null,
+    /// Replaces the actions.
+    actions: ?[]const status.Action = null,
+};
+
+/// Set a side session's view, or report that the person asked for one.
+pub const SideReq = struct {
+    cmd: []const u8 = "side",
+    session: []const u8,
+    view: ?status.SideView = null,
+    request: bool = false,
+};
+
+/// Flag a session as needing attention, or clear the flag.
+pub const FlagReq = struct {
+    cmd: []const u8 = "flag",
+    session: []const u8,
+    attention: ?[]const u8 = null,
+    clear: bool = false,
+};
+
+/// Report that the person chose a session's action.
+pub const ActionReq = struct {
+    cmd: []const u8 = "action",
+    session: []const u8,
+    key: []const u8,
+    value: ?[]const u8 = null,
+};
+
+/// Keep a session alive while the connection lasts.
+pub const LeaseReq = struct {
+    cmd: []const u8 = "lease",
+    session: []const u8,
+};
+
+/// Start an ended session's program again, with exactly this environment
+/// and the session's own variables.
+pub const RespawnReq = struct {
+    cmd: []const u8 = "respawn",
+    session: []const u8,
+    env: []const []const u8 = &.{},
+};
+
+/// The latest commands that a session's shell marks reported.
+pub const CommandsReq = struct {
+    cmd: []const u8 = "commands",
+    session: []const u8,
+    last: ?u32 = null,
+};
+
+pub const Command = @import("marks.zig").Command;
+
+/// A terminal's default colors, "#rrggbb" each.
+pub const RunColors = struct {
+    fg: []const u8,
+    bg: []const u8,
+};
+
+/// "#rrggbb" as its three bytes; null for anything else.
+pub fn parseHexColor(text: []const u8) ?[3]u8 {
+    if (text.len != 7 or text[0] != '#') return null;
+    var out: [3]u8 = undefined;
+    for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, text[1 + 2 * i ..][0..2], 16) catch return null;
+    return out;
+}
+
 pub const Alert = alert.Rule;
+
+/// How a box that `run` starts is shown over another session.
+pub const RunOver = struct {
+    /// The session underneath.
+    session: []const u8,
+    /// The text on its border; null for the session's name.
+    title: ?[]const u8 = null,
+    /// Left out: frozen, or none with grab never; null only with never.
+    backdrop: ?status.Backdrop = null,
+    grab: status.Grab = .pause,
+    /// Stop the box once it ran this long without being held (shown,
+    /// with grab never).
+    unseen_ms: ?u64 = null,
+};
 
 pub const RunRecord = struct {
     /// Absolute path; null records into the session's store directory.
     path: ?[]const u8 = null,
     format: RecordFormat = .cast,
+    /// Record passwords as typed instead of a marker; left out unless
+    /// set, for daemons without the feature.
+    passwords: ?bool = null,
 };
 
 pub const ListReq = struct {
@@ -196,6 +308,9 @@ pub const Require = struct {
     /// No input came after the hit with this number, which the log still
     /// has.
     reply_to: ?u64 = null,
+    /// The shell waits at its primary prompt with this prompt_seq and
+    /// nothing was typed since; the batch is one paste of one line.
+    prompt: ?u64 = null,
 };
 
 pub const AlertReq = struct {
@@ -224,6 +339,9 @@ pub const RecordStart = struct {
     format: RecordFormat,
     /// Also record input events in a cast; a trace always has them.
     input: bool = false,
+    /// Record passwords as typed instead of a marker; left out unless
+    /// set, for daemons without the feature.
+    passwords: ?bool = null,
     /// Stop once one of these conditions holds.
     until: ?[]const Condition = null,
     /// Stop this many milliseconds after the start.
@@ -288,7 +406,20 @@ pub const AttachReq = struct {
     /// A writer's terminal size, applied before the first redraw.
     cols: ?u16 = null,
     rows: ?u16 = null,
+    /// A fresh screen after every resize, for a client that keeps its own
+    /// copy of the screen; left out unless set, for daemons without the
+    /// feature.
+    redraw_on_resize: ?bool = null,
+    /// Send the last this many rows of the primary screen's history
+    /// (0 to max_history_rows) before the first screen; left out unless
+    /// set, for daemons without the feature.
+    history: ?u32 = null,
+    /// With `history`: only rows numbered this or higher.
+    history_from: ?u64 = null,
 };
+
+/// The most history rows an attach may ask for.
+pub const max_history_rows = 100_000;
 
 // ---- replies -------------------------------------------------------------
 
@@ -383,6 +514,13 @@ pub const InputFailure = struct {
     done: u32 = 0,
     guard: ?[]const u8 = null,
     matches: ?[]const Status = null,
+};
+
+/// The commands a session's shell marks reported, oldest first.
+pub const CommandsResp = struct {
+    ok: bool = true,
+    commands: []const Command = &.{},
+    status: ?Status = null,
 };
 
 pub const ListResp = struct {
@@ -724,6 +862,11 @@ test "requests are decoded strictly, naming the field at fault" {
     // A u64 takes what its error message promises.
     const big = try parseEnvelope(gpa, "{\"cmd\":\"run\",\"argv\":[\"sh\"],\"scrollback\":18446744073709551615}");
     try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), (try decode(RunReq, gpa, big.value, &problem)).scrollback);
+}
+
+test "a run request's colors are #rrggbb" {
+    try std.testing.expectEqual([3]u8{ 0x12, 0xab, 0xff }, parseHexColor("#12abFF").?);
+    for ([_][]const u8{ "", "#fff", "12abff", "#12abfg", "#12abff0" }) |bad| try std.testing.expect(parseHexColor(bad) == null);
 }
 
 test "decimal parsing accepts digits only" {

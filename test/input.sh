@@ -52,6 +52,10 @@ grep -q "^guard hidden_input .* step=2 done=1$" "$dir/out" || fail "the hidden-i
 grep -q "nothing was typed" "$dir/err" && fail "the guard denies the typed text: $(cat "$dir/err")"
 "$BIN" do "$sh_id" -k '<C-u>' >/dev/null
 "$BIN" view "$sh_id" | grep -q 'NOPE\|hunter2' && fail "a refused batch typed something"
+# A batch that cannot send its first step is no input.
+seq_before=$("$BIN" list -j "$sh_id" | grep -o '"input_seq":[0-9]*')
+exits 1 "a key the shell cannot take was sent" "$BIN" key "$sh_id" '<C-S-Space>'
+[ "$("$BIN" list -j "$sh_id" | grep -o '"input_seq":[0-9]*')" = "$seq_before" ] || fail "a batch that sent nothing counted as input"
 
 # --- do -j: each condition step's reply, and a failure with step and done --
 # json_has EXPRESSION: it holds for r, the JSON object in $dir/out.

@@ -26,6 +26,8 @@ const events = @import("events.zig");
 const alert = @import("alert.zig");
 const limits = @import("limits.zig");
 const budget = @import("budget.zig");
+const over_mod = @import("over.zig");
+const marks_mod = @import("marks.zig");
 
 pub const RecordFormat = record.RecordFormat;
 pub const startRecording = record.startRecording;
@@ -63,6 +65,9 @@ pub fn refuseStarts() bool {
 /// `stop` gives the process group this long to exit after SIGHUP and
 /// SIGTERM before it sends SIGKILL.
 const stop_grace_ns: i64 = 500 * std.time.ns_per_ms;
+/// How long a session must have had no output before its history is
+/// compressed.
+const compress_idle_ns: i64 = 500 * std.time.ns_per_ms;
 /// How long `stop` waits for the program to exit after SIGKILL.
 pub const stop_exit_wait_ns: i64 = 3 * std.time.ns_per_s;
 /// How long an ended session may take to save its results: rendering a
@@ -91,6 +96,15 @@ pub const Options = struct {
     record: ?RunRecord = null,
     /// Alerts, checked with alert.rulesError, watching from the first byte.
     alerts: []const alert.Rule = &.{},
+    /// Start a box over another session.
+    over: ?status_mod.Over = null,
+    /// Default foreground and background instead of tuppet's.
+    colors: ?[2]vt.color.RGB = null,
+    /// What the caller says about it as a member of a group.
+    member: status_mod.Member = .{},
+    /// A screen and history, as `screenBytes` gives them, that the
+    /// terminal shows before the program's first byte.
+    seed: ?[]const u8 = null,
 };
 
 /// A recording that starts with the session: to `path`, or to a file in
@@ -98,12 +112,22 @@ pub const Options = struct {
 pub const RunRecord = struct {
     path: ?[]const u8 = null,
     format: RecordFormat = .cast,
+    /// Passwords as typed instead of a marker.
+    passwords: bool = false,
 };
 
 /// Ghostty's default theme colors, so OSC 10/11 color queries get
 /// answers (the vt library ships them unset).
 const default_fg: vt.color.RGB = .{ .r = 0xdc, .g = 0xd7, .b = 0xba };
 const default_bg: vt.color.RGB = .{ .r = 0x1f, .g = 0x1f, .b = 0x28 };
+
+/// Install tuppet's default colors as the terminal's defaults, so that
+/// an override is always one the program set (OSC 10/11), and its reset
+/// (OSC 110/111) brings tuppet's back.
+pub fn setDefaultColors(t: *vt.Terminal) void {
+    t.colors.foreground.default = default_fg;
+    t.colors.background.default = default_bg;
+}
 
 pub const Session = struct {
     id: u64,
@@ -121,6 +145,9 @@ pub const Session = struct {
     /// The lower history limit the memory budget holds it to, or null
     /// while it has its own; guarded by terminal_mutex.
     history_cap: ?u64 = null,
+    /// Where the last compression pass of the history ended; guarded by
+    /// terminal_mutex. See compressIdle.
+    compressed: ?Compressed = null,
     /// The bytes of history that trimming could free.
     trimmable: std.atomic.Value(u64) = .init(0),
     /// The session has ended and the store has all of it, so it can leave
@@ -228,12 +255,35 @@ pub const Session = struct {
     ack_mutex: std.Io.Mutex = .init,
     /// `stop` signalled the program.
     stopped: std.atomic.Value(bool) = .init(false),
+    /// The program's alternate screen showed when it ended.
+    ended_alt: std.atomic.Value(bool) = .init(false),
     /// The latest alert hits; guarded by terminal_mutex. The alerts are
     /// the tracker's.
     hits: alert.Log,
     /// Serializes changes of the alerts, which also write them to the
     /// store; taken before terminal_mutex.
     alert_mutex: std.Io.Mutex = .init,
+    /// On a box, how it is shown over another session: set at the start,
+    /// its title owned, `shown`, `held`, and `ended_by` guarded by
+    /// terminal_mutex.
+    over: ?status_mod.Over = null,
+    /// Serializes saving `over`; taken before terminal_mutex.
+    over_mutex: std.Io.Mutex = .init,
+    /// The running boxes over this session; guarded by terminal_mutex.
+    boxes: over_mod.Boxes = .{},
+    /// On a box with unseen_ms, the monotonic time at which its evaluator
+    /// stops it unless it was seen enough; 0 for none.
+    unseen_deadline: std.atomic.Value(i64) = .init(0),
+    /// What the shell's prompt marks said; guarded by terminal_mutex.
+    marks: marks_mod.Marks = .{},
+    /// What a caller says about the session as a member of a group, its
+    /// strings in `member_arena`, and the running side session tied to
+    /// it; guarded by member_mutex, which no one holds while taking
+    /// another lock.
+    member: status_mod.Member = .{},
+    member_arena: ?*std.heap.ArenaAllocator = null,
+    side: ?u64 = null,
+    member_mutex: std.Io.Mutex = .init,
 
     /// Start a session. It is returned with a reference taken: release it
     /// with `release`.
@@ -281,8 +331,15 @@ pub const Session = struct {
             .start_seq = start_seq,
             .seq = start_seq,
             .alerts = opts.alerts,
+            .over = opts.over,
+            .member = if (opts.member.isEmpty()) null else opts.member,
         }) catch |err| return storeFailure(err);
         errdefer store.discard(created.id, created.running);
+        var over = opts.over;
+        if (over) |*o| if (o.title) |title| {
+            o.title = try gpa.dupe(u8, title);
+        };
+        errdefer if (over) |o| if (o.title) |title| gpa.free(title);
 
         var id_var_buf: [48]u8 = undefined;
         const id_var = std.fmt.bufPrint(&id_var_buf, "TUPPET_SESSION={d}", .{created.id}) catch unreachable;
@@ -319,6 +376,7 @@ pub const Session = struct {
             .last_output = .{ .raw = io_mod.nowNanos() },
             .reader = null,
             .hits = .{ .gpa = gpa },
+            .over = over,
         };
         errdefer pty_mod.close(&s.pty);
         if (builtin.os.tag != .windows) {
@@ -332,11 +390,23 @@ pub const Session = struct {
         s.floor = floor;
         s.charged = floor;
 
-        s.terminal.colors.foreground.set(default_fg);
-        s.terminal.colors.background.set(default_bg);
+        setDefaultColors(&s.terminal);
+        if (opts.colors) |c| {
+            s.terminal.colors.foreground.default = c[0];
+            s.terminal.colors.background.default = c[1];
+        }
         // ConPTY keeps its own screen without scrollback; rows pulled back
         // from history on a resize would put its next output out of place.
         if (builtin.os.tag == .windows) s.terminal.flags.resize_pull_scrollback = false;
+        if (opts.seed) |bytes| {
+            var seeding = s.terminal.vtHandler();
+            seeding.effects = .readonly;
+            var seed_stream = vt.TerminalStream.init(.{ .handler = seeding, .allocator = gpa });
+            defer seed_stream.deinit();
+            seed_stream.nextSlice(bytes);
+        }
+        try s.setMember(opts.member);
+        errdefer s.freeMember();
         s.track = try .init(gpa, &track.counter, &s.terminal, start_seq, start_seq, io_mod.nowNanos());
         errdefer s.track.deinit(&s.terminal);
         for (opts.alerts) |rule| _ = try s.track.addAlert(&s.terminal, rule);
@@ -353,7 +423,7 @@ pub const Session = struct {
         // answer for XTGETTCAP "TN" queries.
         handler.terminfo_name = "ghostty";
         s.stream = ptyio.Stream.init(.{
-            .handler = .{ .inner = handler },
+            .handler = .{ .inner = handler, .session = s },
             .allocator = gpa,
             // Keeps a chunk's unfinished escape sequence for attach redraws.
             .continuation_max_bytes = 64 * 1024,
@@ -366,7 +436,7 @@ pub const Session = struct {
         if (opts.record) |rec| {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const path = rec.path orelse try store.sessionFile(&path_buf, s.id, record_name.?);
-            try startRecording(s, .{ .path = path, .format = rec.format });
+            try startRecording(s, .{ .path = path, .format = rec.format, .passwords = rec.passwords });
             s.run_recording = .{ .path = try gpa.dupe(u8, path), .format = rec.format, .input = rec.format == .trace, .started_ms = s.started_ms };
         }
         errdefer if (s.run_recording) |rec| gpa.free(rec.path);
@@ -487,6 +557,7 @@ pub const Session = struct {
             .notification_count = .init(meta.notification_count),
             .seen = meta.seen,
             .stopped = .init(meta.stopped),
+            .ended_alt = .init(meta.ended_alt),
             .hits = .{ .gpa = gpa },
         };
         s.terminal = try newTerminal(gpa, meta.cols, meta.rows, meta.scrollback);
@@ -498,8 +569,7 @@ pub const Session = struct {
             s.history_cap = pages.limits.bytes.min + room;
             s.terminal.setScrollbackMaxBytes(s.history_cap);
         }
-        s.terminal.colors.foreground.set(default_fg);
-        s.terminal.colors.background.set(default_bg);
+        setDefaultColors(&s.terminal);
         var handler = s.terminal.vtHandler();
         handler.effects = .readonly;
         s.stream = ptyio.Stream.init(.{ .handler = .{ .inner = handler }, .allocator = gpa });
@@ -555,6 +625,10 @@ pub const Session = struct {
         if (meta.recording_report.stopped) |st| s.last_stopped = .{ .path = try gpa.dupe(u8, st.path), .reason = st.reason, .reported = st.reported };
         errdefer if (s.last_stopped) |st| gpa.free(st.path);
         s.recording_failed.store(meta.recording_report.failed, .release);
+        s.over = try status_mod.dupeOver(gpa, meta.over);
+        errdefer if (s.over) |o| if (o.title) |title| gpa.free(title);
+        try s.setMember(meta.member orelse .{});
+        errdefer s.freeMember();
         if (meta.notification) |n| s.notification = try status_mod.dupeNotification(gpa, n);
         // Last: the caller gives back the floor if anything above fails.
         s.floor = floor;
@@ -569,7 +643,7 @@ pub const Session = struct {
         const running = self.running_lock orelse return;
         self.running_lock = null;
         var complete = true;
-        const screen = self.storedScreen() catch |err| blk: {
+        const screen = self.screenBytes() catch |err| blk: {
             std.log.err("session {d}: cannot render its final screen: {}", .{ self.id, err });
             complete = false;
             break :blk &[_]u8{};
@@ -590,6 +664,8 @@ pub const Session = struct {
             }
         }
         self.terminal_mutex.lockUncancelable(io);
+        // Rendering the final screen decompressed the history.
+        self.compressed = null;
         const cols = self.cols;
         const rows = self.rows;
         const title = status_mod.titleOf(arena.allocator(), self.terminal.getTitle()) catch null;
@@ -630,6 +706,7 @@ pub const Session = struct {
             .title = title,
             .reported_cwd = cwd,
             .stopped = self.stopped.load(.acquire),
+            .ended_alt = self.ended_alt.load(.acquire),
             .bell_count = self.bell_count.load(.acquire),
             .notification_count = self.notification_count.load(.acquire),
             .notification = notification,
@@ -648,7 +725,7 @@ pub const Session = struct {
     /// own full format, plus the blank rows at the bottom of the screen,
     /// which its content trims: without them a screen that ends in empty
     /// rows would come back shifted up.
-    fn storedScreen(self: *Session) ![]u8 {
+    pub fn screenBytes(self: *Session) ![]u8 {
         const io = io_mod.io();
         self.terminal_mutex.lockUncancelable(io);
         defer self.terminal_mutex.unlock(io);
@@ -712,12 +789,54 @@ pub const Session = struct {
         if (self.running_lock) |lock| lock.close(io_mod.io());
         if (self.run_recording) |rec| gpa.free(rec.path);
         if (self.notification) |n| status_mod.freeNotification(gpa, n);
+        if (self.over) |o| if (o.title) |title| gpa.free(title);
+        self.marks.deinit(gpa);
+        self.freeMember();
         self.sampler.deinit(gpa);
         freeArgv(gpa, self.argv);
         gpa.free(self.name);
         budget.release(self.floor, self.charged);
         gpa.destroy(self);
     }
+    /// Give the session `m` as what the caller says about it, copied;
+    /// member_mutex must not be held.
+    pub fn setMember(self: *Session, m: status_mod.Member) !void {
+        const arena = try self.gpa.create(std.heap.ArenaAllocator);
+        arena.* = .init(self.gpa);
+        errdefer {
+            arena.deinit();
+            self.gpa.destroy(arena);
+        }
+        const copy = try m.dupe(arena.allocator());
+        const io = io_mod.io();
+        self.member_mutex.lockUncancelable(io);
+        const old = self.member_arena;
+        self.member = copy;
+        self.member_arena = arena;
+        self.member_mutex.unlock(io);
+        if (old) |a| {
+            a.deinit();
+            self.gpa.destroy(a);
+        }
+    }
+
+    /// What the caller says about the session, in `gpa`.
+    pub fn memberOf(self: *Session, gpa: std.mem.Allocator) !status_mod.Member {
+        const io = io_mod.io();
+        self.member_mutex.lockUncancelable(io);
+        defer self.member_mutex.unlock(io);
+        return self.member.dupe(gpa);
+    }
+
+    fn freeMember(self: *Session) void {
+        if (self.member_arena) |a| {
+            a.deinit();
+            self.gpa.destroy(a);
+        }
+        self.member_arena = null;
+        self.member = .{};
+    }
+
     /// Attach input: written as it is, after any batch that runs.
     pub fn send(self: *Session, data: []const u8) !void {
         if (self.state.load(.acquire) == .exited) return error.SessionExited;
@@ -769,16 +888,18 @@ pub const Session = struct {
     /// held; the seq of the reflow, or null when it leaves the size as it
     /// is (the same size, or a restore while a writer is attached).
     fn resizeLocked(self: *Session, cols: u16, rows: u16, by: ResizeBy) !?u64 {
-        switch (by) {
-            .request => self.size_before_writer = null,
-            .writer => if (self.size_before_writer == null) {
-                self.size_before_writer = .{ self.cols, self.rows };
-            },
+        // Kept only once the size is the one asked for.
+        const before_writer: ?[2]u16 = switch (by) {
+            .request => null,
+            .writer => self.size_before_writer orelse .{ self.cols, self.rows },
             // A writer attached meanwhile: its size wins.
-            .restore => if (self.writer != null) return null,
-            .undo => {},
+            .restore => if (self.writer != null) return null else self.size_before_writer,
+            .undo => self.size_before_writer,
+        };
+        if (cols == self.terminal.cols and rows == self.terminal.rows) {
+            self.size_before_writer = before_writer;
+            return null;
         }
-        if (cols == self.terminal.cols and rows == self.terminal.rows) return null;
         if (!limits.validSize(cols, rows)) return error.SizeOutOfRange;
         const old_cols = self.terminal.cols;
         const old_rows = self.terminal.rows;
@@ -814,8 +935,10 @@ pub const Session = struct {
         self.resize_seq.store(seq, .release);
         self.cols = cols;
         self.rows = rows;
+        self.size_before_writer = before_writer;
         var frame_buf: [96]u8 = undefined;
         self.broadcastLocked(attach.resizeFrame(&frame_buf, cols, rows, seq));
+        self.redrawResizedLocked();
         return seq;
     }
 
@@ -853,6 +976,31 @@ pub const Session = struct {
         return true;
     }
 
+    /// Compress the cold history of a session that has had no output for
+    /// a while, so it keeps less resident memory; the budget still counts
+    /// it in full, as a resize decompresses it. Each step takes the
+    /// terminal lock only when it is free, and the pass stops for anyone
+    /// else who wants it. False when the target cannot compress.
+    pub fn compressIdle(self: *Session) bool {
+        const io = io_mod.io();
+        if (io_mod.nowNanos() - self.last_output.load(.monotonic) < compress_idle_ns) return true;
+        // A request may have read history, which decompresses it.
+        const released = self.released_ns.load(.acquire);
+        while (true) {
+            if (!self.terminal_mutex.tryLock()) return true;
+            const step = compressStep(&self.terminal, &self.compressed, released);
+            self.terminal_mutex.unlock(io);
+            switch (step) {
+                .more => {},
+                .done => return true,
+                .unsupported => return false,
+            }
+            // The mutex is not fair: a reader woken by the unlock gets the
+            // lock only if the next step does not take it first.
+            std.Io.sleep(io, .fromMilliseconds(1), .awake) catch return true;
+        }
+    }
+
     /// Let a trimmed session's history grow to its own limit again.
     pub fn liftHistoryCap(self: *Session) void {
         const io = io_mod.io();
@@ -877,14 +1025,39 @@ pub const Session = struct {
     /// the session has exited. Processes that left the session (setsid,
     /// daemons) are not tracked.
     pub fn stop(self: *Session) !void {
+        return self.stopFor(null);
+    }
+
+    /// `stop`, for the daemon's own reason `why` on a box, which its
+    /// status gives as `ended_by` unless a stop came first.
+    pub fn stopFor(self: *Session, why: ?status_mod.EndedBy) !void {
         const io = io_mod.io();
         if (self.state.load(.acquire) == .exited) return self.waitSettled(io_mod.nowNanos() + save_wait_ns);
         self.stop_mutex.lockUncancelable(io);
+        var marked = false;
         if (!self.process_reaped.load(.acquire)) {
+            // Before the signal: the status at the end must say why.
+            if (why) |reason| if (!self.stopped.load(.acquire)) {
+                self.terminal_mutex.lockUncancelable(io);
+                if (self.over) |*o| {
+                    // Held since its evaluator looked.
+                    if (reason == .unseen and over_mod.seenEnough(o.*)) {
+                        self.terminal_mutex.unlock(io);
+                        self.stop_mutex.unlock(io);
+                        return;
+                    }
+                    if (o.ended_by == null) {
+                        o.ended_by = reason;
+                        marked = true;
+                    }
+                }
+                self.terminal_mutex.unlock(io);
+            };
             self.stopped.store(true, .release);
             spawn.signalGroup(self, .terminate);
         }
         self.stop_mutex.unlock(io);
+        if (marked) self.overChanged();
 
         const grace_end = io_mod.nowNanos() + stop_grace_ns;
         while (io_mod.nowNanos() < grace_end and spawn.groupAlive(self)) {
@@ -966,10 +1139,12 @@ pub const Session = struct {
         }
         var record_locked = want != null;
         defer if (record_locked) self.record_mutex.unlock(io);
-        const resized = blk: {
+        const resized, const marked = blk: {
             self.terminal_mutex.lockUncancelable(io);
             defer self.terminal_mutex.unlock(io);
-            break :blk try self.attachLocked(arena.allocator(), v, write, force, want, recording);
+            const before = self.marksLocked();
+            const resized = try self.attachLocked(arena.allocator(), v, write, force, want, recording);
+            break :blk .{ resized, !std.meta.eql(before, self.marksLocked()) };
         };
         if (record_locked) {
             if (resized) record.recordInputLocked(self, .{ .resize = .{ .cols = want.?[0], .rows = want.?[1] } });
@@ -977,6 +1152,33 @@ pub const Session = struct {
             record_locked = false;
         }
         if (resized) self.afterResize();
+        if (marked) self.overChanged();
+    }
+
+    /// A box's `shown` and `held`; terminal_mutex must be held.
+    fn marksLocked(self: *const Session) ?[2]bool {
+        const o = self.over orelse return null;
+        return .{ o.shown, o.held };
+    }
+
+    /// Save what became of a box and tell the event streams.
+    fn overChanged(self: *Session) void {
+        const io = io_mod.io();
+        // The store gets the copies in the order they were taken.
+        self.over_mutex.lockUncancelable(io);
+        defer self.over_mutex.unlock(io);
+        self.lockTerminal();
+        const over = self.over.?;
+        self.unlockTerminal();
+        store.setOver(self.gpa, self.id, over) catch |err| std.log.err("session {d}: cannot save what became of the box: {}", .{ self.id, err });
+        events.publish(self.id, .changed, .initOne(.over));
+    }
+
+    /// Have the evaluator stop the box once `ms` passed without it being
+    /// seen enough (see over.seenEnough).
+    pub fn armUnseen(self: *Session, ms: u64) void {
+        self.unseen_deadline.store(io_mod.nowNanos() + @as(i64, @intCast(ms)) * std.time.ns_per_ms, .release);
+        self.track.notify();
     }
 
     /// `attachViewer` with terminal_mutex held, and record_mutex with
@@ -1001,11 +1203,11 @@ pub const Session = struct {
             _ = self.resizeLocked(old_size[0], old_size[1], .undo) catch {};
             self.size_before_writer = old_saved;
         };
-        const vt_bytes = try self.redrawLocked(gpa);
-        defer gpa.free(vt_bytes);
-        const screen = try attach.screenFrame(gpa, vt_bytes);
+        const screen = try self.screenFrameLocked(v.redraw_on_resize);
         defer gpa.free(screen);
-        if (!attach.roomForScreen(screen.len)) return error.ViewersBehind;
+        const history: []u8 = if (v.history > 0) try attach.historyFrames(gpa, &self.terminal, &self.track, v.history, v.history_from) else &.{};
+        defer gpa.free(history);
+        if (!attach.roomForScreen(screen.len + history.len)) return error.ViewersBehind;
         const end = if (ended) try attach.endFramesLocked(a, self) else "";
         const previous = self.writer;
         if (write) self.writer = v;
@@ -1014,16 +1216,34 @@ pub const Session = struct {
             _ = self.viewers.pop();
             self.writer = previous;
         }
+        // A box first watched or written to while it runs.
+        const old_marks = self.marksLocked();
+        if (!ended) if (self.over) |*o| {
+            o.shown = o.shown or !v.passive;
+            o.held = o.held or write;
+        };
+        // Only the marks: whether there is `over`, and the rest of it, are
+        // read without the lock.
+        errdefer if (old_marks) |m| {
+            self.over.?.shown = m[0];
+            self.over.?.held = m[1];
+        };
         const st = try status_mod.ofLocked(a, self, recording);
         const reply = try protocol.stringifyAlloc(a, protocol.StatusResp{ .status = st });
         if (write) if (previous) |old| {
             old.can_write.store(false, .release);
             // A fresh screen repairs what its notice of the takeover drew.
             old.push("{\"writer\":\"taken\"}\n");
-            old.push(screen);
+            if (old.redraw_on_resize == v.redraw_on_resize) {
+                old.push(screen);
+            } else if (self.screenFrameLocked(old.redraw_on_resize)) |own| {
+                defer gpa.free(own);
+                old.push(own);
+            } else |err| std.log.err("session {d}: cannot redraw for the displaced writer: {}", .{ self.id, err });
         };
         v.pushInitial(reply);
         v.pushInitial("\n");
+        if (history.len > 0) v.pushInitial(history);
         v.pushInitial(screen);
         if (ended) v.finish(end);
         return resized;
@@ -1132,10 +1352,13 @@ pub const Session = struct {
         return new[1];
     }
 
-    /// Count the end of a session that `stop` ended as seen: whoever
-    /// stopped it knows.
-    pub fn markStopSeen(self: *Session) void {
+    /// Count the end of a session as seen when `stop` ended it, as whoever
+    /// stopped it knows, or when it is a box, which needs nobody once it
+    /// ended.
+    pub fn markEndSeen(self: *Session) void {
         const io = io_mod.io();
+        self.ack_mutex.lockUncancelable(io);
+        defer self.ack_mutex.unlock(io);
         const seen = blk: {
             self.seen_mutex.lockUncancelable(io);
             defer self.seen_mutex.unlock(io);
@@ -1150,13 +1373,49 @@ pub const Session = struct {
     /// over the screen.
     pub fn redrawTo(self: *Session, v: *attach.Viewer) void {
         const io = io_mod.io();
+        defer self.track.notify();
         self.terminal_mutex.lockUncancelable(io);
         defer self.terminal_mutex.unlock(io);
-        const vt_bytes = self.redrawLocked(self.gpa) catch return;
-        defer self.gpa.free(vt_bytes);
-        const screen = attach.screenFrame(self.gpa, vt_bytes) catch return;
+        const screen = self.screenFrameLocked(v.redraw_on_resize) catch return;
         defer self.gpa.free(screen);
         v.push(screen);
+    }
+
+    /// After a resize frame, a fresh screen to every stream that asked
+    /// for one (`redraw_on_resize`); terminal_mutex must be held.
+    fn redrawResizedLocked(self: *Session) void {
+        for (self.viewers.items) |v| {
+            if (v.redraw_on_resize) break;
+        } else return;
+        const screen = self.screenFrameLocked(true) catch |err| {
+            std.log.err("session {d}: cannot redraw after a resize: {}", .{ self.id, err });
+            return;
+        };
+        defer self.gpa.free(screen);
+        for (self.viewers.items) |v| if (v.redraw_on_resize) v.push(screen);
+    }
+
+    /// A `screen` frame of `redrawLocked`, owned by self.gpa. It settles
+    /// output parsed before, so its row number fits its screen: the
+    /// caller notifies the tracker after unlocking.
+    fn screenFrameLocked(self: *Session, copy: bool) ![]u8 {
+        if (self.track.unsettled()) self.track.settle(&self.terminal, io_mod.nowNanos());
+        const vt_bytes = try self.redrawLocked(self.gpa, copy);
+        defer self.gpa.free(vt_bytes);
+        // The redraw ends every row: a client that keeps a copy is told
+        // which rows the session wrapped, so its copy marks them too.
+        var wrapped: std.ArrayList(u16) = .empty;
+        defer wrapped.deinit(self.gpa);
+        var continued = false;
+        if (copy) {
+            const pages = &self.terminal.screens.active.pages;
+            if (pages.pin(.{ .active = .{} })) |top| continued = top.rowAndCell().row.wrap_continuation;
+            for (0..self.terminal.rows -| 1) |y| {
+                const pin = pages.pin(.{ .active = .{ .y = @intCast(y) } }) orelse break;
+                if (pin.rowAndCell().row.wrap) try wrapped.append(self.gpa, @intCast(y));
+            }
+        }
+        return attach.screenFrame(self.gpa, vt_bytes, @intCast(@max(0, self.track.top(.primary))), wrapped.items, continued);
     }
 
     /// End every attach stream with `line`.
@@ -1174,8 +1433,10 @@ pub const Session = struct {
 
     /// A full redraw for an attach client: reset, then everything needed
     /// to rebuild the visible screen (palette, modes, content, cursor),
-    /// then any escape sequence the child has not finished yet.
-    fn redrawLocked(self: *Session, gpa: std.mem.Allocator) ![]u8 {
+    /// then any escape sequence the child has not finished yet. With
+    /// `copy`, for a client that keeps its own copy of the screen, also
+    /// the default colors and the cursor shape the program set.
+    fn redrawLocked(self: *Session, gpa: std.mem.Allocator, copy: bool) ![]u8 {
         var w: std.Io.Writer.Allocating = .init(gpa);
         errdefer w.deinit();
         try w.writer.writeAll("\x1bc");
@@ -1186,6 +1447,16 @@ pub const Session = struct {
             if (std.meta.eql(now, was)) continue;
             try w.writer.print("\x1b]4;{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{ i, now.r, now.g, now.b });
         }
+        // A reset leaves the default colors alone: one the program did not
+        // set is reset explicitly.
+        if (copy) for ([_]struct { u8, vt.color.DynamicRGB }{
+            .{ 10, self.terminal.colors.foreground },
+            .{ 11, self.terminal.colors.background },
+        }) |entry| {
+            if (entry[1].override) |c| {
+                try w.writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{ entry[0], c.r, c.g, c.b });
+            } else try w.writer.print("\x1b]1{d}\x1b\\", .{entry[0]});
+        };
         var formatter = vt.formatter.TerminalFormatter.init(&self.terminal, .{ .emit = .vt });
         formatter.extra = .all;
         formatter.extra.palette = false;
@@ -1196,6 +1467,15 @@ pub const Session = struct {
             false,
         ) };
         try formatter.format(&w.writer);
+        if (copy and !self.terminal.cursor.is_default) {
+            const blink = self.terminal.modes.get(.cursor_blinking);
+            const shape: u8 = switch (self.terminal.screens.active.cursor.cursor_style) {
+                .block, .block_hollow => if (blink) 1 else 2,
+                .underline => if (blink) 3 else 4,
+                .bar => if (blink) 5 else 6,
+            };
+            try w.writer.print("\x1b[{d} q", .{shape});
+        }
         // If the last chunk ended inside a sequence, replay its start so
         // the next out frame completes it instead of printing as text.
         self.stream.writeContinuation(&w.writer) catch |err| switch (err) {
@@ -1203,6 +1483,13 @@ pub const Session = struct {
             else => |e| return e,
         };
         return w.toOwnedSlice();
+    }
+
+    /// The default colors the terminal reports.
+    pub fn defaultColors(self: *Session) [2]vt.color.RGB {
+        self.lockTerminal();
+        defer self.unlockTerminal();
+        return .{ self.terminal.colors.foreground.default orelse default_fg, self.terminal.colors.background.default orelse default_bg };
     }
 
     pub fn lockTerminal(self: *Session) void {
@@ -1216,6 +1503,24 @@ pub const Session = struct {
 
 /// A session's terminal. Every one is made here, so no size outside the
 /// limits reaches Ghostty, which allocates the whole grid at once.
+/// The compression activity of a terminal and the latest release of its
+/// session when a compression pass ended.
+const Compressed = struct { activity: u64, released: i64 };
+
+/// One bounded compression step over `t`'s cold history, unless the pass
+/// that `mark` records still covers it.
+fn compressStep(t: *vt.Terminal, mark: *?Compressed, released: i64) enum { more, done, unsupported } {
+    if (mark.*) |m| if (m.activity == t.compressionActivity() and m.released == released) return .done;
+    switch (t.compress(.incremental)) {
+        .pending => return .more,
+        .complete => {
+            mark.* = .{ .activity = t.compressionActivity(), .released = released };
+            return .done;
+        },
+        .unsupported => return .unsupported,
+    }
+}
+
 fn newTerminal(gpa: std.mem.Allocator, cols: u16, rows: u16, scrollback: u64) !vt.Terminal {
     if (!limits.validSize(cols, rows) or scrollback > limits.max_scrollback) return error.SizeOutOfRange;
     // No Kitty graphics: nothing shows images, so storing them only costs
@@ -1263,4 +1568,45 @@ fn trailingBlankRows(t: *const vt.Terminal) usize {
         blank += 1;
     }
     return blank;
+}
+
+test "idle compression packs cold history, and again after a read" {
+    const gpa = std.testing.allocator;
+    var t = try newTerminal(gpa, 80, 24, 16 << 20);
+    defer t.deinit(gpa);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    for (0..20_000) |i| {
+        var buf: [96]u8 = undefined;
+        stream.nextSlice(try std.fmt.bufPrint(&buf, "line {d} of the history that the pass compresses\r\n", .{i}));
+    }
+    const pages = &t.screens.get(.primary).?.pages;
+    const S = struct {
+        fn compressed(list: *vt.PageList) usize {
+            var n: usize = 0;
+            var node = list.pages.first;
+            while (node) |nd| : (node = nd.next) n += @intFromBool(nd.storage() == .compressed);
+            return n;
+        }
+        fn pass(term: *vt.Terminal, mark: *?Compressed, released: i64) !void {
+            for (0..10_000) |_| switch (compressStep(term, mark, released)) {
+                .more => {},
+                .done => return,
+                .unsupported => return error.Unsupported,
+            };
+            return error.PassNeverEnded;
+        }
+    };
+    var mark: ?Compressed = null;
+    try S.pass(&t, &mark, 1);
+    const packed_pages = S.compressed(pages);
+    try std.testing.expect(packed_pages > 0);
+
+    // Reading a page restores it; the same release does not start a pass.
+    _ = pages.pages.first.?.page();
+    try std.testing.expectEqual(packed_pages - 1, S.compressed(pages));
+    try S.pass(&t, &mark, 1);
+    try std.testing.expectEqual(packed_pages - 1, S.compressed(pages));
+    try S.pass(&t, &mark, 2);
+    try std.testing.expectEqual(packed_pages, S.compressed(pages));
 }

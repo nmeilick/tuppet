@@ -55,6 +55,16 @@ grep -q -- "--start and --stop conflict" "$tmp/stderr"
 check_usage_error sweep 1 -s 80x24 --find 'title=ok '
 check_usage_error view "$(printf '\377')"
 grep -q "is not valid UTF-8" "$tmp/stderr"
+check_usage_error --socket "$(printf '\377')" list
+grep -q -- "--socket path .* is not valid UTF-8" "$tmp/stderr"
+set +e
+printf '\377' | "$bin" do 1 --stdin >"$tmp/stdout" 2>"$tmp/stderr"
+status=$?
+set -e
+test "$status" -eq 2
+grep -q "standard input is not valid UTF-8" "$tmp/stderr"
+check_usage_error events -i 25h
+grep -q -- "-i must be at most 24h" "$tmp/stderr"
 
 "$bin" help >"$tmp/help"
 grep -q '1\.\.9' "$tmp/help"
@@ -79,6 +89,7 @@ done
 "$bin" help alert >"$tmp/help_cmd"
 cmp -s "$tmp/stdout" "$tmp/help_cmd"
 "$bin" view 1 -j --help | grep -q '^tuppet view '
+"$bin" restart 1 --help | grep -q '^tuppet restart '
 
 check_usage_error help bogus
 check_usage_error help key extra
@@ -94,9 +105,9 @@ grep -q "see 'tuppet help view'" "$tmp/stderr"
 check_usage_error alert add 1 '=x'
 grep -q "the alert name is empty" "$tmp/stderr"
 
-# Options may come before the session: these parse, and fail only for
-# want of a daemon (exit 1, not 2).
-for args in "view -j 1" "wait -m x 1" "do -t 1s 1 -s x" "record --stop 1" "attach -r 1" "key -- 1 -v"; do
+# Options may come before the session, and after -- nothing is an
+# option: these parse, and fail only for want of a daemon (exit 1, not 2).
+for args in "view -j 1" "wait -m x 1" "do -t 1s 1 -s x" "record --stop 1" "attach -r 1" "key -- 1 -v" "png 1 -- -j"; do
     set +e
     # shellcheck disable=SC2086
     "$bin" $args </dev/null >/dev/null 2>"$tmp/stderr"

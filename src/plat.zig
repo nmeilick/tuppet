@@ -128,7 +128,7 @@ pub fn close(f: File) void {
 fn consoleWriteAll(which: win32.DWORD, data: []const u8) !void {
     switch (builtin.os.tag) {
         .windows => {
-            const h = win32.GetStdHandle(which);
+            const h = win32.GetStdHandle(which) orelse return error.OutputFailed;
             var i: usize = 0;
             while (i < data.len) {
                 var written: win32.DWORD = 0;
@@ -170,7 +170,8 @@ pub fn stdinReadAll(gpa: std.mem.Allocator, limit: usize) ![]u8 {
         const n: usize = switch (builtin.os.tag) {
             .windows => blk: {
                 var read: win32.DWORD = 0;
-                if (win32.ReadFile(win32.GetStdHandle(win32.STD_INPUT_HANDLE), &chunk, chunk.len, &read, null) == 0) {
+                const h = win32.GetStdHandle(win32.STD_INPUT_HANDLE) orelse break :blk 0;
+                if (win32.ReadFile(h, &chunk, chunk.len, &read, null) == 0) {
                     if (win32.GetLastError() == win32.ERROR_BROKEN_PIPE) break :blk 0;
                     return error.InputFailed;
                 }

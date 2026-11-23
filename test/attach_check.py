@@ -10,12 +10,12 @@ import time
 path = sys.argv[1]
 
 
-def attach(sid, mode="read", force=False, label=None):
+def attach(sid, mode="read", force=False, label=None, **fields):
     s = socket.socket(socket.AF_UNIX)
     # A broken daemon fails the check instead of hanging it.
     s.settimeout(5)
     s.connect(path)
-    req = {"cmd": "attach", "session": sid, "mode": mode, "force": force}
+    req = {"cmd": "attach", "session": sid, "mode": mode, "force": force, **fields}
     if label is not None:
         req["label"] = label
     s.sendall(json.dumps(req).encode() + b"\n")
@@ -56,6 +56,14 @@ def output_has(text):
 def resized(cols, rows):
     """A resize frame to this size, whatever its seq."""
     return lambda fr: (fr.get("resize") or {}).get("cols") == cols and fr["resize"].get("rows") == rows
+
+
+def screens_until(f, text):
+    """The screens among the frames up to the output that shows text."""
+    got = []
+    has = output_has(text)
+    check(until(f, lambda fr: got.append(fr) or has(fr)), "the output %r did not arrive" % text)
+    return [base64.b64decode(fr["screen"]) for fr in got if "screen" in fr]
 
 
 def check(ok, what):
@@ -194,6 +202,27 @@ def sized(sid):
     check(refused["code"] == "guard" and refused["guard"] == "unattended" and refused["status"]["cols"] == 72, "an attended resize was not refused: %r" % refused)
 
 
+def redraw(sid, tuppet):
+    """A stream that asked for redraw_on_resize gets one screen after every
+    resize, whoever made it, with the background color the program set;
+    a stream that did not ask sees neither."""
+    s, f = attach(sid, "write", redraw_on_resize=True)
+    _, plain = attach(sid)
+    check(frame(f)["ok"] and frame(plain)["ok"], "attach replies")
+    colored = b"\x1b]11;rgb:12/34/56\x1b\\"
+    check(colored in base64.b64decode(frame(f)["screen"]), "the first screen lacks the program's background")
+    check(b"\x1b]11;" not in base64.b64decode(frame(plain)["screen"]), "a plain stream's screen carries the program's background")
+    subprocess.run([tuppet, "resize", sid, "70x20"], check=True)
+    check(until(f, resized(70, 20)), "the request's resize was lost")
+    after = frame(f)
+    check("screen" in after and colored in base64.b64decode(after["screen"]), "no screen with the background after the resize: %r" % after)
+    s.sendall(b'{"resize":{"cols":72,"rows":22}}\n')
+    check(until(f, resized(72, 22)), "the writer's resize was lost")
+    subprocess.run([tuppet, "key", sid, "MARK"], check=True)
+    check(len(screens_until(f, b"MARK")) == 1, "the writer's own resize did not bring exactly one screen")
+    check(screens_until(plain, b"MARK") == [], "a plain viewer got a screen after a resize")
+
+
 def preview(sid, tuppet):
     """A preview counts in status.previews, not in viewers."""
     _, f = attach(sid, "preview")
@@ -227,6 +256,24 @@ def restore(sid, tuppet):
         while size_of(tuppet, sid) != want and time.time() < end:
             time.sleep(0.02)
         check(size_of(tuppet, sid) == want, "after the writer left the size is %r, not %r" % (size_of(tuppet, sid), want))
+
+
+def refused(sid, tuppet, size):
+    """A resize request that fails leaves a writer's size to go when it
+    detaches."""
+    before = size_of(tuppet, sid)
+    s, f = attach(sid, "write")
+    frame(f)
+    s.sendall(b'{"resize":{"cols":61,"rows":17}}\n')
+    check(until(f, resized(61, 17)), "the writer's resize was lost")
+    check(subprocess.run([tuppet, "resize", sid, size], capture_output=True).returncode != 0, "the resize to %s did not fail" % size)
+    s.sendall(b'{"detach":true}\n')
+    check(until(f, lambda fr: "end" in fr), "no end frame after a detach")
+    s.close()
+    end = time.time() + 3
+    while size_of(tuppet, sid) != before and time.time() < end:
+        time.sleep(0.02)
+    check(size_of(tuppet, sid) == before, "after a failed resize the writer left the size %r, not %r" % (size_of(tuppet, sid), before))
 
 
 def hold(sid, tuppet):

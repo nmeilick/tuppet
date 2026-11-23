@@ -96,8 +96,8 @@ tuppet remove $id                              # delete the ended session
   session of that name instead of failing; `--if-exists replace` starts
   it anew.
 - `tuppet list` shows every session as a table (ID, NAME, STATE such as
-  running, password?, quiet 3m, bell, done, stopped, failed 2, lost; AGE;
-  CMD); `tuppet list -j` gives each session's full status as JSON. `!`
+  running, password?, box waits, quiet 3m, bell, done, stopped, failed 2,
+  lost; AGE; CMD); `tuppet list -j` gives each session's full status as JSON. `!`
   marks a session that rang the bell, sent a notification, had an alert
   hit (STATE names the alert), or ended since it was last seen; `tuppet
   ack <session>` clears it.

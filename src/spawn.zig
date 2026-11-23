@@ -200,9 +200,11 @@ pub fn waiterLoop(s: *Session) void {
 pub fn spawnWindowsChild(gpa: std.mem.Allocator, opts: Options, child_env: []const []const u8, pair: *const pty_mod.Pair) !Proc {
     const cmd = try buildWindowsCommandLine(gpa, opts.argv);
     defer gpa.free(cmd);
-    // Without a caller environment the child inherits the daemon's.
-    const env_block: ?[:0]u16 = if (opts.env != null) try buildWindowsEnvBlock(gpa, child_env) else null;
-    defer if (env_block) |block| gpa.free(block);
+    const env_block = if (opts.env != null)
+        try buildWindowsEnvBlock(gpa, child_env)
+    else
+        try buildInheritedWindowsEnvBlock(gpa, child_env);
+    defer gpa.free(env_block);
     const cwd_buf = if (opts.cwd) |cwd_path| blk: {
         if (cwd_path.len == 0 or std.mem.indexOfScalar(u8, cwd_path, 0) != null) return error.BadCwd;
         break :blk std.unicode.utf8ToUtf16LeAllocZ(gpa, cwd_path) catch return error.BadCwd;
@@ -226,7 +228,8 @@ pub fn spawnWindowsChild(gpa: std.mem.Allocator, opts: Options, child_env: []con
         attr_list.ptr,
         0,
         win32.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        @as(*const anyopaque, @ptrCast(&hpc)),
+        // This attribute takes the HPCON itself, not a pointer to it.
+        hpc,
         @sizeOf(win32.HPCON),
         null,
         null,
@@ -237,8 +240,7 @@ pub fn spawnWindowsChild(gpa: std.mem.Allocator, opts: Options, child_env: []con
     si.lpAttributeList = attr_list.ptr;
 
     var pi: win32.PROCESS_INFORMATION = std.mem.zeroes(win32.PROCESS_INFORMATION);
-    const job = win32.CreateJobObjectW(null, null);
-    if (@intFromPtr(job) == 0) return error.SpawnFailed;
+    const job = win32.CreateJobObjectW(null, null) orelse return error.SpawnFailed;
     errdefer _ = win32.CloseHandle(job);
     var job_info: win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
     job_info.BasicLimitInformation.LimitFlags = win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -255,7 +257,7 @@ pub fn spawnWindowsChild(gpa: std.mem.Allocator, opts: Options, child_env: []con
         null,
         0, // ConPTY handles are not inherited; the console is.
         win32.EXTENDED_STARTUPINFO_PRESENT | win32.CREATE_SUSPENDED | win32.CREATE_UNICODE_ENVIRONMENT,
-        if (env_block) |block| @ptrCast(block.ptr) else null,
+        @ptrCast(env_block.ptr),
         cwd,
         &si.StartupInfo,
         &pi,
@@ -270,6 +272,38 @@ pub fn spawnWindowsChild(gpa: std.mem.Allocator, opts: Options, child_env: []con
     if (win32.ResumeThread(pi.hThread) == 0xFFFFFFFF) return error.SpawnFailed;
     _ = win32.CloseHandle(pi.hThread);
     return .{ .windows = .{ .process = pi.hProcess, .job = job, .pid = pi.dwProcessId } };
+}
+
+/// The block for a child without a caller environment: the daemon's own,
+/// without the caller's terminal variables, followed by `child_env`
+/// (tuppet's TERM and session variables). `buildChildEnv` cannot add the
+/// daemon's environment on Windows, where it is not a list of
+/// "NAME=value" strings to alias.
+fn buildInheritedWindowsEnvBlock(gpa: std.mem.Allocator, child_env: []const []const u8) ![:0]u16 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const map = try std.process.Environ.createMap(io_mod.environ, arena);
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = map.iterator();
+    while (it.next()) |e| {
+        const entry = try std.mem.concat(arena, u8, &.{ e.key_ptr.*, "=", e.value_ptr.* });
+        // Unpaired surrogates have no UTF-16 form here; such a variable
+        // is left out rather than failing every session.
+        if (!std.unicode.utf8ValidateSlice(entry)) continue;
+        // Per-drive working directories ("=C:=C:\dir") have no name
+        // before the first '='; they are passed on as they are.
+        if (entry[0] == '=') {
+            try list.append(arena, entry);
+            continue;
+        }
+        appendEnvEntry(arena, &list, entry) catch |err| switch (err) {
+            error.BadEnv => {},
+            else => return err,
+        };
+    }
+    try list.appendSlice(arena, child_env);
+    return buildWindowsEnvBlock(gpa, list.items);
 }
 
 /// A CreateProcessW environment block: UTF-16 "NAME=value" entries, each
@@ -389,7 +423,7 @@ fn spawnPosixChild(gpa: std.mem.Allocator, opts: Options, child_env: []const []c
     pair.posix.slave = -1;
     _ = std.c.close(setup_pipe[1]);
     setup_pipe[1] = -1;
-    var child = std.process.Child{
+    const child = std.process.Child{
         .id = @intCast(child_pid),
         .thread_handle = {},
         .stdin = null,
@@ -398,11 +432,18 @@ fn spawnPosixChild(gpa: std.mem.Allocator, opts: Options, child_env: []const []c
         .request_resource_usage_statistics = false,
     };
     var setup_failed: [1]u8 = undefined;
-    if (std.c.read(setup_pipe[0], &setup_failed, setup_failed.len) > 0) {
-        _ = child.wait(io_mod.io()) catch null;
+    const n = while (true) {
+        const rc = std.c.read(setup_pipe[0], &setup_failed, setup_failed.len);
+        if (rc >= 0 or std.posix.errno(rc) != .INTR) break rc;
+    };
+    var proc: Proc = .{ .posix = child };
+    // EOF alone means exec succeeded: the write end closed on exec.
+    if (n != 0) {
+        if (n < 0) _ = std.c.kill(child_pid, std.posix.SIG.KILL);
+        _ = reapPosix(&proc, io_mod.io());
         return error.ChildSetupFailed;
     }
-    return .{ .posix = child };
+    return proc;
 }
 
 fn buildWindowsCommandLine(gpa: std.mem.Allocator, argv: []const []const u8) ![:0]u16 {
@@ -438,17 +479,17 @@ fn buildWindowsCommandLine(gpa: std.mem.Allocator, argv: []const []const u8) ![:
 
 const GroupSignal = enum { terminate, kill };
 
-/// Signal the child's process group (Windows: its job). stop_mutex must
-/// be held: on POSIX the group id is the child's pid, which the waiter
-/// keeps reserved until it reaps the child under the same mutex. SIGKILL
-/// also reaches the session's other process groups on Linux: an
-/// interactive shell runs each background job in its own group.
+/// Signal the child's process group (Windows: its job) while it is the
+/// child's; see `groupOwned`. stop_mutex must be held. SIGKILL also
+/// reaches the session's other process groups on Linux: an interactive
+/// shell runs each background job in its own group.
 pub fn signalGroup(s: *Session, how: GroupSignal) void {
     switch (builtin.os.tag) {
         .windows => {
             if (!s.process_reaped.load(.acquire)) _ = win32.TerminateJobObject(s.proc.windows.job, 1);
         },
         else => {
+            if (!groupOwned(s)) return;
             const group = -@as(std.posix.pid_t, @intCast(s.process_id));
             switch (how) {
                 .terminate => {
@@ -465,15 +506,26 @@ pub fn signalGroup(s: *Session, how: GroupSignal) void {
 }
 
 /// Whether any process of the child's group (or, on Linux, its session)
-/// is still alive; the child itself counts until it is reaped. A group
-/// or session that still has members keeps its id reserved, so
-/// signalling it right after this check is safe from pid reuse.
+/// is still alive; the child itself counts until it is reaped.
 pub fn groupAlive(s: *Session) bool {
     return switch (builtin.os.tag) {
         .windows => !s.process_reaped.load(.acquire),
-        else => std.c.kill(-@as(std.posix.pid_t, @intCast(s.process_id)), @fromBackingInt(0)) == 0 or
-            forEachSessionMember(s.process_id, null) > 0,
+        else => groupOwned(s) and
+            (std.c.kill(-@as(std.posix.pid_t, @intCast(s.process_id)), @fromBackingInt(0)) == 0 or
+                forEachSessionMember(s.process_id, null) > 0),
     };
+}
+
+/// Whether the group and session ids that are the child's pid still name
+/// its own processes (POSIX). Until the waiter reaps the child under
+/// stop_mutex, the pid is the child's. After that, the system gives the
+/// pid to a new process only once no process is left in the group or
+/// session it led: a process with that pid means they are gone, and the
+/// ids are another program's.
+fn groupOwned(s: *Session) bool {
+    if (!s.process_reaped.load(.acquire)) return true;
+    const rc = std.c.kill(@intCast(s.process_id), @fromBackingInt(0));
+    return rc != 0 and std.posix.errno(rc) == .SRCH;
 }
 
 /// Linux: send `sig` (or nothing, to count) to every process whose

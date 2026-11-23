@@ -271,7 +271,11 @@ pub fn encodeAll(
 /// input. Outside the kitty protocol, Ctrl combos without a C0 byte (such
 /// as Ctrl+Shift+c) would go out as fixterms CSI u, which a program that
 /// did not ask for it reads as stray text, so they fail too.
-fn encodeKey(w: *std.Io.Writer, ev: key.KeyEvent, opts: key_encode.Options) !void {
+fn encodeKey(w: *std.Io.Writer, event: key.KeyEvent, opts: key_encode.Options) !void {
+    var ev = event;
+    // modifyOtherKeys reports a key by its character, which Space under
+    // Ctrl leaves out so that legacy C-S-Space is not NUL.
+    if (opts.modify_other_keys_state_2 and ev.key == .space) ev.utf8 = " ";
     const legacy = opts.kitty_flags.int() == 0;
     if (legacy and !opts.modify_other_keys_state_2) if (legacyControl(ev)) |byte| {
         if (ev.mods.alt) try w.writeByte(0x1b);
@@ -340,10 +344,17 @@ pub fn split(gpa: std.mem.Allocator, text: []const u8, bad: *[]const u8) ![]cons
         }
         if (i > run) try tokens.append(gpa, text[run..i]);
         const close = std.mem.indexOfScalarPos(u8, text, i + 1, '>');
-        const group: ?[]const u8 = if (close) |c| text[i .. c + 1] else null;
+        var group: ?[]const u8 = if (close) |c| text[i .. c + 1] else null;
+        // The key may be '>' itself, as in <M->>.
+        if (close) |c| if (text[c - 1] == '-' and c + 1 < text.len and text[c + 1] == '>') {
+            var scratch: [4]u8 = undefined;
+            if (parseToken(text[i .. c + 2], &scratch)) |_| group = text[i .. c + 2] else |_| {}
+        };
         if (group) |g| key: {
             const inner = g[1 .. g.len - 1];
-            if (inner.len < 2 or std.mem.indexOfAny(u8, inner, " \t<") != null) break :key;
+            // Or '<', as in <M-<>.
+            const body = if (std.mem.endsWith(u8, inner, "-<")) inner[0 .. inner.len - 1] else inner;
+            if (inner.len < 2 or std.mem.indexOfAny(u8, body, " \t<") != null) break :key;
             var scratch: [4]u8 = undefined;
             if (parseToken(g, &scratch)) |_| {
                 try tokens.append(gpa, g);
@@ -399,6 +410,7 @@ test "a string splits into keys and text" {
         .{ .text = ":q!<Enter>", .tokens = &.{ ":q!", "<Enter>" } },
         .{ .text = "<C-c><Esc>ihi", .tokens = &.{ "<C-c>", "<Esc>", "ihi" } },
         .{ .text = "<M-->x", .tokens = &.{ "<M-->", "x" } },
+        .{ .text = "<M->><M-<><M-->>", .tokens = &.{ "<M->>", "<M-<>", "<M-->", ">" } },
         .{ .text = "a <=> b <x> <", .tokens = &.{ "a ", "<", "=> b ", "<", "x> ", "<" } },
         .{ .text = "<a b>", .tokens = &.{ "<", "a b>" } },
         .{ .text = "-v", .tokens = &.{"-v"} },
@@ -626,6 +638,15 @@ test "ctrl letters, ctrl-space, control characters, and minus encode as keys" {
     const kitty = try encodeFor(&term, &.{ "<C-Space>", "<C-->", "\t", "\x01" });
     defer testing.allocator.free(kitty);
     try testing.expectEqualStrings("\x1b[32;5u\x1b[45;5u\t\x1b[97;5u", kitty);
+}
+
+test "modifyOtherKeys reports ctrl-space by its character" {
+    var term = try vt.Terminal.init((vt.TinyIo.init).io(), testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(testing.allocator);
+    term.flags.modify_other_keys_2 = true;
+    const out = try encodeFor(&term, &.{ "<C-Space>", "<C-S-Space>", "<Space>" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("\x1b[27;5;32~\x1b[27;6;32~ ", out);
 }
 
 test "failed key encoding frees partial output" {

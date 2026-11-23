@@ -23,6 +23,7 @@ const sample = @import("sample.zig");
 const evaluator = @import("evaluator.zig");
 const hangup = @import("hangup.zig");
 const session_mod = @import("session.zig");
+const status = @import("status.zig");
 
 const Session = session_mod.Session;
 
@@ -66,6 +67,20 @@ pub const Checked = union(enum) {
 
 /// Check the steps of a request; strings alias `steps`, the rest lives in
 /// `gpa`.
+/// Why `steps` cannot go to a prompt under the prompt guard, which takes
+/// one paste of one line of printable characters, at most 4 KiB; null
+/// when they can.
+pub fn promptTextError(steps: []const protocol.Step) ?[]const u8 {
+    if (steps.len != 1 or steps[0].paste == null) return "the prompt guard takes one paste step";
+    const text = steps[0].paste.?;
+    if (text.len > 4096) return "the text is longer than 4 KiB";
+    if (!std.unicode.utf8ValidateSlice(text)) return "the text is not valid UTF-8";
+    const view = std.unicode.Utf8View.initUnchecked(text);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| if (status.isControl(cp)) return "the text is not one line of printable characters";
+    return null;
+}
+
 pub fn check(gpa: std.mem.Allocator, steps: []const protocol.Step) !Checked {
     if (steps.len == 0) return .{ .bad = "steps must not be empty" };
     if (steps.len > max_steps) return .{ .bad = try std.fmt.allocPrint(gpa, "steps takes at most {d} steps", .{max_steps}) };
@@ -112,7 +127,7 @@ pub const Options = struct {
     waiter: ?*evaluator.Waiter = null,
 };
 
-pub const Guard = enum { unattended, input_seq, hidden_input, hit_seq, reply_to };
+pub const Guard = enum { unattended, input_seq, hidden_input, hit_seq, reply_to, prompt };
 
 pub const Outcome = struct {
     /// Steps that ran.
@@ -121,6 +136,8 @@ pub const Outcome = struct {
     /// The key token `err` is about, when a key failed to encode.
     key: []const u8 = "",
     guard: ?Guard = null,
+    /// Which condition of the prompt guard failed.
+    prompt_why: []const u8 = "",
     /// The client went away; nobody gets a reply.
     hung_up: bool = false,
     /// The waiter is on the evaluator.
@@ -153,7 +170,7 @@ pub fn run(s: *Session, gpa: std.mem.Allocator, plans: []const Plan, opts: Optio
     };
     defer ptyio.flushAfterWrite(s);
     defer s.write_mutex.unlock(io);
-    if (refused(s, opts.require)) |guard| {
+    if (refused(s, opts.require, &out.prompt_why)) |guard| {
         out.guard = guard;
         return out;
     }
@@ -161,7 +178,11 @@ pub fn run(s: *Session, gpa: std.mem.Allocator, plans: []const Plan, opts: Optio
         out.err = error.CoordinatesOutsideGrid;
         return out;
     }
-    ptyio.markInput(s);
+    var first = markInputWith(s, gpa, plans[0], &out.key) catch |err| {
+        out.err = err;
+        return out;
+    };
+    defer if (first) |bytes| gpa.free(bytes);
     if (opts.waiter) |w| out.registered = evaluator.register(s, w, false) catch |err| {
         out.err = err;
         return out;
@@ -172,7 +193,9 @@ pub fn run(s: *Session, gpa: std.mem.Allocator, plans: []const Plan, opts: Optio
             out.hung_up = true;
             return out;
         };
-        runStep(s, gpa, p, start + write_budget_ns, &slept, &out.key) catch |err| {
+        const encoded = first;
+        first = null;
+        runStep(s, gpa, p, encoded, start + write_budget_ns, &slept, &out.key) catch |err| {
             out.err = err;
             return out;
         };
@@ -188,8 +211,27 @@ fn finish(s: *Session) void {
     io_mod.io().futexWake(u32, &s.batch.ended.raw, std.math.maxInt(u32));
 }
 
-/// The first guard of `req` that refuses the batch.
-fn refused(s: *Session, req: protocol.Require) ?Guard {
+/// The first guard of `req` that refuses the batch; for the prompt guard,
+/// `why` says which of its conditions failed.
+fn refused(s: *Session, req: protocol.Require, why: *[]const u8) ?Guard {
+    if (req.prompt) |seq| {
+        s.lockTerminal();
+        defer s.unlockTerminal();
+        const m = &s.marks;
+        why.* = if (m.shell != .prompt)
+            "the shell does not wait at its prompt"
+        else if (m.prompt_seq != seq)
+            "the prompt is not the one with that prompt_seq"
+        else if (s.track.input_seq.load(.acquire) != m.prompt_input_seq)
+            "something was typed since the prompt appeared"
+        else if (s.terminal.screens.active_key != .primary)
+            "the session is not on its normal screen"
+        else if (!s.terminal.modes.get(.bracketed_paste))
+            "the program has bracketed paste off"
+        else
+            "";
+        if (why.len > 0) return .prompt;
+    }
     if (req.unattended) {
         s.lockTerminal();
         const attended = s.writer != null;
@@ -215,6 +257,24 @@ fn refused(s: *Session, req: protocol.Require) ?Guard {
     return null;
 }
 
+/// As ptyio.markInput, but only once the first step `p` encodes, under
+/// the same lock: a batch that cannot send its first step is no input.
+/// Returns the step's bytes, null for a sleep; caller owns them.
+fn markInputWith(s: *Session, gpa: std.mem.Allocator, p: Plan, bad_key: *[]const u8) !?[]u8 {
+    if (s.child_exited.load(.acquire)) return error.SessionExited;
+    ptyio.settleOutput(s);
+    sample.refresh(s, false);
+    s.lockTerminal();
+    const bytes: ?[]u8 = if (p == .sleep_ms) null else encode(gpa, &s.terminal, s.cols, s.rows, p, bad_key) catch |err| {
+        s.unlockTerminal();
+        return err;
+    };
+    const settled = s.track.takeInput(&s.terminal, io_mod.nowNanos());
+    s.unlockTerminal();
+    if (settled) s.track.notify();
+    return bytes;
+}
+
 /// Whether every mouse step lies inside the grid as it is now.
 fn fitsGrid(s: *Session, plans: []const Plan) bool {
     s.lockTerminal();
@@ -223,26 +283,33 @@ fn fitsGrid(s: *Session, plans: []const Plan) bool {
     return true;
 }
 
-/// Run one step; `budget_end` is when writing must be done, not counting
-/// the sleeps, which `slept` adds up.
-fn runStep(s: *Session, gpa: std.mem.Allocator, p: Plan, budget_end: i64, slept: *i64, bad_key: *[]const u8) !void {
+/// Run one step, with its bytes when they are `encoded` already (it owns
+/// them); `budget_end` is when writing must be done, not counting the
+/// sleeps, which `slept` adds up.
+fn runStep(s: *Session, gpa: std.mem.Allocator, p: Plan, encoded: ?[]u8, budget_end: i64, slept: *i64, bad_key: *[]const u8) !void {
+    var owned = encoded;
+    defer if (owned) |bytes| gpa.free(bytes);
     if (s.child_exited.load(.acquire)) return error.SessionExited;
     if (p == .sleep_ms) {
         const before = io_mod.nowNanos();
         defer slept.* += io_mod.nowNanos() - before;
         return sleepFlushing(s, p.sleep_ms, budget_end + slept.* + @as(i64, @intCast(p.sleep_ms)) * std.time.ns_per_ms);
     }
-    const bytes = blk: {
+    const bytes = owned orelse blk: {
         s.lockTerminal();
         defer s.unlockTerminal();
         break :blk try encode(gpa, &s.terminal, s.cols, s.rows, p, bad_key);
     };
-    defer gpa.free(bytes);
+    owned = bytes;
     // The program has mouse or focus reporting off.
     if (bytes.len == 0) return;
     var mods_buf: [4]u8 = undefined;
+    const secret = switch (p) {
+        .text, .paste => |t| t.secret,
+        else => false,
+    };
     record.recordInput(s, switch (p) {
-        .text, .paste => |t| if (t.secret) .secret else .{ .send = bytes },
+        .text, .paste => .{ .send = bytes },
         .keys => |tokens| .{ .key = .{ .keys = tokens, .encoded = bytes } },
         .mouse => |m| .{ .mouse = .{
             .button = record.canonicalButtonName(m.event.button),
@@ -253,7 +320,7 @@ fn runStep(s: *Session, gpa: std.mem.Allocator, p: Plan, budget_end: i64, slept:
         } },
         .focus => |focused| .{ .focus = focused },
         .sleep_ms => unreachable,
-    });
+    }, secret);
     ptyio.writeLocked(s, bytes, budget_end + slept.*) catch |err| {
         record.recordMark(s, "input not delivered") catch {};
         return err;

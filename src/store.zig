@@ -15,6 +15,8 @@
 //!                                (output.trace for a trace)
 //!     <boot>/<id>/record-N.cast  a recording started without a path
 //!                                (record-N.trace for a trace)
+//!     <boot>/<id>/start-failed   the input_seq when `tuppet start` did not
+//!                                finish, kept by the CLI
 //!     <boot>/last-detached       the session `tuppet attach -` returns
 //!                                to, kept by the CLI
 //!
@@ -86,6 +88,8 @@ pub const Meta = struct {
     reported_cwd: ?Cwd = null,
     /// `stop` ended the program.
     stopped: bool = false,
+    /// The program's alternate screen showed when it ended.
+    ended_alt: bool = false,
     bell_count: u64 = 0,
     notification_count: u64 = 0,
     notification: ?status.Notification = null,
@@ -106,6 +110,10 @@ pub const Meta = struct {
     /// The latest recording, once it stopped, until a stop request
     /// reports it.
     recording_report: RecordingReport = .{},
+    /// On a box, how it is shown over another session.
+    over: ?status.Over = null,
+    /// What a caller says about it as a member of a group.
+    member: ?status.Member = null,
 };
 
 /// What a stop request has yet to report of a session's latest recording.
@@ -290,6 +298,44 @@ pub fn lastDetached(gpa: std.mem.Allocator) ?u64 {
     var raw: [24]u8 = undefined;
     const got = dir.readFile(io, last_detached_file, &raw) catch return null;
     return parseId(std.mem.trim(u8, got, " \n"));
+}
+
+const start_failed_file = "start-failed";
+
+/// What `markStartFailed` noted: the session's input_seq at the time.
+pub const FailedStart = struct { input_seq: ?u64 };
+
+/// Note that `tuppet start` left session `id` short of its state, with
+/// its input_seq then, so that a later start replaces it unless someone
+/// typed into it since. The note goes with the session's directory.
+pub fn markStartFailed(gpa: std.mem.Allocator, id: u64, input_seq: ?u64) void {
+    const io = io_mod.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const boot_path = clientBootPath(gpa, &path_buf) orelse return;
+    var boot_dir = Dir.cwd().openDir(io, boot_path, .{}) catch return;
+    defer boot_dir.close(io);
+    var name_buf: [24]u8 = undefined;
+    var dir = boot_dir.openDir(io, idName(&name_buf, id), .{}) catch return;
+    defer dir.close(io);
+    var buf: [24]u8 = undefined;
+    const text = if (input_seq) |s| std.fmt.bufPrint(&buf, "{d}\n", .{s}) catch unreachable else "-\n";
+    writeAtomic(dir, start_failed_file, text) catch {};
+}
+
+/// The note `markStartFailed` left for session `id`, if any.
+pub fn startFailed(gpa: std.mem.Allocator, id: u64) ?FailedStart {
+    const io = io_mod.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const boot_path = clientBootPath(gpa, &path_buf) orelse return null;
+    var boot_dir = Dir.cwd().openDir(io, boot_path, .{}) catch return null;
+    defer boot_dir.close(io);
+    var name_buf: [24]u8 = undefined;
+    var dir = boot_dir.openDir(io, idName(&name_buf, id), .{}) catch return null;
+    defer dir.close(io);
+    var raw: [24]u8 = undefined;
+    const got = std.mem.trim(u8, dir.readFile(io, start_failed_file, &raw) catch return null, " \n");
+    if (std.mem.eql(u8, got, "-")) return .{ .input_seq = null };
+    return .{ .input_seq = std.fmt.parseInt(u64, got, 10) catch return null };
 }
 
 /// The store's directory: set HOME (or XDG_STATE_HOME) for it.
@@ -629,6 +675,36 @@ pub fn setAlerts(gpa: std.mem.Allocator, id: u64, rules: []const alert.Rule) !vo
     try writeMetaIn(gpa, dir, meta);
 }
 
+/// Record what became of a box.
+pub fn setOver(gpa: std.mem.Allocator, id: u64, over: status.Over) !void {
+    const io = io_mod.io();
+    meta_mutex.lockUncancelable(io);
+    defer meta_mutex.unlock(io);
+    var name_buf: [24]u8 = undefined;
+    var dir = try bootDir().openDir(io, idName(&name_buf, id), .{});
+    defer dir.close(io);
+    const parsed = (try readMeta(gpa, id)) orelse return error.FileNotFound;
+    defer parsed.deinit();
+    var meta = parsed.value;
+    meta.over = over;
+    try writeMetaIn(gpa, dir, meta);
+}
+
+/// Record what a caller says about session `id` as a member of a group.
+pub fn setMember(gpa: std.mem.Allocator, id: u64, member: status.Member) !void {
+    const io = io_mod.io();
+    meta_mutex.lockUncancelable(io);
+    defer meta_mutex.unlock(io);
+    var name_buf: [24]u8 = undefined;
+    var dir = try bootDir().openDir(io, idName(&name_buf, id), .{});
+    defer dir.close(io);
+    const parsed = (try readMeta(gpa, id)) orelse return error.FileNotFound;
+    defer parsed.deinit();
+    var meta = parsed.value;
+    meta.member = member;
+    try writeMetaIn(gpa, dir, meta);
+}
+
 /// Record what a stop request reported of an ended session's recording.
 pub fn setRecordingReport(gpa: std.mem.Allocator, id: u64, report: RecordingReport) !void {
     const io = io_mod.io();
@@ -661,6 +737,7 @@ pub const Ending = struct {
     title: ?[]const u8 = null,
     reported_cwd: ?Cwd = null,
     stopped: bool = false,
+    ended_alt: bool = false,
     bell_count: u64 = 0,
     notification_count: u64 = 0,
     notification: ?status.Notification = null,
@@ -705,6 +782,7 @@ pub fn finish(gpa: std.mem.Allocator, id: u64, ending: Ending, screen: []const u
     meta.title = ending.title;
     meta.reported_cwd = ending.reported_cwd;
     meta.stopped = ending.stopped;
+    meta.ended_alt = ending.ended_alt;
     meta.bell_count = ending.bell_count;
     meta.notification_count = ending.notification_count;
     meta.notification = ending.notification;
@@ -927,12 +1005,7 @@ fn housekeepAt(gpa: std.mem.Allocator, keep_ms: ?i64, now: i64) ![]u64 {
             meta.ended_ms = metaWritten(id) orelse continue;
         };
         if (meta.ended_ms == null) {
-            meta.ended_ms = now;
-            meta.lost = true;
-            var name_buf: [24]u8 = undefined;
-            var dir = bootDir().openDir(io_mod.io(), idName(&name_buf, id), .{}) catch continue;
-            defer dir.close(io_mod.io());
-            writeMetaIn(gpa, dir, meta) catch {};
+            markLost(gpa, id, now);
             continue;
         }
         const keep = keep_ms orelse continue;
@@ -942,6 +1015,23 @@ fn housekeepAt(gpa: std.mem.Allocator, keep_ms: ?i64, now: i64) ![]u64 {
         }
     }
     return deleted.toOwnedSlice(gpa);
+}
+
+/// Record that session `id`, which never ended, was found lost at `now`.
+fn markLost(gpa: std.mem.Allocator, id: u64, now: i64) void {
+    const io = io_mod.io();
+    meta_mutex.lockUncancelable(io);
+    defer meta_mutex.unlock(io);
+    var name_buf: [24]u8 = undefined;
+    var dir = bootDir().openDir(io, idName(&name_buf, id), .{}) catch return;
+    defer dir.close(io);
+    const parsed = (readMeta(gpa, id) catch null) orelse return;
+    defer parsed.deinit();
+    var meta = parsed.value;
+    if (meta.ended_ms != null) return;
+    meta.ended_ms = now;
+    meta.lost = true;
+    writeMetaIn(gpa, dir, meta) catch {};
 }
 
 /// When session `id`'s session.json was last written, in Unix
@@ -1102,11 +1192,17 @@ fn writeMetaIn(gpa: std.mem.Allocator, dir: Dir, meta: Meta) !void {
     try writeAtomic(dir, meta_file, text);
 }
 
+var tmp_count: std.atomic.Value(u64) = .init(0);
+
 /// Replace a file so that readers see either the old or the new content.
+/// Each write has a temporary file of its own: other threads and
+/// processes may replace the same file at once.
 fn writeAtomic(dir: Dir, name: []const u8, bytes: []const u8) !void {
     const io = io_mod.io();
-    var tmp_buf: [64]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{name}) catch return error.NameTooLong;
+    const pid: u64 = if (builtin.os.tag == .windows) win32.GetCurrentProcessId() else @intCast(std.c.getpid());
+    var tmp_buf: [96]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.{d}-{d}.tmp", .{ name, pid, tmp_count.fetchAdd(1, .monotonic) }) catch return error.NameTooLong;
+    errdefer dir.deleteFile(io, tmp) catch {};
     {
         const file = try dir.createFile(io, tmp, .{ .permissions = filePermissions() });
         defer file.close(io);

@@ -22,7 +22,7 @@ platform and by font variant (lean, medium, full); the license texts follow. mac
 | [musl libc](https://musl.libc.org/) | C library | Linux | MIT |
 | [mingw-w64](https://www.mingw-w64.org/) runtime | C runtime | Windows | ZPL 2.1 |
 
-Ghostty, simdutf, and Highway come from Ghostty 1.4.0, revision `83fb95624b0439ee660c2679b43b38c8b63769cd`; Wuffs is
+Ghostty, simdutf, and Highway come from Ghostty 1.4.1-dev, revision `7fa26e8b675f3248975479d88274c937d7e63905`; Wuffs is
 the `0.4.0-alpha.10` release, FreeType 2.13.2 and zlib 1.3.1 are the versions that revision pins.
 
 ## Zig

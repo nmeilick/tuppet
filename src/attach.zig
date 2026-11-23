@@ -16,6 +16,8 @@ const session_mod = @import("session.zig");
 const status = @import("status.zig");
 const batch_mod = @import("batch.zig");
 const limits = @import("limits.zig");
+const track = @import("track.zig");
+const vt = @import("vt");
 
 const Session = session_mod.Session;
 
@@ -48,6 +50,14 @@ pub const Viewer = struct {
     can_write: std.atomic.Value(bool),
     /// A preview: it watches without counting among the viewers.
     passive: bool = false,
+    /// Gets a fresh screen after every resize, and screens that carry
+    /// what a client's own copy of the screen needs; see
+    /// Session.redrawLocked.
+    redraw_on_resize: bool = false,
+    /// History rows to send before the first screen, and the lowest row
+    /// number among them; see historyFrames.
+    history: u32 = 0,
+    history_from: ?u64 = null,
     /// What the client calls itself, cleaned; owned by `gpa`.
     label: ?[]u8 = null,
     mutex: std.Io.Mutex = .init,
@@ -64,6 +74,10 @@ pub const Viewer = struct {
     /// The bytes of its frames queued or being sent, counted in
     /// `queued_total`; `mutex` guards it.
     held: usize = 0,
+    /// The bytes of `held` that `pushInitial` queued and the sender has
+    /// not sent yet: a client is not behind for them, however much
+    /// history they carry.
+    initial: usize = 0,
 
     /// Queue one frame. Never blocks on the client.
     pub fn push(v: *Viewer, line: []const u8) void {
@@ -81,18 +95,19 @@ pub const Viewer = struct {
         v.mutex.lockUncancelable(io);
         defer v.mutex.unlock(io);
         if (v.closing) return;
-        if (limited and tooFarBehind(v.held, line.len, queued_total.load(.acquire), viewer_count.load(.acquire))) {
+        if (limited and tooFarBehind(v.held - v.initial, line.len, queued_total.load(.acquire), viewer_count.load(.acquire))) {
             v.forget(v.queue.items.len);
             v.queue.clearRetainingCapacity();
+            v.initial = 0;
             v.queueLocked(too_slow_line) catch {};
             v.closing = true;
             v.ending.store(true, .release);
             v.overflowed.store(true, .release);
-        } else {
-            v.queueLocked(line) catch {
-                v.closing = true;
-                v.ending.store(true, .release);
-            };
+        } else if (v.queueLocked(line)) {
+            if (!limited) v.initial += line.len;
+        } else |_| {
+            v.closing = true;
+            v.ending.store(true, .release);
         }
         v.cond.signal(io);
     }
@@ -147,6 +162,21 @@ test "a viewer falls too far behind past its limit, or past its share of a full 
     try std.testing.expect(!tooFarBehind(2 << 20, 1, max_queued_total - 1, 64));
 }
 
+test "a viewer is not behind for its first frames, however large" {
+    const gpa = std.testing.allocator;
+    var v: Viewer = .{ .gpa = gpa, .fd = -1, .can_write = .init(false) };
+    defer {
+        _ = queued_total.fetchSub(v.held, .acq_rel);
+        v.queue.deinit(gpa);
+    }
+    const history = try gpa.alloc(u8, max_queue + 1);
+    defer gpa.free(history);
+    @memset(history, 'h');
+    v.pushInitial(history);
+    v.push("out");
+    try std.testing.expect(!v.closing);
+}
+
 /// Wait until every attach stream has closed, or until `deadline`
 /// (monotonic nanoseconds).
 pub fn waitClosed(deadline: i64) void {
@@ -157,20 +187,171 @@ pub fn waitClosed(deadline: i64) void {
 
 /// Frames built by the session, encoded once and queued to every viewer.
 pub fn outFrame(gpa: std.mem.Allocator, data: []const u8) ![]u8 {
-    return base64Frame(gpa, "out", data);
+    return base64Frame(gpa, "out", data, "");
 }
 
-pub fn screenFrame(gpa: std.mem.Allocator, vt_bytes: []const u8) ![]u8 {
-    return base64Frame(gpa, "screen", vt_bytes);
+/// {"screen":"<base64>","row":T,"wrapped":[Y,...],"continued":true}: T
+/// is the number of the primary screen's top row when the screen was
+/// taken; the screen rows Y (from 0) wrap into the next, and with
+/// `continued` the top row continues the row above it; each is left out
+/// when there is nothing to say.
+pub fn screenFrame(gpa: std.mem.Allocator, vt_bytes: []const u8, row: u64, wrapped: []const u16, continued: bool) ![]u8 {
+    var extra: std.Io.Writer.Allocating = .init(gpa);
+    defer extra.deinit();
+    try extra.writer.print(",\"row\":{d}", .{row});
+    if (wrapped.len > 0) {
+        try extra.writer.writeAll(",\"wrapped\":[");
+        for (wrapped, 0..) |y, i| try extra.writer.print("{s}{d}", .{ if (i > 0) "," else "", y });
+        try extra.writer.writeAll("]");
+    }
+    if (continued) try extra.writer.writeAll(",\"continued\":true");
+    return base64Frame(gpa, "screen", vt_bytes, extra.written());
 }
 
-fn base64Frame(gpa: std.mem.Allocator, key: []const u8, data: []const u8) ![]u8 {
+/// The longest line of a history frame.
+pub const max_history_line = 256 << 10;
+/// The most VT bytes one history frame holds: their base64 and the
+/// frame's other fields fit the line.
+pub const max_history_bytes = (max_history_line - 64) / 4 * 3;
+
+/// {"history":"<base64>","row":X,"rows":N}: N history rows from row X;
+/// without `row` for rows that have no number.
+pub fn historyFrame(gpa: std.mem.Allocator, vt_bytes: []const u8, row: ?u64, rows: usize) ![]u8 {
+    var buf: [64]u8 = undefined;
+    const fields = if (row) |r|
+        std.fmt.bufPrint(&buf, ",\"row\":{d},\"rows\":{d}", .{ r, rows }) catch unreachable
+    else
+        std.fmt.bufPrint(&buf, ",\"rows\":{d}", .{rows}) catch unreachable;
+    return base64Frame(gpa, "history", vt_bytes, fields);
+}
+
+/// At most this many VT bytes of history go with one attach; past it the
+/// oldest of the rows asked for are left out.
+pub const max_history_total = 16 << 20;
+
+/// The `history` frames for an attach: the newest `count` rows of the
+/// primary screen's history, of those only rows numbered `from` or
+/// higher, oldest first; empty when there are none. terminal_mutex must
+/// be held, and output settled.
+pub fn historyFrames(gpa: std.mem.Allocator, t: *const vt.Terminal, tracker: *const track.Tracker, count: u32, from: ?u64) ![]u8 {
+    const top = tracker.historyTop(t) orelse return &.{};
+    const screen = t.screens.get(.primary).?;
+    const kept = screen.pages.total_rows - screen.pages.rows;
+    // A resize keeps the top row's number, so rows it moved into history
+    // can be numbered below 0: they have no number.
+    var first: i64 = @as(i64, @intCast(top)) - @as(i64, @intCast(@min(@as(u64, kept), count)));
+    // A row numbered below numbered_from may have the number of a row
+    // that the client has had.
+    if (from) |f| {
+        if (f >= top) return &.{};
+        first = @max(first, @as(i64, @intCast(f)), tracker.numbered_from, 0);
+    }
+    if (first >= top) return &.{};
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Newest first, so the limit leaves out the oldest rows.
+    var bytes: std.ArrayList(u8) = .empty;
+    var bounds: std.ArrayList([2]usize) = .empty;
+    const newest = screen.pages.getTopLeft(.active).up(1) orelse return &.{};
+    var it = newest.rowIterator(.left_up, null);
+    while (bounds.items.len < @as(i64, @intCast(top)) - first) {
+        const pin = it.next() orelse break;
+        const start = bytes.items.len;
+        try appendHistoryRow(a, &bytes, screen, pin);
+        if (bytes.items.len > max_history_total) break;
+        try bounds.append(a, .{ start, bytes.items.len });
+    }
+
+    var frames: std.ArrayList(u8) = .empty;
+    errdefer frames.deinit(gpa);
+    var frame_bytes: std.ArrayList(u8) = .empty;
+    var row: i64 = @as(i64, @intCast(top)) - @as(i64, @intCast(bounds.items.len));
+    var i = bounds.items.len;
+    while (i > 0) {
+        frame_bytes.clearRetainingCapacity();
+        var rows: usize = 0;
+        while (i > 0) : (i -= 1) {
+            const b = bounds.items[i - 1];
+            if (rows > 0 and frame_bytes.items.len + (b[1] - b[0]) > max_history_bytes) break;
+            // Rows without a number and numbered ones go in frames apart.
+            if (rows > 0 and row < 0 and row + @as(i64, @intCast(rows)) == 0) break;
+            try frame_bytes.appendSlice(a, bytes.items[b[0]..b[1]]);
+            rows += 1;
+        }
+        const frame = try historyFrame(a, frame_bytes.items, if (row < 0) null else @intCast(row), rows);
+        try frames.appendSlice(gpa, frame);
+        row += @intCast(rows);
+    }
+    return frames.toOwnedSlice(gpa);
+}
+
+/// One history row as VT bytes: its cells with their styles and links,
+/// then CR LF. A row that wraps into the next gets nothing after it, so a
+/// terminal of the session's width wraps it there itself.
+fn appendHistoryRow(a: std.mem.Allocator, bytes: *std.ArrayList(u8), screen: *const vt.Screen, pin: vt.Pin) !void {
+    const start = bytes.items.len;
+    const pad = if (pin.rowAndCell().row.wrap) wrapPadding(pin.cells(.all)) else null;
+    try formatRow(a, bytes, screen, pin, .vt, pad == null);
+    if (bytes.items.len - start + (pad orelse 2) <= max_history_bytes) {
+        if (pad) |n| return bytes.appendNTimes(a, ' ', n);
+        return bytes.appendSlice(a, "\r\n");
+    }
+    // Too long for a frame with its styles and links: the text alone.
+    bytes.shrinkRetainingCapacity(start);
+    try formatRow(a, bytes, screen, pin, .plain, true);
+    var end = bytes.items.len;
+    if (end - start > max_history_bytes - 2) {
+        end = start + max_history_bytes - 2;
+        while (end > start and bytes.items[end] & 0xc0 == 0x80) end -= 1;
+    }
+    bytes.shrinkRetainingCapacity(end);
+    try bytes.appendSlice(a, "\r\n");
+}
+
+fn formatRow(a: std.mem.Allocator, bytes: *std.ArrayList(u8), screen: *const vt.Screen, pin: vt.Pin, emit: vt.formatter.Format, trim: bool) !void {
+    var w: std.Io.Writer.Allocating = .fromArrayList(a, bytes);
+    var formatter = vt.formatter.ScreenFormatter.init(screen, .{ .emit = emit, .trim = trim });
+    var left = pin;
+    left.x = 0;
+    var right = pin;
+    right.x = @intCast(pin.cells(.all).len - 1);
+    formatter.content = .{ .selection = vt.Selection.init(left, right, false) };
+    try formatter.format(&w.writer);
+    bytes.* = w.toArrayList();
+}
+
+/// How many spaces make a wrapped row's VT bytes end in its last column,
+/// so that the next row wraps: the formatter leaves out the empty cells
+/// at its end. Null when they cannot end there: after cells with only a
+/// background, which the formatter steps over to the last column.
+fn wrapPadding(cells: []const vt.Cell) ?usize {
+    var end = cells.len;
+    // A wide character that did not fit left a spacer; a terminal moves
+    // it to the next row itself.
+    const spacer = end > 0 and cells[end - 1].wide == .spacer_head;
+    if (spacer) end -= 1;
+    var n: usize = 0;
+    while (end > 0 and cells[end - 1].isEmpty() and !cells[end - 1].hasStyling()) : (end -= 1) n += 1;
+    if (n == 0 and !spacer and end > 0) switch (cells[end - 1].content_tag) {
+        .bg_color_palette, .bg_color_rgb => return null,
+        .codepoint, .codepoint_grapheme => {},
+    };
+    return n;
+}
+
+/// {"key":"<base64 of data>"<fields>}, a line.
+fn base64Frame(gpa: std.mem.Allocator, key: []const u8, data: []const u8, fields: []const u8) ![]u8 {
     const enc = std.base64.standard.Encoder;
     const prefix_len = key.len + 5; // {"key":"
-    const out = try gpa.alloc(u8, prefix_len + enc.calcSize(data.len) + 3);
+    const end = prefix_len + enc.calcSize(data.len);
+    const out = try gpa.alloc(u8, end + 1 + fields.len + 2);
     _ = std.fmt.bufPrint(out, "{{\"{s}\":\"", .{key}) catch unreachable;
-    _ = enc.encode(out[prefix_len..][0..enc.calcSize(data.len)], data);
-    @memcpy(out[out.len - 3 ..], "\"}\n");
+    _ = enc.encode(out[prefix_len..end], data);
+    out[end] = '"';
+    @memcpy(out[end + 1 ..][0..fields.len], fields);
+    @memcpy(out[out.len - 2 ..], "}\n");
     return out;
 }
 
@@ -219,6 +400,25 @@ pub fn errorFrame(gpa: std.mem.Allocator, code: protocol.Code, err: []const u8) 
     return std.mem.concat(gpa, u8, &.{ line, "\n" });
 }
 
+test "a viewer whose queue overflowed gives up its batch at once" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var v: Viewer = .{ .gpa = std.testing.allocator, .fd = fds[0], .can_write = .init(false) };
+    v.ending.store(true, .release);
+    v.overflowed.store(true, .release);
+    // More than the socket takes while nobody reads.
+    const bytes = try std.testing.allocator.alloc(u8, 16 << 20);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    const started = io_mod.nowNanos();
+    try std.testing.expect(!sendAll(&v, bytes, false));
+    try std.testing.expect(io_mod.nowNanos() - started < final_line_wait_ns);
+}
+
 test "exit frames name signals" {
     var buf: [80]u8 = undefined;
     try std.testing.expectEqualStrings("{\"exit\":{\"code\":null,\"signal\":\"SIGKILL\"}}\n", exitFrame(&buf, -9));
@@ -241,7 +441,15 @@ pub fn serve(gpa: std.mem.Allocator, conn: *ipc.Conn, s: *Session, req: protocol
     _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, @ptrCast(&no_timeout), @sizeOf(std.posix.timeval));
 
     const write = req.mode == .write;
-    var viewer: Viewer = .{ .gpa = std.heap.page_allocator, .fd = fd, .can_write = .init(write), .passive = req.mode == .preview };
+    var viewer: Viewer = .{
+        .gpa = std.heap.page_allocator,
+        .fd = fd,
+        .can_write = .init(write),
+        .passive = req.mode == .preview,
+        .redraw_on_resize = req.redraw_on_resize orelse false,
+        .history = req.history orelse 0,
+        .history_from = req.history_from,
+    };
     defer viewer.queue.deinit(viewer.gpa);
     // What the sender left unsent.
     defer _ = queued_total.fetchSub(viewer.held, .acq_rel);
@@ -370,12 +578,16 @@ fn handleFrame(gpa: std.mem.Allocator, s: *Session, viewer: *Viewer, line: []con
             pushError(a, viewer, .bad_request, std.fmt.allocPrint(a, "invalid size {d}x{d} ({s})", .{ r.cols, r.rows, why }) catch "invalid size");
         } else {
             if (s.resizeSeq(r.cols, r.rows, .writer, false)) |seq| {
-                // The client's terminal reflowed its copy of the screen in
-                // its own way: a fresh screen makes the two agree again.
-                if (seq != null) s.redrawTo(viewer) else {
+                if (seq != null) {
+                    // The client's terminal reflowed its copy of the screen
+                    // in its own way: a fresh screen makes the two agree
+                    // again. One that asked for it got it with the resize.
+                    if (!viewer.redraw_on_resize) s.redrawTo(viewer);
+                } else {
                     // Every viewer saw the frame of a resize that took place.
                     var buf: [96]u8 = undefined;
                     viewer.push(resizeFrame(&buf, r.cols, r.rows, null));
+                    if (viewer.redraw_on_resize) s.redrawTo(viewer);
                 }
             } else |err| pushSessionError(a, viewer, err);
         }
@@ -398,6 +610,11 @@ fn sendHeld(a: std.mem.Allocator, s: *Session, viewer: *Viewer, bytes: []const u
                     viewer.push(hold_line);
                 }
                 if (!batch_mod.awaitIdle(s, cutoff.?)) return false;
+                // Another client may have taken over the writing meanwhile.
+                if (!viewer.can_write.load(.acquire)) {
+                    pushError(a, viewer, .bad_request, "a read-only attach cannot send input or resize");
+                    break;
+                }
                 continue;
             },
             else => pushSessionError(a, viewer, err),
@@ -435,14 +652,16 @@ fn sendLoop(viewer: *Viewer) void {
     defer batch.deinit(viewer.gpa);
     while (true) {
         var done = false;
+        // Whether `batch` is what an overflow left: its last line.
+        var overflow_before = false;
         {
             viewer.mutex.lockUncancelable(io);
             defer viewer.mutex.unlock(io);
             while (viewer.queue.items.len == 0 and !viewer.closing) viewer.cond.waitUncancelable(io, &viewer.mutex);
             std.mem.swap(std.ArrayListUnmanaged(u8), &batch, &viewer.queue);
             done = viewer.closing;
+            overflow_before = viewer.overflowed.load(.acquire);
         }
-        const overflow_before = viewer.overflowed.load(.acquire);
         if (!sendAll(viewer, batch.items, overflow_before)) {
             if (viewer.overflowed.load(.acquire) and !overflow_before) {
                 // The abandoned batch may end mid-frame: finish that line
@@ -453,6 +672,8 @@ fn sendLoop(viewer: *Viewer) void {
         }
         viewer.mutex.lockUncancelable(io);
         viewer.forget(batch.items.len);
+        // The initial frames were queued first, so they are sent first.
+        viewer.initial -|= batch.items.len;
         const empty = viewer.queue.items.len == 0;
         viewer.mutex.unlock(io);
         batch.clearRetainingCapacity();
@@ -479,10 +700,11 @@ fn sendAll(viewer: *Viewer, bytes: []const u8, final: bool) bool {
         switch (std.posix.errno(n)) {
             .INTR => {},
             .AGAIN => {
+                // An overflow ends the stream too, but its batch is
+                // given up at once.
+                if (!final and viewer.overflowed.load(.acquire)) return false;
                 if (final or viewer.ending.load(.acquire)) {
                     if (io_mod.nowNanos() - last_progress >= final_line_wait_ns) return false;
-                } else if (viewer.overflowed.load(.acquire)) {
-                    return false;
                 }
                 var pfd = [1]std.c.pollfd{.{ .fd = viewer.fd, .events = std.c.POLL.OUT, .revents = 0 }};
                 _ = std.c.poll(&pfd, 1, 100);
@@ -491,4 +713,170 @@ fn sendAll(viewer: *Viewer, bytes: []const u8, final: bool) bool {
         }
     }
     return true;
+}
+
+const HistoryFixture = struct {
+    term: vt.Terminal,
+    stream: vt.TerminalStream,
+    seqs: track.Counter = .{},
+    tracker: track.Tracker,
+
+    fn create(cols: u16, rows: u16, scrollback: usize) !*HistoryFixture {
+        const gpa = std.testing.allocator;
+        const f = try gpa.create(HistoryFixture);
+        errdefer gpa.destroy(f);
+        f.* = .{ .term = undefined, .stream = undefined, .tracker = undefined };
+        f.term = try vt.Terminal.init((vt.TinyIo.init).io(), gpa, .{ .cols = cols, .rows = rows, .max_scrollback_bytes = scrollback });
+        errdefer f.term.deinit(gpa);
+        var handler = f.term.vtHandler();
+        handler.effects = .readonly;
+        f.stream = vt.TerminalStream.init(.{ .handler = handler, .allocator = gpa });
+        const start = f.seqs.next();
+        f.tracker = try .init(gpa, &f.seqs, &f.term, start, start, 0);
+        return f;
+    }
+
+    fn destroy(f: *HistoryFixture) void {
+        const gpa = std.testing.allocator;
+        f.tracker.deinit(&f.term);
+        f.stream.deinit();
+        f.term.deinit(gpa);
+        gpa.destroy(f);
+    }
+
+    fn feed(f: *HistoryFixture, bytes: []const u8) void {
+        f.stream.nextSlice(bytes);
+        f.tracker.noteParsed(bytes.len, 0);
+        f.tracker.settle(&f.term, 0);
+    }
+
+    /// A frame's first row when its rows have no number.
+    const no_row = std.math.maxInt(u64);
+
+    /// The history frames' bytes, and each frame's first row and rows.
+    fn history(f: *HistoryFixture, a: std.mem.Allocator, count: u32, from: ?u64) !struct { bytes: []u8, frames: [][2]u64 } {
+        const lines = try historyFrames(a, &f.term, &f.tracker, count, from);
+        var bytes: std.ArrayList(u8) = .empty;
+        var frames: std.ArrayList([2]u64) = .empty;
+        var it = std.mem.splitScalar(u8, lines, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            try std.testing.expect(line.len < max_history_line);
+            const frame = try std.json.parseFromSliceLeaky(struct { history: []const u8, row: ?u64 = null, rows: u64 }, a, line, .{});
+            const dec = std.base64.standard.Decoder;
+            const raw = try a.alloc(u8, try dec.calcSizeForSlice(frame.history));
+            try dec.decode(raw, frame.history);
+            try bytes.appendSlice(a, raw);
+            try frames.append(a, .{ frame.row orelse no_row, frame.rows });
+        }
+        return .{ .bytes = bytes.items, .frames = frames.items };
+    }
+};
+
+test "history frames give the rows in order, wrapped where the session wrapped them, split between rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try HistoryFixture.create(10, 3, 1 << 20);
+    defer f.destroy();
+    // A wide character that does not fit wraps with an empty cell left.
+    f.feed("\x1b[31mred\x1b[0m\r\n0123456789abcde\r\n123456789\xe7\x95\x8c\r\nx\r\ny\r\nz");
+    const got = try f.history(a, 10, null);
+    try std.testing.expectEqualStrings("\x1b[0m\x1b[38;5;1mred\x1b[0m\r\n0123456789abcde\r\n123456789\xe7\x95\x8c\r\n", got.bytes);
+    try std.testing.expectEqualSlices([2]u64, &.{.{ 0, 5 }}, got.frames);
+    // A terminal of the session's width shows them as the session did.
+    var copy = try vt.Terminal.init((vt.TinyIo.init).io(), std.testing.allocator, .{ .cols = 10, .rows = 6 });
+    defer copy.deinit(std.testing.allocator);
+    var handler = copy.vtHandler();
+    handler.effects = .readonly;
+    var stream = vt.TerminalStream.init(.{ .handler = handler, .allocator = std.testing.allocator });
+    defer stream.deinit();
+    stream.nextSlice(got.bytes);
+    var same = vt.formatter.TerminalFormatter.init(&copy, .{ .emit = .plain, .unwrap = true });
+    var text: std.Io.Writer.Allocating = .init(a);
+    try same.format(&text.writer);
+    try std.testing.expectEqualStrings("red\n0123456789abcde\n123456789\xe7\x95\x8c", text.written());
+
+    // More rows than one frame holds.
+    const g = try HistoryFixture.create(100, 2, 64 << 20);
+    defer g.destroy();
+    var flood: std.ArrayList(u8) = .empty;
+    for (0..2500) |i| try flood.print(a, "{d:0>99}\r\n", .{i});
+    g.feed(flood.items);
+    const many = try g.history(a, 3000, null);
+    try std.testing.expectEqual(@as(usize, 2), many.frames.len);
+    try std.testing.expectEqual(@as(u64, 0), many.frames[0][0]);
+    try std.testing.expectEqual(many.frames[0][1], many.frames[1][0]);
+    // The last line and the empty one below it are on the screen.
+    try std.testing.expectEqual(@as(u64, 2499), many.frames[0][1] + many.frames[1][1]);
+}
+
+test "rows a resize moves into history below row 0 come without a number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = try HistoryFixture.create(10, 5, 1 << 20);
+    defer f.destroy();
+    f.feed("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng");
+    try std.testing.expectEqual(@as(i64, 2), f.tracker.top(.primary));
+    // A shorter screen moves three more rows into history and keeps the
+    // top row's number.
+    var reflow = f.tracker.beginReflow(&f.term, 0);
+    defer reflow.deinit(std.testing.allocator);
+    try f.term.resize(std.testing.allocator, .{ .cols = 10, .rows = 2 });
+    _ = f.tracker.endReflow(&f.term, &reflow, 0, true);
+    try std.testing.expectEqual(@as(i64, 2), f.tracker.top(.primary));
+    const all = try f.history(a, 100, null);
+    try std.testing.expectEqualStrings("a\r\nb\r\nc\r\nd\r\ne\r\n", all.bytes);
+    try std.testing.expectEqualSlices([2]u64, &.{ .{ HistoryFixture.no_row, 3 }, .{ 0, 2 } }, all.frames);
+    // A client that had rows from a number on gets none of them.
+    try std.testing.expectEqualSlices([2]u64, &.{.{ 0, 2 }}, (try f.history(a, 100, 0)).frames);
+}
+
+test "history rows keep their numbers after scrolling and after the limit dropped old ones" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Wide rows fill the smallest history quickly.
+    const f = try HistoryFixture.create(400, 5, 1);
+    defer f.destroy();
+    for (0..100) |chunk| {
+        var lines: std.ArrayList(u8) = .empty;
+        for (chunk * 4..chunk * 4 + 4) |i| try lines.print(a, "line {d}\r\n", .{i});
+        f.feed(lines.items);
+    }
+    try std.testing.expect(f.tracker.history_dropped);
+    try std.testing.expectEqual(@as(i64, 0), f.tracker.numbered_from);
+    // Line i is on row i.
+    const top: u64 = @intCast(f.tracker.top(.primary));
+    const last = try f.history(a, 2, null);
+    try std.testing.expectEqualSlices([2]u64, &.{.{ top - 2, 2 }}, last.frames);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "line {d}\r\nline {d}\r\n", .{ top - 2, top - 1 }), last.bytes);
+    // Only the rows from a number on, and of those the last ones asked for.
+    try std.testing.expectEqualSlices([2]u64, &.{.{ top - 3, 3 }}, (try f.history(a, 100, top - 3)).frames);
+    try std.testing.expectEqualSlices([2]u64, &.{.{ top - 1, 1 }}, (try f.history(a, 1, top - 3)).frames);
+    try std.testing.expectEqual(@as(usize, 0), (try f.history(a, 100, top)).frames.len);
+    try std.testing.expectEqual(@as(usize, 0), (try f.history(a, 100, std.math.maxInt(u64))).frames.len);
+
+    // Rows that went by unseen: their numbers may repeat earlier ones, so
+    // a client fetching what it missed gets only rows after them.
+    var flood: std.ArrayList(u8) = .empty;
+    for (400..1000) |i| try flood.print(a, "line {d}\r\n", .{i});
+    f.feed(flood.items);
+    const from: u64 = @intCast(f.tracker.numbered_from);
+    try std.testing.expect(from > top);
+    f.feed("after\r\n");
+    try std.testing.expectEqualSlices([2]u64, &.{.{ from, 1 }}, (try f.history(a, 100, top)).frames);
+
+    // A taller screen pulls rows back out of history: the rows left there
+    // get higher numbers, and those pulled out get new ones when they
+    // scroll back.
+    const before: u64 = @intCast(f.tracker.top(.primary));
+    var reflow = f.tracker.beginReflow(&f.term, 0);
+    defer reflow.deinit(std.testing.allocator);
+    try f.term.resize(std.testing.allocator, .{ .cols = 400, .rows = 8 });
+    _ = f.tracker.endReflow(&f.term, &reflow, 0, true);
+    try std.testing.expectEqual(@as(u64, before), @as(u64, @intCast(f.tracker.top(.primary))));
+    try std.testing.expectEqual(@as(i64, @intCast(before + 3)), f.tracker.numbered_from);
+    try std.testing.expectEqual(@as(usize, 0), (try f.history(a, 100, 0)).frames.len);
 }

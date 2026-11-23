@@ -222,7 +222,15 @@ pub const Hit = struct {
     pub fn dupe(h: Hit, gpa: std.mem.Allocator) !Hit {
         var out = h;
         const list = try gpa.alloc([]const u8, h.alerts.len);
-        for (h.alerts, list) |name, *n| n.* = try gpa.dupe(u8, name);
+        var filled: usize = 0;
+        errdefer {
+            for (list[0..filled]) |name| gpa.free(name);
+            gpa.free(list);
+        }
+        for (h.alerts, list) |name, *n| {
+            n.* = try gpa.dupe(u8, name);
+            filled += 1;
+        }
         out.alerts = list;
         out.line = try gpa.dupe(u8, h.line);
         return out;
@@ -438,12 +446,16 @@ pub const Log = struct {
     }
 
     /// Fill an empty log with the hits a session kept when it ended,
-    /// oldest first, checked with hitsError.
+    /// oldest first, checked with hitsError. On failure the log stays
+    /// empty.
     pub fn restore(log: *Log, hits: []const Hit) !void {
-        for (hits) |h| {
-            log.ring[index(h.n)] = try h.dupe(log.gpa);
-            log.next = h.n + 1;
+        for (hits, 0..) |h, i| {
+            log.ring[index(h.n)] = h.dupe(log.gpa) catch |err| {
+                for (hits[0..i]) |done| free(log.gpa, log.ring[index(done.n)]);
+                return err;
+            };
         }
+        if (hits.len > 0) log.next = hits[hits.len - 1].n + 1;
     }
 
     fn index(n: u64) usize {
@@ -537,6 +549,22 @@ test "the latest hit the rate limit left out goes in once its second is over" {
         if (try log.add(&set, .{ .mask = bit(slot), .seq = 30, .region = .visible, .row = 1 }, "tick", std.time.ns_per_s + 1)) |_| logged += 1;
     }
     try testing.expectEqual(@as(usize, max_rate - 1), logged);
+}
+
+test "a log that runs out of memory refilling stays empty and leaks nothing" {
+    const refill = struct {
+        fn run(gpa: std.mem.Allocator, hits: []const Hit) !void {
+            var log: Log = .{ .gpa = gpa };
+            defer log.deinit();
+            try log.restore(hits);
+        }
+    }.run;
+    // A full log, not from hit 1: one only partly refilled would take the
+    // slots before its first hit for kept.
+    var hits: [max_hits]Hit = undefined;
+    for (&hits, 0..) |*h, i| h.* = .{ .n = i + 2, .alerts = &.{"a"}, .line = "x", .seq = 1, .region = .visible, .row = 1, .suppressed = 0 };
+    try testing.expectEqual(@as(?[]const u8, null), hitsError(&hits));
+    try testing.checkAllAllocationFailures(testing.allocator, refill, .{@as([]const Hit, &hits)});
 }
 
 test "a log refilled from stored hits reads like the one that kept them" {

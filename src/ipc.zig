@@ -137,6 +137,18 @@ pub fn ownedByCurrentUser(fd: std.posix.fd_t) bool {
     return meta.ownedByCurrentUser();
 }
 
+/// Why an open file must not be trusted to hold commands, or null when
+/// it may be: another user owns it, others may write it, or it is no
+/// regular file.
+pub fn untrusted(fd: std.posix.fd_t) ?[]const u8 {
+    if (builtin.os.tag == .windows) return null;
+    const meta = statMeta(fd, "") catch return "it cannot be checked";
+    if (!meta.isType(Meta.ifreg)) return "it is not a regular file";
+    if (!meta.ownedByCurrentUser()) return "another user owns it";
+    if (meta.mode & 0o022 != 0) return "group or others may write to it";
+    return null;
+}
+
 /// Whether an open descriptor refers to a regular file.
 pub fn isRegularFile(fd: std.posix.fd_t) bool {
     const meta = statMeta(fd, "") catch return false;
@@ -175,8 +187,8 @@ fn expired(started: i64, timeout_ns: i64) bool {
 
 /// The daemon endpoint. POSIX: `$XDG_RUNTIME_DIR/tuppet-<uid>.sock`, or
 /// `/tmp/tuppet-<uid>/tuppet.sock` (in a private 0700 directory) when
-/// XDG_RUNTIME_DIR is unset or empty. A runtime directory too long for a
-/// socket address is an error, never a silent fallback. Windows:
+/// XDG_RUNTIME_DIR is unset, empty, or relative. A runtime directory too
+/// long for a socket address is an error, never a silent fallback. Windows:
 /// `\\.\pipe\tuppet-<user SID>`.
 pub fn socketPath(buf: *[max_path_len:0]u8) error{ SocketPathTooLong, UnsafeRuntimeDir, UnknownUser }![:0]const u8 {
     switch (builtin.os.tag) {
@@ -197,7 +209,9 @@ pub fn socketPath(buf: *[max_path_len:0]u8) error{ SocketPathTooLong, UnsafeRunt
             const max_socket_path = @sizeOf(@TypeOf(addr.sun_path)) - 1;
             if (c.getenv("XDG_RUNTIME_DIR")) |rt| {
                 const dir = std.mem.span(@as([*:0]const u8, @ptrCast(rt)));
-                if (dir.len > 0) {
+                // A relative one is invalid, as the XDG spec says, and
+                // would name another place after a chdir.
+                if (dir.len > 0 and dir[0] == '/') {
                     const p = std.mem.printSentinel(buf, "{s}/tuppet-{d}.sock", .{ dir, uid }, 0) catch return error.SocketPathTooLong;
                     if (p.len > max_socket_path) return error.SocketPathTooLong;
                     return p;
@@ -216,10 +230,15 @@ pub fn socketPath(buf: *[max_path_len:0]u8) error{ SocketPathTooLong, UnsafeRunt
 /// plant or replace the socket in the shared /tmp.
 fn ensurePrivateDir(dir: [:0]const u8) error{UnsafeRuntimeDir}!void {
     if (std.c.mkdir(dir.ptr, 0o700) != 0 and std.posix.errno(-1) != .EXIST) return error.UnsafeRuntimeDir;
-    const meta = pathMeta(dir) catch return error.UnsafeRuntimeDir;
+    // Checked and tightened through one descriptor, so the directory
+    // checked is the one that gets the mode.
+    const fd = std.c.open(dir.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true });
+    if (fd < 0) return error.UnsafeRuntimeDir;
+    defer _ = std.c.close(fd);
+    const meta = statMeta(fd, "") catch return error.UnsafeRuntimeDir;
     if (!meta.isType(Meta.ifdir) or !meta.ownedByCurrentUser()) return error.UnsafeRuntimeDir;
     // Owned by this user, so tightening the mode is safe.
-    if (std.c.chmod(dir.ptr, 0o700) != 0) return error.UnsafeRuntimeDir;
+    if (std.c.fchmod(fd, 0o700) != 0) return error.UnsafeRuntimeDir;
 }
 
 /// The daemon log next to a POSIX socket path: `.sock` becomes `.log`.
@@ -353,11 +372,13 @@ pub const Conn = union(enum) {
                     if (n < 0) switch (std.posix.errno(n)) {
                         .INTR => continue,
                         .PIPE, .CONNRESET => return error.ConnectionResetByPeer,
+                        // SO_SNDTIMEO ran out.
+                        .AGAIN => return error.WriteTimeout,
                         else => return error.WriteFailed,
                     };
                     if (n == 0) return error.WriteFailed;
                     i += @intCast(n);
-                    if (requestExpired(started)) return error.WriteTimeout;
+                    if (i < bytes.len and requestExpired(started)) return error.WriteTimeout;
                 },
             }
         }
@@ -419,7 +440,6 @@ pub const Conn = union(enum) {
                 errdefer gpa.free(rest);
                 return .{ .line = try line.toOwnedSlice(gpa), .rest = rest };
             }
-            if (line.items.len == max_len) return error.LineTooLong;
         }
     }
 
@@ -529,6 +549,14 @@ pub const Server = union(enum) {
                 _ = c.close(self.posix.lock_fd);
             },
         }
+    }
+
+    /// Before the process exits, while another thread may still be in
+    /// `accept`: no new client reaches this server, and nothing `accept`
+    /// uses is closed or freed (exiting does that). A Windows pipe name
+    /// goes with the process.
+    pub fn withdraw(self: *Server) void {
+        if (builtin.os.tag != .windows) _ = c.unlink(&self.posix.path);
     }
 };
 
@@ -705,6 +733,38 @@ pub fn accept(server: *Server, io: std.Io) !Conn {
             return .{ .posix = stream };
         },
     }
+}
+
+test "a line of the longest length may end in a later read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "\n", 1));
+    var conn: Conn = .{ .posix = .{ .socket = .{ .handle = fds[0], .address = undefined } } };
+    const gpa = std.testing.allocator;
+    const split = try conn.recvLineAfter(gpa, 4, "abcd", std.time.ns_per_s);
+    defer gpa.free(split.line);
+    defer gpa.free(split.rest);
+    try std.testing.expectEqualStrings("abcd", split.line);
+}
+
+test "a private runtime directory is made 0700, and a symlink in its place is refused" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const dir = try std.mem.printSentinel(&dir_buf, ".zig-cache/tmp/{s}/private", .{tmp.sub_path}, 0);
+    try ensurePrivateDir(dir);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(dir.ptr, 0o755));
+    try ensurePrivateDir(dir);
+    try std.testing.expectEqual(@as(u32, 0o700), (try pathMeta(dir)).mode & 0o777);
+    var link_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buf, ".zig-cache/tmp/{s}/link", .{tmp.sub_path}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.symlink("private", link.ptr));
+    try std.testing.expectError(error.UnsafeRuntimeDir, ensurePrivateDir(link));
 }
 
 test "socket path rejects a runtime directory too long for a socket address" {

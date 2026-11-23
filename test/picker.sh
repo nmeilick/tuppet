@@ -200,4 +200,28 @@ screen_has " second " "the picker did not list the sessions" "$other"
 "${outer[@]}" "$BIN" view "$other" | grep -qF "(this terminal)" && fail "the picker labelled another daemon's session as its own"
 "${outer[@]}" "$BIN" key "$other" q
 
-echo "PASS: picker list, header, viewer, key guard, attach and back, -, attach -, attach size and detach line, Tab and Space, filter, split keys, stop, exit to viewer, history, self guard"
+# attach -r --no-keys shows no key, and takes none but the detach key.
+watcher=$("${outer[@]}" "$BIN" run --size 100x30 env -u TUPPET_SESSION "${inner[@]:1}" "$BIN" attach "$second" -r --no-keys -k ^Q)
+screen_has "#$second second" "the --no-keys viewer did not name the session" "$watcher"
+"${outer[@]}" "$BIN" wait "$watcher" --idle 600ms --timeout 3s >/dev/null
+"${outer[@]}" "$BIN" key "$watcher" a x '?' q '<Esc>' '<C-c>' '<C-]>'
+"${outer[@]}" "$BIN" wait "$watcher" --idle 600ms --timeout 3s >/dev/null
+"${outer[@]}" "$BIN" view "$watcher" | grep -qE 'Esc|attach|quit|keys' && fail "the --no-keys viewer showed keys"
+"${outer[@]}" "$BIN" list -j "$watcher" | grep -q '"state":"running"' || fail "a key other than the detach key ended the --no-keys viewer"
+"${inner[@]}" "$BIN" list -j "$second" | grep -q '"writer":null' || fail "a key in the --no-keys viewer took control"
+"${outer[@]}" "$BIN" key "$watcher" '<C-q>'
+"${outer[@]}" "$BIN" wait "$watcher" --ended --timeout 3s >/dev/null || fail "the detach key did not end the --no-keys viewer"
+
+# attach -r follows the session it restarts, and a plain character as
+# its detach key quits it.
+gone=$("${inner[@]}" "$BIN" run --name gone true)
+"${inner[@]}" "$BIN" wait "$gone" --ended --timeout 3s >/dev/null || fail "the session to restart did not end"
+reviewer=$("${outer[@]}" "$BIN" run --size 100x30 env -u TUPPET_SESSION "${inner[@]:1}" "$BIN" attach "$gone" -r -k z)
+screen_has "#$gone gone" "the viewer did not name the ended session" "$reviewer"
+"${outer[@]}" "$BIN" wait "$reviewer" --idle 600ms --timeout 3s >/dev/null
+"${outer[@]}" "$BIN" key "$reviewer" r y
+screen_has "restarted #$gone as #" "the viewer of attach -r lost the session it restarted" "$reviewer"
+"${outer[@]}" "$BIN" key "$reviewer" z
+"${outer[@]}" "$BIN" wait "$reviewer" --ended --timeout 3s >/dev/null || fail "a plain character as the detach key did not quit attach -r"
+
+echo "PASS: picker list, header, viewer, key guard, attach and back, -, attach -, attach size and detach line, Tab and Space, filter, split keys, stop, exit to viewer, history, self guard, --no-keys viewer, restart in attach -r, plain detach key"

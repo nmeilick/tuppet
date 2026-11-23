@@ -114,13 +114,20 @@ fi
 timeout 1 "$BIN" remove "$stuck"
 
 # A background job holding the pty must not keep the session running or
-# hang stop; the shell passes stop's hangup on to the job.
+# hang stop, also one that ignores the hangup and SIGTERM: stop kills it
+# after the shell has gone.
 shell=$("$BIN" run bash --norc --noprofile -i)
 "$BIN" wait "$shell" --idle 100ms --timeout 2s >/dev/null
-"$BIN" key "$shell" 'sleep 301 &' '<Enter>'
+"$BIN" key "$shell" '(trap "" HUP TERM; exec sleep 3017) &' '<Enter>'
 "$BIN" wait "$shell" --match '[1] ' --after-input --timeout 2s >/dev/null
-timeout 2 "$BIN" stop "$shell"
+timeout 3 "$BIN" stop "$shell"
 "$BIN" list -j "$shell" | grep -q '"state":"exited"'
+for _ in $(seq 100); do pgrep -fx 'sleep 3017' >/dev/null || break; sleep 0.02; done
+if pgrep -fx 'sleep 3017' >/dev/null; then
+    pkill -KILL -fx 'sleep 3017'
+    echo "stop left a background job that ignores the hangup running" >&2
+    exit 1
+fi
 
 # Sessions run in the caller's directory, not the daemon's.
 mkdir "$test_dir/here"

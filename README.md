@@ -41,7 +41,7 @@ Font icons in matching TrueType fonts (full), or the smallest binary (lean).
 
 The sizes are those of the x86_64 Linux binaries. `tuppet --version` names the build.
 
-To build from source you need [Zig 0.17.0](https://ziglang.org/download/) and network access for the first build, which
+To build from source you need [Zig 0.17.1](https://ziglang.org/download/) and network access for the first build, which
 downloads Ghostty, GNU Unifont, FreeType, and JetBrains Mono. A lean build (`zig build -Dfonts=lean`) skips the last
 two; a full build (`-Dfonts=full`) also downloads JuliaMono, Symbols Nerd Font, and Noto Sans Mono CJK SC, about 52 MB:
 
@@ -59,30 +59,39 @@ Linux is the supported platform for now; see [Platform support](#platform-suppor
 | --- | --- |
 | `tuppet` | Open the session picker (in a terminal). |
 | `tuppet run [-a] [-n NAME] [-s WxH] [-C DIR] [-r] [--alert NAME=TEXT] [--if-exists W] [conditions] <cmd...>` | Start a session and print its id, then wait for the conditions; or attach to it (`-a`). |
+| `tuppet run --over <session> [--title TEXT] [--grab W] [-t DUR] <cmd...>` | Start a session in a box over another one, wait until its program ends, and report how (see [Boxes](#boxes)). |
+| `tuppet start [<id>...] [-d] [--new] [-A] \| --check [<id>] \| --record <id>` | Open a session and bring it to a known state through the steps of the start file (a login, say), then attach; several ids or a group start one after another, detached; check the file; or record a login done by hand (see [Logins with tuppet start](#logins-with-tuppet-start)). |
 | `tuppet list [<session>...]` | List sessions with id, name, state, age, and command. |
 | `tuppet stop <session>...` | Hang up and terminate each program's process group, killing what is left after 0.5 s. |
 | `tuppet remove <session>... [-f]` | Delete ended sessions and what tuppet kept of them; `-f` stops running ones first. |
 | `tuppet restart <session>` | Run an ended session's command again, with your current environment. |
 | `tuppet rename <session> <name> [-j]` | Give a session another name. |
+| `tuppet update <session> [--group G] [--label TEXT] [--mark M] [--action SPEC]...` | Change what a group attach shows about a session (see [Groups](#groups)). |
+| `tuppet flag <session> --attention TEXT \| --clear` | Flag a session as needing attention in a group attach, or take the flag away. |
+| `tuppet side <session> --view compact\|half\|full \| --request` | Set the view of a side session, or ask whoever follows the events for one. |
+| `tuppet respawn <session> [--env NAME=VALUE]...` | Start an ended session's command again in its place, with only the environment given. |
+| `tuppet lease <session>` | Keep a session alive only while this command runs (Linux only). |
 | `tuppet events [<session>...] [-i DUR] [-v] [-j]` | Follow what happens to sessions as it happens: starts, ends, bells, notifications, alert hits, renames. |
 | `tuppet ack <session>...` | Mark sessions as seen, which clears their `!` in `tuppet list`. |
+| `tuppet commands <session> [N]` | List the last commands a shell reported with OSC 133 marks, with their output and exit codes. |
 | `tuppet alert add <session> NAME=TEXT \| list \| remove` | Watch a session for a text: a line that comes to show it is a hit. |
 | `tuppet key <session> <keys...>` | Type keys in vim notation, such as `<C-c>`, `<Esc>`, `<Up>`, `<S-Tab>`, or `<F5>`. Other text is typed as it is. |
-| `tuppet do <session> <steps...>` | Type text, keys, pastes, secrets, mouse clicks, and focus events, resize, and wait for what follows, with guards. |
+| `tuppet do <session> <steps...>` | Type text, keys, pastes, secrets, mouse clicks, and focus events, resize, and wait for what follows, with guards; or run a start-file block's steps (`--use`). |
 | `tuppet resize <session> WxH [-j]` | Resize the terminal and print the seq of the reflow. |
 | `tuppet view <session> [-f plain\|vt\|html] [-s] [--since SEQ] [--styles] [-j]` | Print the visible screen, with `-s` also the history above it, with `--since` only what changed, with `--styles` its colors and emphasis. |
 | `tuppet png <session> <file> [-f SPEC] [--font-size N] [-j]` | Render the visible screen to a PNG file, with the fonts SPEC lists. |
 | `tuppet wait <session>... [-m TEXT] [--gone TEXT] [--settled DUR] [-i DUR] [-e] [--hidden-input] [--hit NAME] [--after-input] [--any]` | Block until text appears or goes, the screen settles or goes quiet, the program asks for a password, an alert hits, or it ends. |
 | `tuppet record <session> --start FILE \| --mark LABEL \| --stop` | Start, mark, or stop an asciicast or trace recording. |
+| `tuppet play FILE.cast [--speed N] [--max-pause DUR]` | Play an asciicast recording into your terminal (see [Recordings](#recordings)). |
 | `tuppet sweep <session> -s SIZES [--find NAME=TEXT]...` | Resize through many sizes and report what the program drew at each and where the texts sit. |
-| `tuppet attach [<session> \| -]` | Show a session live in your terminal and type into it (`-`: the one you detached from last); without a session, open the session picker. |
+| `tuppet attach [<session> \| -] [--drawn] [--group NAME]` | Show a session live in your terminal and type into it (`-`: the one you detached from last; `--drawn`: tuppet paints it, see [Drawn attach](#drawn-attach); `--group`: the members of a group, see [Groups](#groups)); without a session, open the session picker. |
 | `tuppet shutdown [--reset] [--all]` | Stop every running session and the daemon; `--reset` also deletes the stored sessions. |
 
 `tuppet help <command>` describes each option, its short form, and its default, usually with an example. Options may
 come before or after the session. Durations always take a unit: `500ms`, `5s`, `2m`, `1h`, or plain `0`. `list`,
 `view`, `run`, `restart`, `rename`, `stop`, `remove`, `ack`, `wait`, `do`, `record`, `alert`, `events`, `resize`, `png`,
-`sweep`, and `shutdown` print JSON with `-j`: the daemon's reply with the full status of each session, as
-[docs/protocol.md](docs/protocol.md) describes it.
+`sweep`, `shutdown`, `update`, `flag`, `side`, `respawn`, `lease`, and `commands` print JSON with `-j`: the daemon's
+reply with the full status of each session, as [docs/protocol.md](docs/protocol.md) describes it.
 
 `tuppet rename build web` renames a session; `tuppet restart build` starts an ended session's command again, in its
 directory, under its name, at its size, and with its alerts, but with your current environment: the old one is not
@@ -108,8 +117,9 @@ one once. Their patterns must match at least one session and skip the ones the a
 Keys reach the program before it has redrawn, so read the screen only after waiting for the state you expect. The daemon
 checks a wait's conditions after every change on the screen. `tuppet wait --match TEXT` (`-m`) waits for text on the
 screen, `--idle DUR` (`-i`) for the screen's text to stay unchanged that long, and `--ended` (`-e`) for the program to
-end. Several conditions are alternatives, and the first that holds ends the wait. `tuppet help conditions` describes
-them all.
+end. Several conditions are alternatives, and the first that holds ends the wait. `--icase` makes `-m` and `--gone`
+ignore the case of ASCII letters, and `--regex` makes their text a regular expression, such as `-m '^me@db\d+:'
+--regex`. `tuppet help conditions` describes them all, and the regular expressions tuppet knows.
 
 `wait` prints one line that scripts can read, such as `met match#0 3 seq=1187 input_seq=1100 hit_seq=-`: the outcome,
 the condition that was met (its kind and its place among the conditions, counting from 0), the session, and its seqs.
@@ -147,7 +157,9 @@ Windows has the title and the working directory, but neither hidden input nor th
 
 `tuppet list` marks a session with `!` when something happened that nobody has seen yet: the program rang the bell,
 sent a desktop notification (OSC 9 or OSC 777), had an alert hit, or ended; a session that `tuppet stop` ended is not
-marked, since whoever stopped it knows. Its state then reads the alert's name, `bell`, `done`, or `failed N`.
+marked, since whoever stopped it knows. Its state then reads the alert's name, `bell`, `done`, or `failed N`. A
+session over which a [box](#boxes) waits for someone to type into it reads `box waits` and keeps its `!` until no box
+waits; an ack does not clear that.
 `tuppet ack <session>...` marks what the session shows now as seen; the status keeps `bell_count`,
 `notification_count`, the latest `notification`, and what was `seen`, also across daemon restarts.
 
@@ -192,11 +204,150 @@ being submitted line by line. `--mouse left 10 3` clicks at zero-based cell coor
 both follow the program's reporting modes like a real terminal, so nothing is sent while the program has them off.
 
 `--secret VAR` types the value of an environment variable and keeps it out of recordings, as tuppet does with anything
-typed while a program hides its input, such as a password typed by hand. `--secret` is refused unless the
+typed while a program on its own terminal hides its input, such as a password typed by hand (see
+[Recordings](#recordings)). `--secret` is refused unless the
 program is reading hidden input at that moment, so a password never lands at a shell prompt:
 `tuppet do 3 -k 'sudo make install<Enter>' --hidden-input --secret PW -k '<Enter>' -m '$ '`. `--unless-attached`
 refuses to type while someone is attached as the writer, and `--if-input-seq N` refuses when anybody typed after the
 input that an earlier outcome line reported. A refused batch types nothing, and `do` exits 5.
+
+### Logins with tuppet start
+
+`tuppet start db3` opens a session named `db3` and logs it in through steps kept in a file like `~/.ssh/config`: it
+types a command, waits for the text that should follow, and goes on; then it attaches your terminal. The file is
+`$XDG_CONFIG_HOME/tuppet/start` (by default `~/.config/tuppet/start`; `TUPPET_START` names another file, and an empty
+one reads none). tuppet refuses it when another user owns it or when group or others may write it, since its steps type
+into shells that may be privileged.
+
+```
+steps jump
+    send     ssh jump.example.com
+    expect   me@jump:~$
+
+steps become user pw=$SUDO_PW
+    send     sudo -iu %{user}
+    when     [sudo] password for me:
+        secret %{pw}
+    expect   %{user}@
+
+start db1 db2 db*
+    use      jump
+    send     ssh %i.internal
+    expect(30s) me@%i:~$
+    fail     me@jump:~$
+    use      become app $APP_PW
+    send     cd /srv/app && pwd
+    expect   /srv/app
+    send     git status
+```
+
+A `start` line names ids or patterns; `%i` is the id that was started. A `steps` block holds steps that `use` puts in,
+with parameters (`%{user}`) and defaults; a start block with a single id can be used too, up to 8 deep. `send` types a
+line and Enter, `type` text alone, `keys` keys as `tuppet key` takes them, `secret $VAR` a password from the
+environment (or, without a variable, one asked on your terminal without echo), and `ask` an answer asked on your
+terminal. After each, `expect TEXT` (with `or TEXT` for alternatives) waits for the text to appear anew after the input,
+`gone TEXT` for a text to leave the screen, `settle DUR` for the screen to stop changing, and `ended [STATUS]` for the
+program to end, with that exit status if given; `ended` is the last step, and nothing is attached after it. The echo of
+what an input typed never meets its check, so `send cd /srv/app && pwd` with `expect /srv/app` waits for the output of
+`pwd`. A check waits 10 s, or what the block's `timeout` says, or the time in parentheses right after its keyword:
+`expect(1m) TEXT`. With `(re)`, as in `expect(re, 30s) ^me@db\d+:`, the text is a regex (see `tuppet help conditions`),
+taken as written; `or(re)`, `fail(re)`, `when(re)`, and `gone(re)` work the same way, and `%i` and parameters put into a
+regex match as written. Settings come before a block's first step. Values are literal text: a `#` after the start of a
+line is part of it, and quotes (with `\"` and `\\` inside) only keep blanks at the ends. Plain texts are matched as they
+are: a `*` is a star, not a wildcard. For a program's environment, write it into the command: `command env LC_ALL=C
+bash -l` (the built-in failure texts below are English, so `LC_ALL=C` keeps them working).
+
+Checks are optional. An input without one waits until the screen changed below the input's line and then stayed still
+for 300 ms, at most 2 s, and then goes on either way, so a block may end with `send git status` or `send tail -f log`
+and the terminal attaches after it. The pause does not wait for a command to finish, a program that prints all the
+time costs the full 2 s, and a pager takes the next input as its own (`PAGER=cat` helps). Give each command that changes
+where input goes (`ssh`, `sudo`, `su`) an `expect`: without one, a hop that failed shows only at a later check, and the
+commands between go to the host before.
+
+A block's first input waits until the program takes input, since a shell that gets it earlier draws its prompt again
+after it, where a `fail` line for that prompt would match. A shell with line editing (bash, zsh, fish) or a full-screen
+program takes input once it reads keys one at a time and its output has paused for 300 ms; a program that reads whole
+lines (dash, a script's `read`) once its output has stayed still for 1 s. A program that prints nothing waits the full
+5 s, after which the input is typed anyway, with a note. This cannot see the remote shell behind `command ssh host`, or a line-reading program that pauses longer after its
+banner, so such a block starts with an `expect` for the prompt, as `--record` writes it.
+
+A question that only sometimes comes, such as ssh's about a host it does not know yet, sudo's password prompt, or an
+installer's "Overwrite?", gets a `when` line after the input that may bring it, followed by the `send`, `type`, `keys`,
+or `secret` line that answers it, indented deeper:
+
+```
+start web1
+    send     ssh web1
+    when     continue connecting (yes/no/[fingerprint])?
+        send yes
+    expect   me@web1:~$
+```
+
+While the checks after it wait, up to the next input, the answer is typed once when the text appears anew after the
+input and the output pauses; an input right before the `when` without a check after it watches for it while it pauses,
+and a `when` first in a block answers from the program's start. The checks wait as usual whether the question comes or
+not, count from the answer once it is typed, and the run says when it answered. A `when` never reaches into a used block,
+and `--check` notes one that no check or pause watches for.
+
+A check fails at once when a failure text appears after the input, or when the session ends (except for `ended`). The
+failure texts are built-in English ones (such as `Permission denied`, `Could not resolve hostname`, `Sorry, try again`, or
+`command not found`), and those of `fail` lines, in three places: at the left margin before the first block for the whole
+file, before a block's first step for that block and the blocks it uses, and right under a check (or its `or` lines)
+for that check alone, as `fail me@jump:~$` above stops the run at once when ssh drops back to the jump host. `nofail
+TEXT` leaves a text out of a block's own checks, and a bare `nofail` the built-in ones (at the margin: for the whole
+file). A file-wide or block-wide text that is part of the input, or of what the check waits for, is left out of that
+check. tuppet then prints the step as written and as expanded, its line in the file and
+the chain of `use` that led there, and the session's last lines, and offers to attach, to open the file in your editor
+at that line, or to stop the session. With `-d` (and outside a terminal) it prints the session's id and exits 1, 3, 4,
+or 5 as `tuppet do` does, and the session keeps running.
+
+`tuppet do SESSION --use NAME [ARG...]` runs the steps of a block in a session that runs already, so that a script can
+open a session once and repeat steps in it: `tuppet do "$id" --use hop db4`. The block must start with the `expect` of
+the prompt it is used at; nothing is typed unless the cursor's line ends with that prompt, and every input requires that
+nothing else was typed since the one before. Failure texts, passwords, and exit codes are those of `tuppet start -d`;
+it prints nothing when the steps succeed. Pass a password variable in single quotes, `--use become app '$APP_PW'`, so
+that the shell does not put its value on the command line.
+
+A password is typed only into the prompt it was meant for: the daemon refuses the batch when anything was typed into
+the session after the prompt appeared, and tuppet types it only when its prompt is on the cursor's line once the
+output pauses, so a banner that mentions a password after a key login gets nothing. A `secret` follows the `expect` of
+its prompt, or answers a `when` that waits for it, which suits a sudo that asks only when it has no password cached.
+`--check` notes a password prompt whose command has no check before it, where a hop that failed would send the password
+to the host before. The variables that `secret` steps read are left out of the session's environment, and their values out of what tuppet prints. While the steps run, a line shows the
+step and the session's current line; Ctrl-C stops them and attaches. When a session with the id's name runs already,
+tuppet asks whether to attach to it or start another, named `db3-2`; `--new` starts another without asking. A session
+whose start failed or was cut short with Ctrl-C is replaced instead, unless someone typed into it since or is attached
+to it.
+
+`tuppet start db1 db2 web` starts several ids one after another and attaches none: each says when it is ready, a
+password asked for a variable is asked once and, once it worked, used for the next sessions, and tuppet prints the
+sessions' ids and exits with the code of the first that failed. A session that runs already is kept, and one whose start failed is replaced, so the same command
+finishes a partial setup. The others go on when one fails; with `--atomic` (`-A`) tuppet stops instead, and stops every
+session it opened, so that either all run or none. A `group` line in the file names ids that start together:
+
+```
+group morning jump db1 db2 web
+```
+
+`tuppet start morning` then starts those four. A group has no steps and is never a session's name; its ids must be
+exact ids of start blocks, and not groups.
+
+`tuppet start --check` reports every problem in the file, with notes on checks that may be met too early (an `expect`
+text that is part of an earlier hop's prompt, or of the hop's command, where an error naming the host would meet it), and
+`tuppet start --check db3` prints the steps as they would run, with the line each comes from (for a group, those of each
+id). The echo rules and regexes need a daemon of tuppet 0.4.0 or later: an older one that still runs makes a start that
+uses them fail with a hint to restart it when your sessions may stop. `tuppet start` alone lists the ids, with the
+sessions running under them, and the groups.
+
+`tuppet start --record db3` starts your shell (or the command after `--`) in a session and attaches it. Log in by hand,
+then press the detach key: tuppet shows the block it made and asks whether to append it to the file, to edit it first,
+or to drop it. The block has an `expect` for each prompt, a `send` for each command, `secret` without a value where you
+typed a password (a line the screen did not show, or one typed at a prompt that asks for a password), a `fail` line
+under each prompt that differs from the one its command was typed at, with the earlier prompt, `use` when its first steps
+are those of a block you have, a time such as `expect(14s)` for a step that took long, and a `when` for ssh's question
+about a new host key and for sudo's password prompt. Lines it is unsure of carry a
+`# CHECK:` comment, and it does not append the block while one is left. Your keys are kept only in a file in tuppet's
+private runtime directory that is deleted as soon as it is opened.
 
 ### Snapshots
 
@@ -315,6 +466,12 @@ before each input), markers, and the reason the recording stopped, with the exit
 are plain text you can grep. The conditions of `tuppet wait` and `-t DUR` let the daemon end a recording on its own:
 `tuppet record <id> --start build.trace -m 'Tests passed' -t 10m`.
 
+A recording keeps out what tuppet knows is a password: a `tuppet do --secret`, and what is typed while the program reads
+without echo, as sudo, ssh, and `read -s` do. The recording gets a marker (`secret input`) instead. tuppet sees that
+only for programs on its own terminal, so a password typed on a host that ssh reached looks like any other input and is
+recorded as typed. `--passwords` (on `tuppet record --start`, `tuppet run -r` or `--record-file`, and
+`tuppet do --record-file`) records every password as typed.
+
 `tuppet run --record` starts a recording together with the program, so even a program that exits at once is recorded in
 full. The recording is kept in the session's directory in the store (see [What tuppet keeps](#what-tuppet-keeps)) as
 `output.cast` or `output.trace`, and deleted with the session. `tuppet view <id> -j` (or `tuppet list <id> -j`) shows
@@ -331,6 +488,21 @@ It checks every step before sending anything and always stops its recording, als
 press Ctrl-C.
 
 Recordings are readable only by you, because they contain everything typed into the session.
+
+`tuppet play demo.cast` plays an asciicast recording into the terminal it runs in, at the pace it was recorded;
+`--speed 2` plays it twice as fast, and `--max-pause 1s` shortens every longer pause to a second (by default, to the
+recording's `idle_time_limit` when it has one). Space pauses, `q`
+quits, and the last frame stays until you press a key; these keys work whatever keyboard and mouse modes the recording
+turns on. Recorded input is left out, and the output passes through the same filter as a raw attach, so your terminal
+never answers a query in the recording. At the end, play leaves the alternate screen and resets the modes the recording
+set. Inside a tuppet session, play resizes the session to the recording's size, follows the recording's resizes, and
+gives the session its size back at the end; anywhere else the recording plays as it is, and play says once when it is
+larger than the window. Outside a terminal play fails with exit 2. A recording you do not trust is safest in a session of
+its own under a drawn attach, which writes to your terminal only what tuppet composes:
+
+```sh
+tuppet run -a --drawn -- tuppet play demo.cast
+```
 
 ### Live attach and the session picker
 
@@ -374,20 +546,201 @@ ends. While you are attached, your terminal's bell rings once when another
 session comes to need you, and the only key tuppet takes is the detach key. An attach marks what it showed as seen when
 it starts, when you detach, and when the session ends.
 
+`tuppet attach <id> --history 500` first writes the session's last 500 older lines (up to 100000), the ones above its
+screen, so they land in your terminal's scrollback right above the session, in order and with their colours; `tuppet
+attach -r <id> --history 500` outside a terminal writes them before the stream. A daemon too old for it says so and
+attaches without them. `--history` is a usage error with `-r` in a terminal, which opens the picker's viewer.
+
 A session can have any number of viewers (`--read-only`, which in a terminal opens the picker's viewer for that one
 session) and one writer; `--force` takes the writer role from someone else, whose terminal then says so and goes on
 read-only. Attach lets you watch an agent work and take over by hand. Other commands keep working while clients are
 attached. While `tuppet do` types, what you type waits for it, in order, and the terminal shows `held: automation is
 typing`. When you detach, the session gets back the size it had before you attached, unless `tuppet resize` set one
-meanwhile. Inside a session (where `TUPPET_SESSION` is set), the picker of the same daemon labels that session `(this
-terminal)` and does not show or attach it, and warns that an attach around this terminal takes Ctrl-] first; `-k`,
+meanwhile. A writer is shown by its terminal's name, such as `pts/3`, in the picker, `tuppet events`, and the status;
+`--label TEXT` gives it another (at most 64 bytes, without control characters). `tuppet attach <id> -r --no-keys` is a
+viewer for someone who may only watch: it takes no key but the detach key and shows no keys, so nothing on screen
+offers to stop the session or take control; `--no-keys` without `-r` is a usage error. Inside a session (where
+`TUPPET_SESSION` is set), the picker of the same daemon labels that session `(this terminal)` and does not show or
+attach it, and warns that an attach around this terminal takes Ctrl-] first; `-k` (also on `tuppet run -a`),
 `TUPPET_DETACH_KEY`, or the config file sets another detach key:
 
 ```toml
 [attach]
 detach_key = "^A"   # also <C-a>, or one character
 bell = false        # no bell while attached
+drawn = true        # attach, run -a, and the picker's `a` are drawn attaches
+box_pause = "1s"    # how long you pause typing before a box opens by itself (at most 1m)
+set_aside = false   # Esc goes to a box's program, and the detach key detaches from an open box
+alt_screen = false  # a drawn attach always paints on the alternate screen
+pass = "bell,links" # what a drawn attach passes on (default all four, or "none")
+switch_key = "F12"  # a group attach's switcher (F1 to F12, Ctrl-X, ^X, or one character)
+switch_marks = true # a dim line in the scrollback where a group attach switched
+
+[side]
+key = "F11"                         # steps the side pane through its sizes
+sizes = ["compact", "half", "full"] # compact first, then half, full, or both
+layout = "auto"                     # below, side, strip, or the first that fits
+rows = 8                            # the pane's rows below the front, on windows of 34 rows or more
+front_min = 100                     # the pane goes beside the front on windows wider
+pane_min = 44                       # than front_min + pane_min columns, at least pane_min wide
 ```
+
+`menu_key` is another name for `detach_key`, for a group attach, where that key opens the switcher; give one of the two.
+Older tuppet versions refuse a config file with a key they do not know, such as `drawn`, `box_pause`, `set_aside`,
+`alt_screen`, `pass`, `switch_key`, or a `[side]` section.
+
+### Drawn attach
+
+`tuppet attach <id> --drawn` (also `tuppet attach - --drawn` and `tuppet run -a --drawn`) paints the session itself,
+from tuppet's own copy of its screen; the program's output never reaches your terminal as written. Colours the program changed are painted as their value and the others with your own theme, wide
+and combined characters keep their columns, and the cursor shows where the program has it, in its shape. tuppet gives
+your terminal the input modes the program asked for (cursor keys, keypad, mouse, focus reports, the kitty keyboard
+protocol, modifyOtherKeys) and takes them back at the end, keeps bracketed paste on and passes the brackets only to a
+program that asked for them, and turns alternate scroll off while attached. It passes on the bell, notifications, clipboard
+writes, and links, but never a request to read the clipboard, and never the window title; `--pass` (or `pass` in
+`[attach]`) takes a list of `bell`, `notifications`, `clipboard`, and `links`, or `none`, and passes on only those, from
+the session and from its boxes. tuppet's own bell for a box that arrives stays under `bell = false`. A session larger than your
+terminal is cut at the right and the bottom; a smaller one sits at the top left. After a broken stream it attaches again
+for up to 5 seconds, and when the program ends, the attach ends with the program's code.
+
+A drawn attach paints on your terminal's normal screen, so its own scrollback, search, and copy keep working: every line
+that leaves the session's screen is written into your terminal's scrollback once, in order, and with none of tuppet's
+text, also lines that leave just before the program erases its history or resets the terminal. A line the session
+wrapped is marked as wrapped there, so copying it gives one line. What your terminal showed before moves into its
+scrollback when the attach starts, and the last screen stays when it ends, with the cursor below it. tuppet paints on
+the alternate screen instead while the program is on its own alternate screen (so a full-screen program leaves nothing
+in your scrollback), while a box has your keys, and while your window is smaller than the session, which it then says
+and repeats when the attach ends. `--alt-screen` (or `alt_screen = true` in `[attach]`) always paints on the alternate
+screen, for a terminal whose normal screen misbehaves. Resizing a terminal is where terminals differ: lines next to the
+cut may appear twice in your scrollback, and a window that shrinks can push tuppet's own line into it before tuppet
+repaints; tuppet keeps that line on the bottom row, where that is least likely.
+
+A session that `tuppet run -a --drawn` starts reports your terminal's text and background colours to its program, so a
+program that picks a light or a dark look by them picks the one that fits; a box over a session reports that session's
+colours.
+
+`--no-detach` makes the detach key do nothing, so the attach lasts until the program ends; a tool that ties one session
+to one terminal uses it, and must stop the session itself when the attach ends another way. Once another client has
+taken over writing, the detach key detaches again. `--no-drawn` overrides
+`drawn = true`, which never applies to `-r`. `--drawn` with `-r`, `--no-detach`, `--alt-screen`, or `--pass` without a drawn attach, and
+`--drawn` outside a terminal or on Windows are usage errors (exit 2); a daemon too old to serve a drawn attach fails it with a
+message, and `run -a --drawn` then starts nothing.
+
+A drawn attach also shows boxes: sessions that `tuppet run --over` starts over the session you are attached to, such as a
+confirmation another tool asks you for. A box arrives as one line at the bottom right (one row higher while the
+program's cursor is on the bottom row; on the alternate screen at the top right, or at the bottom while the cursor is in
+the top row), and the bell rings once. It opens once you have paused typing for `box_pause`, and
+takes your keys only after your terminal has answered a cursor report and you have paused another half second, so what
+you were typing for the session underneath never lands in the box. Its border says `wait…`, then `keys here`, and after
+a minute without a key `asleep: any key wakes`. The box sits on a shade of your terminal's background, with a shadow,
+when the terminal tells its colours and `NO_COLOR` is not set. Around an open box the session underneath is shown dimmed, in a colour
+between your terminal's text and background colours (faint when the terminal does not tell them, or with `NO_COLOR`), as
+it was when the box opened (the border says since when) or live, as the box asked. When the box closes, a receipt line says so, and
+keys are dropped until you have paused for half a second. Every key but Esc and the detach key belongs to the program in
+the box. Esc, once the box has your keys, or the detach key sets an open box aside: it waits as the line again, and no
+other box opens by itself until it ended. The detach key opens a box that waits on the line at once and dismisses a
+receipt; it detaches only when no box is there. For a second after Esc or the detach key acted on a box, more presses of
+that key do nothing, so pressing it over and over never detaches and no Esc spills into the session underneath. With
+`set_aside = false` in `[attach]`, Esc reaches the box's program and the detach key detaches from an open box (the box
+waits for the next drawn attach). With `--no-detach` the detach key never detaches while you have the writer role;
+together with `set_aside = false`, an open box keeps your keys until its program ends. A box that another client controls waits with `controlled elsewhere`, one that does not fit even when made
+smaller waits with `window too small`, and an attach without the writer role shows boxes only as a line. A box made
+smaller to fit grows back once the window is larger again.
+
+What a drawn attach does not do:
+
+- **Pictures.** tuppet's sessions store none.
+- **Anything else tuppet's copy of the screen does not hold.**
+- **Windows**, which has no attach.
+
+### Boxes
+
+`tuppet run --over agent --title 'confirm deploy' -- ./confirm` starts `./confirm` in a new session, a box, and shows it
+over the session `agent` to whoever has `agent` in a drawn attach. The box is an ordinary session otherwise: `view`,
+`key`, `do`, `wait`, and recordings work on it, so a script can answer a box with no person present. Its program gets
+64x12 cells unless `-s` says otherwise; `TUPPET_SIZE` does not apply to a box. `--grab` says when the box takes the
+keyboard: `pause` (the default) once you pause typing, `now` at once, or `never`, for a notice that takes no keys.
+`--backdrop frozen` (the default) or `live` says how the session underneath shows meanwhile, and does not go with
+`--grab never`. A box over a box is refused, a session takes at most 16, and the daemon stops a box when the session
+underneath ends. What the person sees and types is in [Drawn attach](#drawn-attach).
+
+In a drawn attach, the program underneath cannot paint inside a box or on its border, move or cover it, give it a key,
+take a key meant for it, or learn what was typed into it. It can still paint something that looks like a box, ring the
+bell, raise notifications, and replace the clipboard. Any process that can reach tuppet's socket can open a box and type
+into it with `key` and `do`, and every session is told the socket's path in `TUPPET_SESSION_SOCKET`. A tool that asks
+through a box about a program it does not trust must therefore keep that program away from the socket, from the box's
+terminal device, and from tuppet's state folder; attach with `--drawn --no-detach`; never open a `--grab now` box for
+something that program caused; and put no text from that program into `--title`.
+[docs/protocol.md](docs/protocol.md#trust) lists what tuppet accepts beyond that.
+
+`run --over` prints the box's id at once, waits as long as it takes until the box's program has ended, removes the box,
+and prints one line:
+
+```text
+ended 7 exit=0 held=yes shown=yes
+stopped 7 reason=unseen held=no shown=no
+lost 7
+```
+
+`held` says that some client typed into the box (an attach that writes, also a plain `tuppet attach` to the box), and
+`shown` that one showed it. `reason` is `unseen` when `-t DUR` (1 ms to 24 h) ran out before the box was held (shown,
+with `--grab never`), `under` when the session underneath ended, and `stopped` when the box was stopped another way.
+`lost` is a box lost with its daemon, or removed before `run --over` saw its end. With `-j` it prints the final wait's
+reply, with the box's status, instead of the line, and nothing for a box lost with its daemon, which leaves no reply. It
+exits with the program's own code when the program ended by
+itself in a box that was held (shown, with `--grab never`), 3 for `reason=unseen`, and 4 in every other case; a program
+can exit with 3 or 4 itself, so a caller that must tell these apart reads the line. Interrupted, `run --over` stops its
+box first and exits 128+n; killed, it leaves the box running until someone stops it or the session underneath ends. On
+Windows, Ctrl-C ends `run --over` and leaves the box. `--over` cannot be combined with `-a`, conditions, or
+`--if-exists`, and a daemon too old for boxes fails it with a message.
+
+While a box that takes the keyboard runs over a session and nobody types into it, `tuppet list` and the picker show that
+session as `box waits`, marked with `!`, counted among the sessions that need you, and reached with Tab. A plain
+`tuppet attach` to that session rings your terminal's bell once when such a box comes.
+
+### Groups
+
+`tuppet run --group w ...` makes a session a member of the group `w`, with the lowest number from 0 that no member has.
+`tuppet attach --drawn --group w [SESSION]` shows the members one at a time on the terminal's normal screen: from the
+second member on, a bar on the bottom row names the member in front (with `--label`, inverted with `--accent`), the
+others with their numbers, state words (`password?`, `ended N`), marks (`--mark`), and `!` with what needs attention: a
+box that waits over a member, a password prompt, a bell since it was last in front, or a flag (`tuppet flag NAME
+--attention TEXT`). Members are sized to the window minus the bar, and a switch resizes nothing.
+
+F12 (`switch_key`) or Ctrl-] opens the switcher: digits jump to a member, `/` filters by name, Space goes to the next
+member that needs attention, Enter goes to the selected one, Esc stays, F12 again goes back to the member in front before,
+`\` sends F12 to the program, `d` detaches (not with `--no-detach`), `f` steps the side pane, `h` shows the history in
+`$PAGER`, and the letters that `run --action` or `update --action` registered are reported to whoever follows `tuppet
+events`, after a second press (`x!:close`), a choice (`s:share:Once|Live|Stop`), or a line of text (`o:open:?host`).
+Letters do nothing for half a second after the switcher opened, so a key meant for the member acts on nothing.
+Ctrl-] twice sends Ctrl-]. After a switch, keys are dropped until the terminal has shown the new screen, and only the
+member in front writes into the terminal's scrollback, after a dim line that names it. When the member in front ends, it
+stays, dimmed, until Enter or `x` closes it, which removes the session, and `r` there is reported as an action;
+`--end-with SESSION` ends the attach instead when that session ends. A member that another window types into shows
+read-only until Enter takes it over. `--title TEXT` gives the switcher's frame a title for people instead of the group's
+name, and `--quiet-detach` leaves out the line on detach that says how to return, for a caller that prints its own.
+
+`tuppet run --side-of NAME` ties a side session to a member: it shows in a pane below the member (on windows of 34 rows
+or more), beside it on wide windows, or only as a strip in the bar. F11 steps it through compact (the keys stay on the
+member), half, and full (the keys go to it); Esc goes back to compact, after which the member takes keys once you paused.
+On a member without one, F11 reports `side-requested` for whoever follows the events. `tuppet side NAME --view VIEW`
+sets the view (`run --side-view` the first one), and `tuppet side NAME --request` reports `side-requested` as F11 does.
+
+`tuppet update NAME` changes after `run` what the bar shows: `--label`, `--accent`, `--mark`, `--group` (`''` takes the
+session out of its group), and `--action`; `--no-accent`, `--no-mark`, and `--no-actions` take them away. `--meta
+KEY=VALUE`, on `run` too, keeps short values that the status returns and tuppet does not read, and `tuppet flag NAME
+--clear` takes a flag away. A program in a session can update its own session through `TUPPET_SESSION` and
+`TUPPET_SESSION_SOCKET`. `tuppet respawn NAME` starts an ended session's command again in a new session that takes its
+place, with the old screen, name, directory, size, alerts, and group settings; its environment is only what `--env
+NAME=VALUE` gives plus tuppet's own variables, so pass `PATH` when the command needs it. `tuppet lease NAME` (or `run
+--lease`) keeps a session alive only while that command runs, and stops it when the command ends; leases work on Linux
+only.
+
+A shell that prints OSC 133 marks tells tuppet where its prompt waits: `list -j` gains `shell`, `prompt_seq`, and
+`last_exit`, `tuppet commands NAME [N]` lists its last N commands (it keeps 50) with their output and exit codes, and
+`tuppet do NAME --at-prompt SEQ -p TEXT` puts one line on a prompt that waits, without Enter, only while nothing was
+typed since it appeared, the session is on its normal screen, and the shell has bracketed paste on. tuppet trusts the
+marks as they come, so any output that prints one, such as `cat` of a file, can move them.
 
 ## Use with coding agents
 
@@ -438,6 +791,10 @@ them. They get their full history limit back once the sessions use less than thr
 budget is a quarter of the machine's memory (or of the daemon's cgroup limit, if that is lower), at least 512 MiB;
 `TUPPET_MEMORY` changes it.
 
+The daemon compresses a session's history in memory once the session has had no output for half a second; a full
+64 MiB history then takes about 5 MiB. The budget still counts history at its full size, because a resize or reading
+the history with `tuppet view -s` unpacks it again until the session is next quiet.
+
 ### Stopping the daemon
 
 `tuppet shutdown` stops every running session, as `tuppet stop` does, and then the daemon, and says what it stopped:
@@ -472,7 +829,8 @@ shutdown` stops it at once. Ended sessions survive the switch.
 | `TUPPET_DETACH_KEY` | `^]` | The key that detaches an attach (`^X`, `<C-x>`, or one character); `-k` overrides it, and it overrides the config file's `detach_key`. |
 | `TUPPET_PNG_FONTS` | `default` | The fonts of `tuppet png` when `-f` is not given; it overrides the config file's `[png] fonts`. |
 | `TUPPET_PNG_FONT_SIZE` | `14` | The size of TrueType fonts in `tuppet png`, 6 to 64 pixels, when neither `--font-size` nor a preset that `-f` names gives one; bitmap fonts keep their size. |
-| `TUPPET_CONFIG` | `$XDG_CONFIG_HOME/tuppet/config.toml`, by default `~/.config/tuppet/config.toml` | The config file: `[alerts]` for `tuppet run`, `[attach]` for attaching and the picker, `[png]` and `[png.presets]` for `tuppet png`; empty reads none. |
+| `TUPPET_START` | `$XDG_CONFIG_HOME/tuppet/start`, by default `~/.config/tuppet/start` | The start file of `tuppet start`; empty reads none. |
+| `TUPPET_CONFIG` | `$XDG_CONFIG_HOME/tuppet/config.toml`, by default `~/.config/tuppet/config.toml` | The config file: `[alerts]` for `tuppet run`, `[attach]` for attaching and the picker, `[side]` for the side pane of a group attach, `[png]` and `[png.presets]` for `tuppet png`; empty reads none. |
 
 `TUPPET_SIZE` and `TUPPET_SCROLLBACK` apply to each `tuppet run`; `--size` and `--scrollback` override them.
 `TUPPET_KEEP`, `TUPPET_IDLE_EXIT`, and `TUPPET_MEMORY` are read by the daemon when it starts, so set them for the
@@ -494,7 +852,8 @@ TUPPET_SOCKET=/run/app/tuppet.sock tuppet run vim notes.txt
 ```
 
 With `--socket` or `TUPPET_SOCKET`, commands talk only to that daemon and never start one. This daemon does not exit when
-idle; on SIGTERM or SIGINT, or `tuppet --socket PATH shutdown`, it stops every session and exits with status 0. On Linux,
+idle unless `--idle-exit` says so (after a minute without sessions), and `--keep-fresh` refreshes the times of its
+socket's folder every hour, so that age-based cleaning of `/tmp` leaves a long-lived daemon alone; on SIGTERM or SIGINT, or `tuppet --socket PATH shutdown`, it stops every session and exits with status 0. On Linux,
 the sessions' programs are killed even if the daemon is killed with SIGKILL; background jobs that ignore SIGHUP can
 survive that. All your daemons share the session data, so the shortest `TUPPET_KEEP` among them applies to every session.
 
@@ -511,19 +870,23 @@ describes every request and reply.
 | 3 | Timeout: a `wait`, a `run` with conditions, a condition step of `tuppet do`, or a daemon that did not exit within 30 seconds of `tuppet shutdown`. |
 | 4 | The session ended (or was removed) first: input to an ended session, a `wait` condition it never met, a `stop` of a session that had ended, a sweep whose program ended, `tuppet events --count` when the daemon shut down first. |
 | 5 | A guard of `tuppet do` refused an input batch, which typed nothing (earlier steps ran); or `tuppet sweep` refused to start. |
-| 128+n | Interrupted by signal n (`tuppet do --record-file`, `tuppet attach`, `tuppet sweep`). |
+| 128+n | Interrupted by signal n (`tuppet do --record-file`, `tuppet attach`, `tuppet sweep`, `tuppet play`, `tuppet run --over`, `tuppet start -d`). |
 
-`tuppet attach` and `tuppet run -a` are the one exception: when the session ends while attached, they exit with the
-program's own exit code, so `tuppet run -a make` returns make's status. They exit 0 after a detach, 1 when another
-client has the writer role, and 4 when the session was lost.
+`tuppet attach`, `tuppet run -a`, and `tuppet run --over` are the exceptions. When the session ends while attached,
+`attach` and `run -a` exit with the program's own exit code, so `tuppet run -a make` returns make's status. They exit 0
+after a detach, 1 when another client has the writer role, and 4 when the session was lost. `run --over` exits with
+the program's own code, 3, or 4, as [Boxes](#boxes) explains. `tuppet start -d` exits 1 when a failure text or an earlier
+prompt stopped its steps, 3 when a check waited out its time, 4 when the session ended, and 5 when a password was not
+typed because something was typed into the session after its prompt; with several ids, it exits with the code of the
+first that failed.
 
 ## Platform support
 
 | Platform | Status |
 | --- | --- |
 | Linux (x86_64, aarch64) | Supported. The test suite runs on x86_64. |
-| macOS (x86_64, aarch64) | Builds; not tested at runtime. A `wait` whose client went away lasts until its timeout. |
-| Windows (x86_64, aarch64) | Builds with ConPTY sessions and named-pipe IPC; not tested at runtime. `attach`, the picker, `events`, hidden input (`--hidden-input` and `--secret`), and the foreground program are not available, the daemon does not exit when idle, and a `wait` whose client went away lasts until its timeout. |
+| macOS (x86_64, aarch64) | Builds; not tested at runtime. A `wait` whose client went away lasts until its timeout, and leases (`tuppet lease`, `run --lease`) are not available. |
+| Windows (x86_64, aarch64) | Builds with ConPTY sessions and named-pipe IPC; not tested at runtime. `attach`, the picker, `events`, leases, hidden input (`--hidden-input` and `--secret`), and the foreground program are not available, the daemon does not exit when idle, `--keep-fresh` does nothing, and a `wait` whose client went away lasts until its timeout. |
 
 Linux binaries are static. macOS binaries link only the system library, and Windows binaries only system DLLs.
 
@@ -540,7 +903,8 @@ make help       # all targets
 
 `make` builds in ReleaseSafe mode, which is also what releases ship. Avoid plain Debug builds for real use: the
 emulator's internal checks make heavy output so slow that `tuppet wait` can time out. The end-to-end tests need bash and
-python3.
+python3. `test/tmux_compare.sh` checks a drawn attach with tmux as the terminal; it needs tmux, so `make e2e` leaves it
+out.
 
 A compile of tuppet takes up to about 2 GB of memory, and `zig build` runs one per CPU core, so `make dist`, which
 compiles six targets at once, can run out of memory on a smaller machine; `make dist JOBS=2` runs only two at a time.
@@ -551,7 +915,7 @@ checkout's location.
 GitHub Actions runs on Ubuntu 24.04, pinned rather than `ubuntu-latest` so that a new runner image cannot change the
 build unannounced. It runs `make check` on each push to `main` and each pull request, builds and tests the lean and
 full builds, cross-compiles all three for every target, and checks with `test/static.sh` that each binary is
-self-contained. To release, set `.version` in `build.zig.zon` and push a matching tag such as `v0.3.0`: the release
+self-contained. To release, set `.version` in `build.zig.zon` and push a matching tag such as `v0.4.0`: the release
 workflow then runs the tests, builds the 18 archives with `make dist`, and publishes them with `SHA256SUMS` on the
 tag's GitHub release.
 

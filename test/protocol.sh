@@ -37,7 +37,9 @@ reply_has() {
 }
 
 # --- envelope and codes ----------------------------------------------------
-reply_has '{"cmd":"hello"}' 'r["protocol"] == 2 and r["features"] == ["alerts", "shutdown", "limits", "fonts"]' || fail "hello does not report protocol 2"
+reply_has '{"cmd":"hello"}' 'r["protocol"] == 2 and r["features"] == ["alerts", "shutdown", "limits", "fonts", "redraw_on_resize", "over", "pass", "play", "no_keys", "history", "colors", "passwords", "regex", "echo", "groups", "side", "lease", "marks", "respawn"]' || fail "hello does not report protocol 2"
+reply_has '{"cmd":"run","argv":["true"],"colors":{"fg":"#000000","bg":"white"}}' \
+    'r["code"] == "bad_request" and "colors.bg" in r["err"]' || fail "a color that is not #rrggbb was not refused"
 reply_has '{"cmd":"run","argv":["true"],"record":{"pathx":"/x"}}' \
     'r["code"] == "bad_request" and "record.pathx" in r["err"] and r["status"] is None' \
     || fail "an unknown nested field was not rejected by name"
@@ -108,6 +110,14 @@ set -e
 [ "$status" -eq 2 ] || fail "view --styles -f html exited $status, not 2"
 "$BIN" stop "$sty" >/dev/null
 
+# A program that ended on its alternate screen says so in its exit.
+full=$("$BIN" run sh -c 'printf "\033[?1049hFULL"; read x')
+"$BIN" wait "$full" --match FULL --timeout 2s >/dev/null
+"$BIN" key "$full" '<Enter>' >/dev/null
+"$BIN" wait "$full" --ended --timeout 3s >/dev/null
+reply_has "{\"cmd\":\"list\",\"sessions\":[\"$full\"]}" 'r["sessions"][0]["exit"]["alt_screen"] is True' \
+    || fail "the exit of a program that ended on its alternate screen does not say so"
+
 # Input to an ended session fails with code ended, and the CLI exits 4.
 "$BIN" stop pick-a pick-b >/dev/null
 reply_has '{"cmd":"input","session":"pick-a","steps":[{"keys":["x"]}]}' 'r["code"] == "ended" and r["done"] == 0 and r["status"]["state"] == "exited"' \
@@ -159,6 +169,10 @@ att pipelined "$sh_id"
 att detach "$sh_id"
 att sized "$sh_id"
 att preview "$sh_id" "$BIN"
+rd=$("$BIN" run sh -c 'printf "\033]11;rgb:12/34/56\033\\\\READY"; exec cat')
+"$BIN" wait "$rd" --match READY --timeout 2s >/dev/null
+att redraw "$rd" "$BIN"
+"$BIN" stop "$rd" >/dev/null
 reply_has "{\"cmd\":\"attach\",\"session\":\"$sh_id\",\"cols\":80,\"rows\":24}" 'r["code"] == "bad_request"' \
     || fail "a viewer's attach took a size"
 if "$BIN" png "$sh_id" "$dir/missing/shot.png" 2>"$dir/png.err"; then fail "png into a missing directory succeeded"; fi

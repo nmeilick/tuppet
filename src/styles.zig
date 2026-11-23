@@ -19,7 +19,7 @@ pub const Color = union(enum) {
     rgb: vt.color.RGB,
 
     fn of(c: vt.Style.Color) Color {
-        return switch (c) {
+        return switch (c.value()) {
             .none => .default,
             .palette => |i| .{ .palette = i },
             .rgb => |rgb| .{ .rgb = rgb },

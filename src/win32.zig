@@ -21,7 +21,6 @@ pub const LPDWORD = ?*DWORD;
 pub const PVOID = windows.PVOID;
 
 pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-pub const NULL_HANDLE: HANDLE = null;
 
 pub const GENERIC_READ: DWORD = 0x80000000;
 pub const GENERIC_WRITE: DWORD = 0x40000000;
@@ -227,7 +226,7 @@ pub extern "kernel32" fn CreateProcessW(
 pub extern "kernel32" fn CreateJobObjectW(
     lpJobAttributes: ?*SECURITY_ATTRIBUTES,
     lpName: ?LPCWSTR,
-) callconv(.winapi) HANDLE;
+) callconv(.winapi) ?HANDLE;
 
 pub extern "kernel32" fn SetInformationJobObject(
     hJob: HANDLE,
@@ -254,7 +253,7 @@ pub extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD
 
 pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
 
-pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?HANDLE;
 
 pub extern "kernel32" fn WriteFile(
     hFile: HANDLE,
@@ -419,11 +418,6 @@ pub fn utf8ToUtf16(buf: []u16, s: []const u8) ![]u16 {
     _ = MultiByteToWideChar(CP_UTF8, 0, s.ptr, @intCast(s.len), buf.ptr, n);
     buf[@intCast(n)] = 0;
     return buf[0..@intCast(n + 1)];
-}
-
-/// Handle error reporting for the daemon log.
-pub fn lastErrorName() []const u8 {
-    return @tagName(std.os.windows.unexpectedError(GetLastError()));
 }
 
 comptime {

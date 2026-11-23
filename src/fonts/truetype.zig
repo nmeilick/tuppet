@@ -244,7 +244,7 @@ pub const Face = struct {
                     FT_GlyphSlot_Oblique(slot);
                     // Slant about the middle of the em box rather than the
                     // baseline, so the glyph stays in its cell.
-                    const mid = @divFloor(c.FT_MulFix(h.*.ascender + h.*.descender, h.*.size.*.metrics.y_scale), 2);
+                    const mid = @divFloor(c.FT_MulFix(@as(c.FT_Long, h.*.ascender) + h.*.descender, h.*.size.*.metrics.y_scale), 2);
                     c.FT_Outline_Translate(outline, -c.FT_MulFix(@intCast(mid), oblique_shear), 0);
                 }
                 if (synthetic.bold) FT_GlyphSlot_Embolden(slot);
@@ -283,7 +283,8 @@ pub const Face = struct {
             else => return null,
         };
         const pitch: usize = @intCast(bm.pitch);
-        const max_value: u32 = if (depth == 8) @max(1, @min(255, @as(u32, bm.num_grays) -| 1)) else (@as(u32, 1) << depth) - 1;
+        const mask: u32 = (@as(u32, 1) << depth) - 1;
+        const max_value: u32 = if (depth == 8) @max(1, @min(255, @as(u32, bm.num_grays) -| 1)) else mask;
         const gx: i64 = if (box.centre) @divFloor(@as(i64, box.width) - bm.width, 2) else @divFloor(origin, 64) + slot.*.bitmap_left;
         const gy: i64 = box.baseline - @as(i64, slot.*.bitmap_top);
         const x0: i64 = @max(0, gx);
@@ -300,7 +301,7 @@ pub const Face = struct {
             const sx0: usize = @intCast(x0 - gx);
             for (data[y * w ..][0..w], sx0..) |*p, sx| {
                 const bit = sx * depth;
-                const v = (src[bit / 8] >> @intCast(8 - depth - bit % 8)) & max_value;
+                const v = (src[bit / 8] >> @intCast(8 - depth - bit % 8)) & mask;
                 p.* = @intCast(@min(255, v * 255 / max_value));
             }
         }

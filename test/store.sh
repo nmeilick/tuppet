@@ -121,6 +121,13 @@ grep -q "is damaged" "$dir/damaged.err" || fail "the error does not say the sess
 rm "$store/$boot/$rec/screen.vt"
 if "$BIN" view "$rec" 2>"$dir/noscreen.err"; then fail "a session without its screen was shown"; fi
 grep -q "is damaged: its saved screen is missing" "$dir/noscreen.err" || fail "a missing screen: $(cat "$dir/noscreen.err")"
+# One whose screen cannot be read for now is neither damaged nor missing.
+if [ "$(id -u)" != 0 ]; then
+    chmod 000 "$store/$boot/$first/screen.vt"
+    if "$BIN" view "$first" 2>"$dir/unreadable.err"; then fail "a session whose screen cannot be read was shown"; fi
+    grep -q "cannot be loaded from the session store now" "$dir/unreadable.err" || fail "an unreadable screen: $(cat "$dir/unreadable.err")"
+    chmod 600 "$store/$boot/$first/screen.vt"
+fi
 sed -i "s/\"id\":$next,/\"id\":$first,/" "$store/$boot/$next/session.json"
 echo garbage >"$store/$boot/$scrolled/session.json"
 daemon_gone || fail "the daemon did not exit"
@@ -157,6 +164,8 @@ hist=$("$BIN" run -- sh -c 'seq 1 100000; echo DONE; sleep 300')
 "$BIN" list -j "$hist" | grep -q '"history_trimmed":true' || fail "the session over the budget does not report its trimmed history"
 if "$BIN" run sleep 300 2>"$dir/budget.err"; then fail "a session whose screens do not fit the memory budget started"; fi
 grep -q "memory budget" "$dir/budget.err" || fail "the refusal does not name the memory budget"
+# A resize the budget refuses leaves a writer's size to go when it detaches.
+python3 "$(dirname "$0")/attach_check.py" "$sock" refused "$held" "$BIN" 1000x1000
 "$BIN" stop "$held" >/dev/null
 # Each fits once the session before it has saved its results.
 fits() {

@@ -15,6 +15,33 @@ Each message is one line of UTF-8 JSON ending in `\n`. A client connects, sends 
 and closes. `run` and `input` with `until` reply with a second line, and `attach` and `events` are the exceptions: after
 their reply the connection becomes a stream (see [Attach streams](#attach-streams) and [events](#events)).
 
+### Trust
+
+Every process that can reach the socket can do everything the protocol offers: it can open boxes over a session (see
+[Boxes](#boxes)) and type into them with `input`. Every session is told the socket's path in `TUPPET_SESSION_SOCKET`.
+
+A tool that shows boxes over a program it does not trust must therefore keep that program away from the socket, from
+the terminal device of the box, and from tuppet's state folder. It should attach with `tuppet attach --drawn
+--no-detach`, never open a box with `"grab":"now"` for something that program caused, and put no text from that program
+into the box's `title`.
+
+- **What a box guarantees,** in a drawn attach, against the program underneath: the program cannot paint inside the box
+  or on its border, cannot move or cover it, cannot give it a key, cannot take a key meant for it, and cannot learn what
+  was typed into it.
+- **What it does not guarantee.** The program can paint something on its own screen that looks like a box, a line, or a
+  receipt; keys typed into such a picture go to the program and answer nothing. It can ring the bell, raise
+  notifications, and replace the clipboard. It can choose which of the line's two places is used, by where it puts its
+  cursor.
+
+Accepted:
+
+- A program can show a picture of a box and then cause the real one, which appears at the same place. The line-first
+  arrival, the pause, and the dropped keys make the person see a change, and nothing more.
+- A key that the person had already decided to press for the program can land in a box 500 ms after it opened.
+- A terminal multiplexer on the far side of a slow link answers the cursor report itself, before the person's own
+  terminal has painted.
+- Until the parser runs in a process of its own, the program's output is read in the process that holds the keyboard.
+
 ## Sessions and ids
 
 All daemons of a user share one session store per machine and boot (see `tuppet help daemon`). Ids count up from 1 after
@@ -40,7 +67,10 @@ request applies to (`stop`: running ones; `remove`: ended ones), while an id or 
 state, and the result explains a mismatch.
 
 A daemon started without `--socket` exits after 30 seconds with no programs running, no open waits or event streams, and
-no clients (`TUPPET_IDLE_EXIT` in its environment changes that; Windows daemons do not exit when idle). Exiting closes
+no clients (`TUPPET_IDLE_EXIT` in its environment changes that; Windows daemons do not exit when idle). One started with
+`--socket` does not; `--idle-exit` makes either exit after a minute of the same. `--keep-fresh` makes a daemon refresh the
+modification times of its socket's folder, its socket, and the socket's lock file every hour, so that age-based cleaning
+of `/tmp` leaves a long-lived daemon alone. Exiting closes
 its listener, which resets any connection that was still waiting to be accepted; the daemon never read that request, so
 a client that gets a connection reset before any reply may send it again, to a new daemon. A daemon that is shutting
 down (see [shutdown](#shutdown)) fails every request but `hello` with `stopping`; a client waits until nothing answers
@@ -92,16 +122,16 @@ closes the connection.
 | `no_session` | No session has that id or name, or matches that pattern. |
 | `ambiguous` | A reference that must pick one session picked several; see `matches`. |
 | `elsewhere` | The id belongs to a session of another daemon's endpoint. |
-| `ended` | The session has ended, so it cannot take input, a resize, or a recording; also a lost session, which has no screen. |
+| `ended` | The session has ended, so it cannot take input, a resize, a recording, or a box over it; also a lost session, which has no screen. |
 | `running` | The session is still running, so it cannot be removed. |
 | `stale` | A seq older than the session (`since` below its `start_seq`), or an `after_input` that is not the latest input. |
 | `guard` | A guard of `input` or `resize` refused the request; nothing was typed or resized. `guard` names it. |
 | `stalled` | The program stopped reading its input for 5 seconds, or an input batch took longer than 5 seconds to write; part of the input may have been delivered. |
 | `busy` | The resource is in use: another input batch runs, another input is stalled, a recording is active (a second `record` start), the session has a writer. |
-| `limit` | A size or count limit: the request or reply size, the PNG render size, the number of attach streams, of waits and event streams, of a session's alerts, or of the references in `sessions`; or the daemon's memory budget, which the screens of a session that would start, grow, or load from the store do not fit (`err` gives the numbers). History never makes a session fail: it is trimmed instead (see `history_trimmed`). |
+| `limit` | A size or count limit: the request or reply size, the PNG render size, the number of attach streams, of waits and event streams, of a session's alerts or running boxes, or of the references in `sessions`; or the daemon's memory budget, which the screens of a session that would start, grow, or load from the store do not fit (`err` gives the numbers). History never makes a session fail: it is trimmed instead (see `history_trimmed`). |
 | `exists` | `run` or `rename`: a running session already has that name; `alert` add: the session has an alert of that name. |
 | `no_alert` | `alert` remove, or a `hit` condition of `wait`, `run`, `input`, or a recording's `until`: the session has no alert of that name. |
-| `unsupported` | Not possible here: the program's keyboard or mouse mode cannot express the key or event, attach and events on Windows, `hidden_input` on Windows. |
+| `unsupported` | Not possible here: the program's keyboard or mouse mode cannot express the key or event, attach and events on Windows, `hidden_input` on Windows, a [lease](#lease) anywhere but on Linux. |
 | `stopping` | The daemon is shutting down and takes no more work; only `hello` is still answered. |
 | `damaged` | The stored session cannot be loaded: its files hold what tuppet never writes, such as a size outside 1..1000. Its status's `damaged` says why; only `list`, `ack`, and `remove` work on it. |
 | `internal` | Anything else, such as a failed write to the pty or out of memory. |
@@ -120,6 +150,21 @@ ignore keep the number, and `hello` lists in `features` those a client may need 
 | `shutdown` | The [shutdown](#shutdown) request. |
 | `limits` | The memory budget (`limit` for screens that do not fit), the `damaged` code and status field, and `history_trimmed`. |
 | `fonts` | `fonts`, `bitmap`, and `font_size` in [png](#png). |
+| `redraw_on_resize` | `redraw_on_resize` in [attach](#attach-streams). |
+| `over` | `over` in [run](#run) (see [Boxes](#boxes)), `over` and `under` in the [status](#status), and the `under` and `over` fields of `changed` [events](#events). |
+| `pass` | Nothing in the protocol: the tuppet that runs this daemon has `--pass` for a drawn attach, which chooses what of the bell, notifications, clipboard writes, and links reaches the terminal. It sends no request of its own. |
+| `play` | `tuppet play` in the CLI of the same release. It runs in the client and sends only [resize](#resize) requests, for the session it plays in. |
+| `no_keys` | The tuppet of this daemon has `tuppet attach -r --no-keys`: a viewer that takes no key but the detach key and shows no keys. It sends the same `read` attach as `attach -r`; the feature changes nothing in the protocol. |
+| `history` | `history` and `history_from` in [attach](#attach-streams), `history` frames, and `row` in `screen` frames. |
+| `colors` | `colors` in [run](#run). |
+| `passwords` | `passwords` in [record](#record) `start` and in the `record` of [run](#run). |
+| `regex` | `regex` in [conditions](#conditions). |
+| `echo` | `typed` and `past_input_line` in [conditions](#conditions). |
+| `groups` | The member fields of [run](#run) (`group`, `label`, `accent`, `mark`, `meta`, `actions`), [update](#update), [flag](#flag), [action](#action), the member fields of the [status](#status), and the `group`, `label`, `meta`, `actions`, and `attention` fields of `changed` [events](#events) and `action` frames. The tuppet of this daemon has `tuppet attach --drawn --group`. |
+| `side` | `side_of` and `side_view` in [run](#run), the [side](#side) request, `side_of`, `side`, and `side_view` in the status, the `side` field of `changed` events, and `side-requested` and `side-view` frames. |
+| `lease` | `lease` in [run](#run) and the [lease](#lease) request. |
+| `marks` | Shell marks: `shell`, `prompt_seq`, `last_exit`, and `paste_mode` in the status, the `shell` field of `changed` events, `command-ended` frames, the [commands](#commands) request, and the `prompt` guard of [input](#input). |
+| `respawn` | The [respawn](#respawn) request. |
 
 A client checks `hello` before its first request and refuses a daemon that speaks another revision. The tuppet CLI
 then names both revisions: for an older tuppet daemon it says how to stop that daemon, and for a newer one it suggests
@@ -139,7 +184,9 @@ Every session has a status. `list` returns them, and every reply about one sessi
  "hidden_input":false,"sample_age_ms":0,"writer":{"label":"pts/3"},"viewers":1,"previews":0,"recording":null,"bell_count":2,
  "notification_count":1,"notification":{"title":"make","text":"build done","at_ms":1792517998035},"hit_seq":2,
  "hit_alerts":["error"],"alerts":["error"],"seen":{"seq":1100,"bell_count":1,"notification_count":0,"hit_seq":null,"ended":false,"at_ms":1792517958035},
- "out_bytes":48211,"draws":96,"full_clears":3,"history_trimmed":false,"damaged":null}
+ "out_bytes":48211,"draws":96,"full_clears":3,"history_trimmed":false,"damaged":null,"over":null,"under":[],
+ "group":null,"number":null,"label":null,"accent":false,"mark":null,"meta":[],"actions":[],"attention":null,"side_of":null,
+ "side_view":null,"side":null,"shell":"unknown","prompt_seq":0,"last_exit":null,"paste_mode":false}
 ```
 
 | Field | Meaning |
@@ -152,7 +199,7 @@ Every session has a status. `list` returns them, and every reply about one sessi
 | `argv` | The command line, as `run` received it. |
 | `cols`, `rows` | The terminal size. |
 | `started_ms`, `ended_ms` | Unix time in milliseconds; `ended_ms` is `null` until the session has ended. |
-| `exit` | How the program ended, once it has: `{"code":N,"signal":null,"stopped":false}` or `{"code":null,"signal":"SIGKILL","stopped":false}`. `stopped` is `true` when [stop](#stop) ended it (also through `remove` with `force`, `run` with `if_exists` `replace`, or a [shutdown](#shutdown)). `null` while it runs and when it was lost. |
+| `exit` | How the program ended, once it has: `{"code":N,"signal":null,"stopped":false,"alt_screen":false}` or `{"code":null,"signal":"SIGKILL","stopped":false,"alt_screen":false}`. `stopped` is `true` when [stop](#stop) ended it (also through `remove` with `force`, `run` with `if_exists` `replace`, or a [shutdown](#shutdown)). `alt_screen` is `true` when the program's alternate screen showed as it ended, so what it showed last did not stay on an attached terminal's normal screen; older daemons leave it out. `null` while it runs and when it was lost. |
 | `seq` | The seq of the latest visible change (see below); `null` for a lost session. |
 | `start_seq` | The seq the session started at. A seq below it is `stale` for this session. |
 | `end_seq` | The seq taken when the session ended; `null` until then. |
@@ -181,16 +228,30 @@ Every session has a status. `list` returns them, and every reply about one sessi
 | `out_bytes` | The bytes the program wrote to the pty. |
 | `draws` | The settles of the program's output that took a seq (see below): how often its output changed something visible. A frame that the program writes with a pause in the middle counts twice, so the number depends on timing. |
 | `full_clears` | How often the program erased the whole screen: ED 2 (`ESC[2J`), kitty's ED 22, and ED 0 (`ESC[J`) with the cursor at the top left cell. ED 3, which erases only the history, does not count. |
+| `over` | On a [box](#boxes), `{"id":N,"title":…,"backdrop":…,"grab":…,"shown":false,"held":false,"ended_by":null}`; `null` on other sessions. `id` is the session underneath, and `title`, `backdrop`, and `grab` are what `run` started the box with, the title cleaned and `null` when it gave none. The daemon sets `shown` when the box first has a viewer or a writer while it runs (a preview does not count), and `held` when it first has a writer, under the session's lock, so the attach reply shows them already. `ended_by` is `"unseen"` when the daemon stopped the box because its `unseen_ms` ran out, `"under"` when it stopped it because the session underneath ended, else `null`. |
+| `under` | The ids of the running boxes shown over this session, oldest first; `[]` without any. |
+| `group`, `number` | The group the session is a member of, and its number there (see [Groups](#groups)); `null` outside a group. |
+| `label`, `accent`, `mark` | What the caller gave for a drawn attach of the group to show: a label (at most 64 bytes), whether to show the name inverted, and a mark (at most 16 bytes); `null`, `false`, `null` without. |
+| `meta` | Values the caller keeps with the session, `[{"key":…,"value":…}, …]`; tuppet does not read them. |
+| `actions` | The keys a drawn attach's switcher offers for the session: `[{"key":"s","name":"share","confirm":false,"choices":["Once","Live"],"input":null}, …]` (see [update](#update)). |
+| `attention` | Why the caller flagged the session as needing attention ([flag](#flag)), or `null`. |
+| `side_of`, `side_view` | On a side session: the id of the session it is tied to, and its view, `compact`, `half`, or `full`; `null` on others. |
+| `side` | The id of the running side session tied to this one, or `null`. |
+| `shell` | What the shell's [marks](#shell-marks) say: `unknown` (no marks yet, or none since a command ended), `prompt` (at its primary prompt, after B and before C), or `running` (after C, before D or A); `null` once the session has ended. |
+| `prompt_seq` | Counts the primary prompts the marks reported (each B after a primary A or P); continuation prompts do not count. |
+| `last_exit` | The exit code of the last command the marks reported ended, or `null`. |
+| `paste_mode` | Whether the program has bracketed paste (mode 2004) on; `false` once the session has ended. |
 
-The title, the working directory, the counters, the latest notification, the hits, and `seen` stay once the session has
-ended, also across daemon restarts. `out_bytes`, `draws`, and `full_clears` are `null` for a lost session; events do not
+The title, the working directory, the counters, the latest notification, the hits, `seen`, and `over` stay once the
+session has ended, also across daemon restarts. `out_bytes`, `draws`, and `full_clears` are `null` for a lost session; events do not
 report their changes. Strings lose control characters (C0, C1, and bidirectional controls) and are cut at 256 bytes
 (the title and a notification's title), 1024 bytes (a notification's text), or 4096 bytes (the path), the program's
-name at 64.
+name and a box's title at 64.
 
 A session needs attention when its `bell_count`, `notification_count`, or `hit_seq` is above what `seen` holds, or it
 has ended (or was lost) and `seen.ended` is `false`; `tuppet list` marks such a session with `!`. A session whose
-`exit.stopped` is `true` has `seen.ended` `true` from its end on: whoever stopped it knows.
+`exit.stopped` is `true` has `seen.ended` `true` from its end on: whoever stopped it knows. So does a box, which needs
+nobody once it has ended.
 
 `foreground`, `tty`, `hidden_input`, and `sample_age_ms` are sampled from the pty while the program runs, and are
 `null` once it has ended and on Windows. A reply samples them anew; between replies the daemon samples right before
@@ -208,7 +269,7 @@ changed at its final `seq`.
 
 ### hello
 
-`{"cmd":"hello"}` → `{"ok":true,"version":"<release>","protocol":2,"features":["alerts","shutdown","limits","fonts"],"variant":"medium","boot":"<boot id>"}`
+`{"cmd":"hello"}` → `{"ok":true,"version":"<release>","protocol":2,"features":["alerts","shutdown","limits","fonts","redraw_on_resize","over","pass","play","no_keys","history","colors","passwords","regex","echo","groups","side","lease","marks","respawn"],"variant":"medium","boot":"<boot id>"}`
 
 `variant` names the build's built-in PNG fonts: `lean`, `medium`, or `full`.
 
@@ -236,15 +297,43 @@ to, as `hello` reports it.
 | `name` | A name for the session (see [Sessions and ids](#sessions-and-ids)); an empty name means none. Names are unique among the daemon's sessions: an ended or lost session that has the name is removed, as `remove` would, once the new program has started. |
 | `if_exists` | What happens when a running session has the name: `fail` (default) fails with `exists` and that session's status; `keep` starts nothing and replies with that session's status; `replace` stops that session, as `stop` does, and starts the new one. |
 | `scrollback` | History limit in bytes of the emulator's memory, at most 1 GiB. Default 8 MiB. |
-| `record` | `{"path":"/abs/file","format":"cast"}` starts a recording together with the program. `format` is `cast` (default) or `trace`; without `path` it goes into the session's store directory as `output.cast` or `output.trace` and is deleted with the session. The status's `recording` gives its path, also after the session has ended. |
+| `record` | `{"path":"/abs/file","format":"cast"}` starts a recording together with the program. `format` is `cast` (default) or `trace`; without `path` it goes into the session's store directory as `output.cast` or `output.trace` and is deleted with the session. `"passwords":true` records passwords as typed (see [record](#record)). The status's `recording` gives its path, also after the session has ended. |
 | `until`, `timeout_ms` | Wait for these [conditions](#conditions) too, as `wait` does; `timeout_ms` is required with `until`. Conditions cannot use `since` or a numbered `after_input`, since the session has no seqs yet. |
 | `alerts` | `[{"name":…,"match":…,"icase":false}, …]`: [alerts](#alerts-and-hits) that watch from the program's first byte, at most 32 (more fail with `limit`), with names unique among them. |
-| `like` | A reference to a session, running, ended, or lost, to start again: `argv`, `cwd`, `name`, `cols`, `rows`, `scrollback`, and `alerts` that the request leaves out come from it. Its environment and its hits do not: `env` applies as without `like`. A session that gives its name and has ended is replaced, as above. |
+| `like` | A reference to a session, running, ended, or lost, to start again: `argv`, `cwd`, `name`, `cols`, `rows`, `scrollback`, and `alerts` that the request leaves out come from it. Its environment and its hits do not: `env` applies as without `like`, and neither does a box's `over`. A session that gives its name and has ended is replaced, as above. |
+| `over` | Start the session as a [box](#boxes) over another one: `{"session":REF,"title":null,"backdrop":"frozen","grab":"pause","unseen_ms":null}`. Check for the `over` feature first: a daemon without it refuses the field. |
+| `colors` | `{"fg":"#rrggbb","bg":"#rrggbb"}`: the default colors the session's terminal reports to its program (OSC 10 and 11) instead of tuppet's own. Without it, a box takes those of the session it is over. `tuppet run -a --drawn` sends the colors of the terminal it runs in. Check for the `colors` feature first: a daemon without it refuses the field. |
+| `group` | Make the session a member of this group (a name, as session names are), with the lowest number no session of the group has, ended ones included. Check for the `groups` feature first. |
+| `label`, `accent`, `mark`, `meta`, `actions` | What a drawn attach of the group shows about the member, as [update](#update) sets them. |
+| `side_of` | A reference to a running session that this one is the side session of; `side_view` (`compact` when left out) is its first view. A session has one running side session at most: another fails with `exists`. A side session takes no `group` and no `over`, and is no side session's side session (`bad_request`); one tied to an ended session fails with `ended`. When the side session ends, the session it was tied to has none. Check for the `side` feature first. |
+| `lease` | `true`: after the reply the connection is the session's [lease](#lease). Not with `until` (`bad_request`); Linux only (`unsupported`). |
 
 With `until`, the reply is followed by a second line, the reply of a [wait](#wait) on the new session. The wait starts
 with the program's first byte, so text that the program printed and that scrolled away before the wait could start
 still counts. A `run` with `if_exists` `keep` waits on the session it kept instead, from the request on. If the wait
 fails, the session keeps running. When a validation error is found in `until`, nothing is started.
+
+#### Boxes
+
+A session that `run` starts with `over` is a box: an ordinary session in every respect, which a client that draws the
+session underneath in a drawn attach shows over it. The daemon keeps only the relation and what became of it; the
+client paints the box and hands the keyboard to it.
+
+| `over` field | Meaning |
+| --- | --- |
+| `session` | Required: the session underneath, a reference resolved as any other. One that picks none fails with `no_session`, several with `ambiguous`, an ended or lost session with `ended`, and a box with `bad_request`: no box is shown over a box. |
+| `title` | The text on the box's border, at most 64 bytes once control characters (C0, C1, and bidirectional controls) are removed and invalid UTF-8 replaced, cut at a character boundary. `null`, or nothing left, shows the box's name, or `#<id>` without one. |
+| `grab` | When the box takes the keyboard: `pause` (default) once the person pauses, `now` at once, `never` not at all, for a notice. |
+| `backdrop` | How the session underneath is shown while the box has the keyboard: `frozen` (left out: the default) or `live`. With `"grab":"never"` it is `null` or left out; `null` with another `grab` fails with `bad_request`. |
+| `unseen_ms` | 1..86400000: stop the box once it ran this long without being held (without being shown, with `"grab":"never"`); `null` waits as long as it takes. |
+
+A session has at most 16 running boxes; one more fails with `limit`. `over` takes no `if_exists` but `fail`
+(`bad_request`). `cols` and `rows` keep their defaults, and a box's relation is never copied by `like`.
+
+The daemon stops a session on its own, as [stop](#stop) does, in three cases only: a box when the session underneath
+ends, however it ends, a box whose `unseen_ms` ran out, and a session whose [lease](#lease) closed. The box's `over.ended_by` says which.
+This follows from how the box was started, not from its status: `over` describes only the showing, and a client must
+not conclude from it that a session will be stopped or removed.
 
 ### list
 
@@ -357,8 +446,11 @@ A condition is an object; the fields that are set must all hold:
 | --- | --- |
 | `match` | This text is on a line of the screen. At most 4 KiB, without `\n` or `\r`. |
 | `icase` | With `match`: ASCII letters match regardless of case. |
+| `regex` | `true`, with `match`: the text is a regular expression of at most 256 bytes, matched on each line. It knows `.` (any character), `[...]` and `[^...]` with ranges, `\d \w \s \D \W \S \t`, `*` `+` `?` `{n}` `{n,}` `{n,m}` (m at most 32), `|`, `( )`, and `^` and `$` for the ends of the line; a `\` before one of `\ . ^ $ | ? * + ( ) [ ] { } /` stands for that character. A match is the leftmost and then longest; occurrences are counted without overlap. A regex looks at the first 4 KiB of each line, and searches at most 256 KiB in one check, so a pattern that searches far past its matches cannot stall the session's waits. A pattern that can match empty text, or one too large, fails with `bad_request`. |
+| `typed` | With `match` and `after_input`: the text the input typed, whose echo does not count. Copies of it on the line the cursor was on at the input are left out of that line before matching (a regex match that overlaps one is left out); when `match` is a part of the typed text, copies of it on every line are. Without a snapshot of the input's screen (another input came, or it was cut), the lines whose text changed after the input stand for the input's line. At most 4 KiB, without `\n` or `\r`. |
 | `idle_ms` | The screen's text has not changed for this many milliseconds, counted from its last text change (`status.idle_ms`); colors, styles, and the cursor do not count. |
 | `settled_ms` | The screen changed after the start, its text or a style (the start: `since`, the input with `after_input`, else the wait's start), and then its text did not change for this many milliseconds, counted from the wait's start at the earliest, while no output waits on the pty to be read and settled and no synchronized-output frame is held back. Use it instead of `idle_ms` after an input or a resize, where `idle_ms` can hold before the program reacted. On Windows, output still waiting on the pty is not seen. |
+| `past_input_line` | `true`, with `settled_ms` and `after_input`: the change must be to the text of a line other than the one the cursor was on at the input, so the input's echo alone is no change. When the snapshot does not know that line (another input came, or a resize lost it), any text change counts. |
 | `absent` | `true`, with `match`: the text was on a line of the screen when the wait started, or came on one later, and is now on none of the screen's lines. Text that scrolled into the history is gone; text that never came never meets it. `icase` applies. It takes no `since` or `after_input` (`bad_request`). |
 | `ended` | `true`: the program has ended. |
 | `hidden_input` | `true`: the terminal reads input a line at a time without echo (`status.hidden_input`). Not on Windows, where it fails with `unsupported`. |
@@ -495,11 +587,13 @@ exactly one of these fields:
 A `text` or `paste` step with `"secret":true` is kept out of recordings: a trace shows `{"ev":"in","kind":"secret"}`
 and a cast a marker event, `secret input`, instead of the text. So is every text, paste, or key, from a batch or an
 attached writer, that the program reads while it hides its input (`hidden_input`), such as a password typed by hand.
+`hidden_input` is sampled from the session's own pty, so a password a remote host asks for through ssh is not hidden
+there and is recorded as typed. A recording with `"passwords":true` records all of these as typed, with no marker.
 Texts must not be empty.
 
 | Mouse field | Values |
 | --- | --- |
-| `button` | `left`, `right`, `middle`, `up`, `down`, `none` (motion only), or `1`..`9` |
+| `button` | `left`, `right`, `middle`, `up`, `down`, `none` (motion only), or `1`..`9` as X11 numbers them (`2` is middle, `3` right, `4` to `7` the wheel) |
 | `action` | `press` (default), `release`, `motion` |
 | `mods` | Modifier letters in any order, each at most once: `c` (Ctrl), `a` or `m` (Alt), `s` (Shift) |
 | `x`, `y` | Zero-based cells inside the grid; checked before the first byte and again when the step runs (`bad_request`) |
@@ -514,6 +608,7 @@ whole batch with code `guard`, a `guard` field that names it, and the session's 
 | `"hidden_input":true` | The terminal reads input without echo, as a password prompt does (`status.hidden_input`). Not on Windows, where it fails with `unsupported`. |
 | `"hit_seq":N` | The latest hit is the one numbered N. |
 | `"reply_to":N` | Hit N is not answered: no input came after it (an input at or after its `seq`), and the log still keeps it. |
+| `"prompt":SEQ` | The shell waits at its primary prompt with this `prompt_seq` (see [Shell marks](#shell-marks)), nothing was written to the session since that prompt's B (the `input_seq` then is still the latest), the session is on its normal screen, and the program has bracketed paste on. The batch must be one `paste` step of one line of printable characters (no C0, C1, or bidirectional controls), at most 4 KiB, which is then written in brackets; anything else is refused by this guard too. `err` says which condition failed. Output on its way from a remote host when the check runs is not covered; no Enter follows. |
 
 One batch runs per session at a time: another fails at once with `busy`, and nothing of it is written. A batch must be
 written within 5 seconds, counting the wait for another input to finish but not its pauses; past that it fails with
@@ -563,6 +658,7 @@ Start, mark, or stop a recording. A request has exactly one of `start`, `mark`, 
 | `start.path` | Absolute path of the file. Without it the recording goes into the session's store directory as `record-N.cast` or `record-N.trace`, and is deleted with the session. |
 | `start.format` | Required: `cast` (asciicast v2) or `trace` (JSONL). |
 | `start.input` | A cast records input events too; a trace always does. |
+| `start.passwords` | `true` records secret text and hidden input as typed instead of a marker; default `false`. |
 | `start.until` | [Conditions](#conditions), as `wait` takes them: the recording stops once one holds, with reason `met`. They are checked the way a wait checks them, and a stale `since` or `after_input` fails the start with `stale`. |
 | `start.max_ms` | 1..86400000: the recording stops this many milliseconds after its start, with reason `max_ms`. |
 | `mark` | A label: append a marker to the active recording. |
@@ -670,6 +766,110 @@ value. Two clients that ack what they each showed therefore never undo each othe
 match. The results are those of [stop](#stop), with each session's status after the ack. A change of `seen` is an
 event (`seen`, below).
 
+### update
+
+`{"cmd":"update","session":"db07","label":"db07 prod","accent":true,"mark":"◉","group":"w","meta":[{"key":"route","value":"dmz"}],"actions":[{"key":"s","name":"share","choices":["Once","Live","Stop"]}]}`
+→ `{"ok":true,"status":{…}}`
+
+This changes what the caller says about a session as a member of a [group](#groups), running or ended. A field left out
+stays as it is; an empty `label` or `mark` takes it away. The daemon only keeps and reports these, and acts on none.
+
+| Field | Meaning |
+| --- | --- |
+| `group` | Move the session into this group, where it gets the lowest number no session of it has; `""` takes it out of its group. A side session takes no group (`bad_request`). |
+| `label` | Shown next to the name, at most 64 bytes once control characters are removed. |
+| `accent` | `true`: show the name inverted at the bar's left end. |
+| `mark` | A short mark next to the member, at most 16 bytes. |
+| `meta` | Sets these keys (names as session names are); an empty `value` takes a key away. Values are at most 256 bytes; a session keeps at most 16. |
+| `actions` | Replaces the actions, at most 16: `key` is one printable ASCII character other than a digit, `/`, `\`, `d`, `f`, or `h`, which the switcher keeps, and each key comes once; `name` 1 to 32 bytes; `confirm` `true` asks for a second press while the session's program runs; `choices` (at most 8, each 1 to 32 bytes) makes the switcher ask for one of them; `input` (a hint, at most 64 bytes) makes it ask for a line of text. `choices` and `input` do not go together. |
+
+A program in a session can update its own session with its `TUPPET_SESSION` and `TUPPET_SESSION_SOCKET`.
+
+### flag
+
+`{"cmd":"flag","session":"db07","attention":"login?"}` or `{"cmd":"flag","session":"db07","clear":true}` →
+`{"ok":true,"status":{…}}`
+
+Flag the session as needing attention, with a text of at most 256 bytes, or take the flag away. It shows as the status's
+`attention`, and a drawn attach of the group clears it when the member comes to the front.
+
+### side
+
+`{"cmd":"side","session":"pair-db07","view":"compact"}` or `{"cmd":"side","session":"db07","request":true}` →
+`{"ok":true,"status":{…}}`
+
+With `view` (`compact`, `half`, or `full`), set the view of a side session: `session` is the side session, or the
+session it is tied to; one without a running side session fails with `bad_request`. The reply carries the side
+session's status, and events get a `side-view` frame. With `request`, report `side-requested` about a session that has
+no side session and is none; a session that has or is one fails with `bad_request`. Give one of them.
+
+### action
+
+`{"cmd":"action","session":"db07","key":"s","value":"Live"}` → `{"ok":true,"status":{…}}`
+
+Report that the person chose the action `key` (one printable ASCII character) of the session, with `value` (at most 256
+bytes of UTF-8 without control characters) or without. Events get an `action` frame; the daemon does nothing else. A drawn
+attach of a group sends it from its switcher, and for `r` on an ended member in front.
+
+### lease
+
+`{"cmd":"lease","session":"agent-1"}` → `{"ok":true,"status":{…}}`, then nothing more.
+
+After the reply the connection is the session's lease: once its client closes it (a full hang-up), the daemon stops the
+session as [stop](#stop) does. When the session ends first, the daemon closes the connection, so the client reads its end.
+Leases are kept by the daemon's hang-up watcher and hold none of the request slots or the 256 places of waits and event
+streams. A session that has ended fails with `ended`. Linux only: elsewhere it fails with `unsupported`. `run` with
+`"lease":true` does the same for the session it starts.
+
+### respawn
+
+`{"cmd":"respawn","session":"db07","env":["PATH=/usr/bin:/bin","SSH_AUTH_SOCK=/tmp/ssh-x/agent.1"]}` →
+`{"ok":true,"status":{…},"boot":"<boot id>"}`
+
+Start the command of an ended session again, in a new session that takes its place: its terminal starts with the old
+session's screen and history, and it gets the old session's name, directory, size, history limit, alerts, colors, and
+what the caller said about it (group, number, label, accent, mark, meta, actions, side view); the running side session
+tied to the old session is tied to the new one. The old session is removed, so events get `started` for the new id, then
+`removed` for the old. The environment is exactly `env` (`NAME=value` entries) plus the session's own variables, as
+`run` sets them; nothing comes from the daemon's environment, so `argv[0]` is found through the `PATH` in `env`. A
+running session fails with `running`.
+
+### commands
+
+`{"cmd":"commands","session":"db07","last":5}` →
+
+```json
+{"ok":true,"commands":[{"n":12,"command":"systemctl reload nginx","output":"nginx: [emerg] unknown directive","output_cut":false,"exit":1,"started_ms":1795302358946,"ended_ms":1795302359012}],"status":{…}}
+```
+
+The last `last` (1 to 50, all by default) commands that the session's [shell marks](#shell-marks) reported, oldest first.
+`command` is the text from B to C (up to 4 KiB), `output` the text from C to D (its last 64 KiB, read from at most the
+4096 rows before D; `output_cut` says when it was cut), `exit` the code D carried (`null` without one). A session keeps
+its last 50 while it is in memory; one restored from the store has none.
+
+### Groups
+
+A group is the sessions whose status has its name in `group`; side sessions and boxes are no members. The daemon gives
+each member a number, the lowest from 0 that no session of the group has, ended ones included, and keeps it while the
+session is in the group. It keeps the label, accent, mark, meta values, actions, attention flag, and side relation with
+the session, in the store too, and reports them; it acts on none of them. `tuppet attach --drawn --group NAME` shows a
+group: it follows the events stream for every session, attaches to the member in front as the writer (a `read` attach
+while another client writes to it), opens `preview` attaches while its switcher is open, sizes members and the side
+session with [resize](#resize) requests only, and sends [flag](#flag) `clear`, [side](#side), [action](#action), and
+[remove](#remove) (for an ended member that the person closes). It needs the `groups` and `side` features. A group has
+no title on the wire: `--title` is the attach's own, shown in its switcher's frame, and `--quiet-detach` drops the line
+it prints on detach.
+
+### Shell marks
+
+The daemon's terminal follows OSC 133 marks as the program prints them: A (or N, or P with a prompt kind) starts a
+prompt, `k=i` or no kind a primary one, `k=c`, `k=s`, or `k=r` another; B ends it and input starts; C starts a command's
+output; D, with `;CODE`, ends the command. A B of a primary prompt makes `shell` `prompt`, counts `prompt_seq` up, and
+notes where input starts and the session's `input_seq`; a C after it makes `shell` `running` and takes the command line;
+a D after that, or a new prompt without one, ends the command, sets `last_exit`, and sends `command-ended`. Anything else
+leaves `shell` `unknown`. The daemon checks nothing about who printed a mark: output such as `cat` of a file can print
+one. A shell redraws its prompt on a resize, which may count `prompt_seq` up; a caller reads it again and tries once more.
+
 ### events
 
 `{"cmd":"events","sessions":["build","ci-*"],"idle_ms":30000}` → `{"ok":true,"boot":"<boot id>"}`, then frames.
@@ -698,18 +898,22 @@ and every frame about a session carries its `id` and its `status`, taken when th
 | `removed` | The session was removed; `status` is `null`. |
 | `renamed` | The session has another name and still matches. |
 | `left` | The session was renamed and no longer matches; no more frames come about it. |
-| `changed` | `fields` names what changed: `seq` (anything visible), `input` (an input), `title`, `cwd`, `foreground`, `tty` (and with it `hidden_input`), `writer`, `viewers`, `bell` (`bell_count`), `notification`, `size`. |
+| `changed` | `fields` names what changed: `seq` (anything visible), `input` (an input), `title`, `cwd`, `foreground`, `tty` (and with it `hidden_input`), `writer`, `viewers`, `bell` (`bell_count`), `notification`, `size`, `under` (a box over the session started or ended), `over` (the `shown`, `held`, or `ended_by` of a box), `group` (`group` or `number`), `label` (`label`, `accent`, or `mark`), `meta`, `actions`, `attention`, `side` (`side_of` or `side`), `shell` (`shell`, `prompt_seq`, `last_exit`, or `paste_mode`). |
 | `seen` | An [ack](#ack) moved `seen`. |
 | `hit` | An [alert hit](#alerts-and-hits): `{"type":"hit","id":3,"hit":{…},"status":{…}}`. One the log dropped before the frame was sent is left out. |
 | `idle`, `active` | With `idle_ms`: the screen's text has not changed for that long, and it changed again. |
+| `side-requested` | Someone asked for a side session of this one ([side](#side) with `request`, as a drawn attach's side key does). |
+| `side-view` | A side session's view changed: `{"type":"side-view","id":N,"view":"half","status":{…}}`. |
+| `action` | The person chose an action of this session in a drawn attach's switcher ([action](#action)): `{"type":"action","id":N,"key":"s","value":"Live","status":{…}}`, `value` `null` for an action without a choice or text. |
+| `command-ended` | The shell's marks reported that a command ended: `{"type":"command-ended","id":N,"code":1,"status":{…}}`, `code` `null` when D carried none or a new prompt came without D. |
 | `resync` | The client fell too far behind and missed frames: the stream starts over with a `snapshot` frame for each session that matches, and `synced`. |
 | `end` | `{"type":"end","reason":"too_slow"}`: the client took nothing for 30 seconds; `"shutdown"`: the daemon is stopping (see [shutdown](#shutdown)). The daemon closes the connection after it. |
 
 Clients ignore frame types they do not know.
 
 Frames about one session come at most ten times a second: changes that happen meanwhile are merged into one `changed`
-frame, and `idle` and `active` take their turn too. `started`, `ended`, `removed`, `renamed`, `left`, `seen`, and `hit`
-frames are never held back, and changes still pending for the session are sent right before them. Sessions with a running
+frame, and `idle` and `active` take their turn too. `started`, `ended`, `removed`, `renamed`, `left`, `seen`, `hit`, `side-requested`,
+`side-view`, `action`, and `command-ended` frames are never held back, and changes still pending for the session are sent right before them. Sessions with a running
 program have their pty sampled every 250 ms while any stream is open, so `foreground` and `tty` changes show without
 other output.
 
@@ -770,9 +974,32 @@ A hit:
 - A session has any number of viewers and at most one writer. A second write attach fails with `busy` unless `force` is
   `true`. In that case the previous writer receives `{"writer":"taken"}` and continues as a viewer.
 - A writer may send a `label`, at most 64 bytes (control characters are removed), which its status shows as
-  `writer.label`.
+  `writer.label`. `tuppet attach` sends its terminal's name, such as `pts/3`, or what `--label` gives, in the raw and
+  the drawn attach alike.
 - A writer may send its terminal size as `cols` and `rows` (both, 1..1000). The session is resized to it, as by a
   `resize` frame, before the first `screen` frame, so that redraw already has the size the client shows it at.
+- `redraw_on_resize` (default `false`) is for a client that keeps its own copy of the screen, fed by the `screen` and
+  `out` frames. Its copy has no history to reflow, so after every `resize` frame, whoever resized the session (this
+  client, another one, a `resize` request, or a writer leaving), the stream gets one `screen` frame of the session at
+  its new size. Its `screen` frames also carry what such a copy needs beyond what a terminal shows: the default
+  foreground and background colors (OSC 10 and OSC 11 when the program set them, OSC 110 and OSC 111 when it did not,
+  as a reset leaves them alone) and, when the program chose one, the cursor's shape and blink (DECSCUSR). Check for the
+  `redraw_on_resize` feature first: a daemon without it refuses the field.
+- `history` (0 to 100000, default 0) asks for the last that many rows of the history above the primary screen (the
+  alternate screen has none), sent in `history` frames between the reply and the first `screen` frame. With
+  `history_from` (0 or more, only with a `history` of 1 or more) it sends only rows numbered `history_from` or higher,
+  and of those the last `history`. A client that fell behind or attaches again asks with the `row` of the last `screen`
+  frame it had, plus the rows it saw scroll since. At most 16 MiB of VT bytes come in all; past that the oldest rows
+  asked for are left out. Check for the `history` feature first: a daemon without it refuses the fields.
+
+Rows are numbered from the start of the session: the primary screen's top row has the number of rows that went into
+its history so far (a restored session counts the history it came back with). A history row keeps its number while
+history drops older rows, to its limit or an erase (ED 3). A resize keeps the number of the top row: the rows it moves
+into history, or that stay there, are numbered anew below it; rows that would be numbered below 0 have no number and come
+first, in `history` frames without `row` (`history_from` leaves them out). Where the numbering cannot follow the rows (a full reset,
+a flood that scrolled past the history unseen, a resize that pulled rows out of history, a restored session), rows then
+in history, and rows a resize pulled out of it, may get the number of a row a client already had: `history_from`
+leaves them out, so a client gets fewer rows rather than a row twice.
 
 The reply is one line, `{"ok":true,"status":{…}}` with the attach counted, or a failure. After a successful reply, the
 connection carries JSON lines in both directions until either side closes it.
@@ -781,16 +1008,18 @@ connection carries JSON lines in both directions until either side closes it.
 
 | Frame | Meaning |
 | --- | --- |
-| `{"screen":"<base64>"}` | Sent first, and again after `{"writer":"taken"}`, `{"hold":false}`, and, to the writer, after a `resize` frame of its that changed the size: a full redraw of the current screen as VT bytes. It starts with a terminal reset (`ESC c`), then sets the palette, modes, screen content, and cursor. The daemon takes it under the same lock as the subscription, so the following `out` frames continue exactly where it ends. |
+| `{"history":"<base64>","row":X,"rows":N}` | With `history` in the request, right after the reply: VT bytes for the N history rows numbered from X on (without `row` for rows that have no number, see above), oldest first, in as many frames as it takes for no line to exceed 256 KiB (split between rows). Each row is its cells as text, with SGR, OSC 8 links, cursor-forward over empty cells (CUF), and erase-character (ECH) for cells with only a background, as `view --format vt` writes them, followed by CR LF; a row that the session wrapped into the next one has nothing after it, so a terminal of the session's width wraps it there itself (when the row cannot end in its last column, it ends with CR LF too). The newest row may wrap into the screen's top row; then the bytes end without CR LF. The bytes of all `history` frames together, written to a terminal of the session's width with the cursor at the start of a line, give the rows in order. A row too long for a frame with its styles comes as plain text. |
+| `{"screen":"<base64>","row":T,"wrapped":[Y,…],"continued":true}` | Sent first (after any `history` frames), and again after `{"writer":"taken"}`, `{"hold":false}`, and, to the writer, after a `resize` frame of its that changed the size (with `redraw_on_resize`, after every `resize` frame instead): a full redraw of the current screen as VT bytes. It starts with a terminal reset (`ESC c`), then sets the palette, modes, screen content, and cursor. The daemon takes it under the same lock as the subscription, so the following `out` frames continue exactly where it ends. `row` is the number of the primary screen's top row when the frame was taken, also while the alternate screen shows (see `history` above); daemons without the `history` feature leave it out. With `redraw_on_resize`, `wrapped` lists the screen rows (from 0) that the session wrapped into the next one, which the redraw ends like any other row; it is left out when there are none, and by daemons without the `history` feature. `continued` says that the screen's top row continues the row above it, in the history; it is left out otherwise. |
 | `{"out":"<base64>"}` | Raw pty output, as it arrives. |
-| `{"resize":{"cols":C,"rows":R,"seq":N}}` | The session's size changed; `seq` is the seq of the resize's reflow, as `resize_seq` in a [resize](#resize) reply. It comes after the reflow took its seq and before the output the program writes for the new size. A writer whose `resize` frame asked for the size the session has already gets this frame alone, with `"seq":null`. |
+| `{"resize":{"cols":C,"rows":R,"seq":N}}` | The session's size changed; `seq` is the seq of the resize's reflow, as `resize_seq` in a [resize](#resize) reply. It comes after the reflow took its seq and before the output the program writes for the new size. A writer whose `resize` frame asked for the size the session has already gets this frame alone, with `"seq":null` (with `redraw_on_resize`, a `screen` frame follows it). |
 | `{"writer":"taken"}` | A forced attach took the writer role; this client is now read-only. A `screen` frame follows, so a client that showed a notice over the screen can draw it afresh. |
 | `{"hold":true}`, `{"hold":false}` | The writer's input waits for an input batch, and then went through (see below). A `screen` frame follows `{"hold":false}`. |
-| `{"exit":{"code":N,"signal":null,"stopped":false},"status":{…}}` | The program ended (`{"code":null,"signal":"SIGKILL",…}` when killed), as `status.exit` describes it; `status` is the session's final status. An `end` frame follows. |
+| `{"exit":{"code":N,"signal":null,"stopped":false,"alt_screen":false},"status":{…}}` | The program ended (`{"code":null,"signal":"SIGKILL",…}` when killed), as `status.exit` describes it; `status` is the session's final status. An `end` frame follows. |
 | `{"error":{"code":"bad_request","err":"…"}}` | A client frame was rejected (codes as in failed replies). The stream continues, except after a frame longer than the 1 MiB line limit (`limit`), after which the daemon closes it. |
-| `{"end":{"reason":"…"}}` | The last frame: `exited` (after `exit`), `detach` (the client asked), `too_slow` (this client fell more than 4 MiB behind, or more than its share of 64 MiB while all clients together are that far behind), or `shutdown` (the daemon is stopping, on a [shutdown](#shutdown) request or on SIGTERM or SIGINT; it stops the session too). |
+| `{"end":{"reason":"…"}}` | The last frame: `exited` (after `exit`), `detach` (the client asked), `too_slow` (this client fell more than 4 MiB behind, not counting the reply and the first `history` and `screen` frames, or more than its share of 64 MiB while all clients together are that far behind), or `shutdown` (the daemon is stopping, on a [shutdown](#shutdown) request or on SIGTERM or SIGINT; it stops the session too). |
 
-Attaching to a session that has ended already gives the reply, the `screen`, the `exit` frame, and `end`.
+Attaching to a session that has ended already gives the reply, any `history` frames, the `screen`, the `exit` frame,
+and `end`.
 
 ### Client to daemon (writer only)
 

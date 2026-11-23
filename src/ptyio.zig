@@ -18,6 +18,9 @@ const evaluator = @import("evaluator.zig");
 const sample = @import("sample.zig");
 const status = @import("status.zig");
 const events = @import("events.zig");
+const over = @import("over.zig");
+const hangup = @import("hangup.zig");
+const member = @import("member.zig");
 const win32 = if (builtin.os.tag == .windows) @import("win32.zig") else @import("win32_stub.zig");
 
 const Session = session_mod.Session;
@@ -70,11 +73,18 @@ pub fn readerLoop(s: *Session) void {
     // the child still runs (it closed its stdio), this waits for it.
     if (s.waiter) |waiter| waiter.join();
     s.waiter = null;
-    if (s.stopped.load(.acquire)) s.markStopSeen();
+    if (s.stopped.load(.acquire) or s.over != null) s.markEndSeen();
     s.ended_ms.store(store.nowMillis(), .release);
     s.end_seq.store(s.track.counter.next(), .release);
+    {
+        const io = io_mod.io();
+        s.terminal_mutex.lockUncancelable(io);
+        defer s.terminal_mutex.unlock(io);
+        s.ended_alt.store(s.terminal.screens.active_key == .alternate, .release);
+    }
     s.state.store(.exited, .release);
     s.track.notify();
+    over.ended(s);
     releasePty(s);
     {
         // Attached clients get the exit event and the final status, then
@@ -94,6 +104,8 @@ pub fn readerLoop(s: *Session) void {
     record.stopRecording(s, .ended);
     s.persist();
     events.publish(s.id, .ended, .{});
+    hangup.endLeases(s.id);
+    member.ended(s);
     // After the ended event: a daemon that shuts down once its sessions
     // settled still tells its event streams.
     s.settled.store(true, .release);
@@ -327,7 +339,7 @@ fn writePty(s: *Session, data: []const u8, input: ?trace_mod.Input) !void {
             markInput(s);
             // Recorded under the lock, so an input that has to wait for a
             // batch is recorded once, when it is written.
-            record.recordInput(s, event);
+            record.recordInput(s, event, false);
         }
         writeLocked(s, data, null) catch |err| {
             if (input != null) record.recordMark(s, "input not delivered") catch {};
@@ -392,15 +404,22 @@ pub fn settleOutput(s: *Session) void {
 /// child wrote so far; null once the pty is closed, or when the reader is
 /// still in the middle of a read at `deadline`.
 fn pendingOutputEnd(s: *Session, deadline: i64) ?u64 {
-    const master = s.pty.posix.master;
-    if (master < 0) return null;
+    const io = io_mod.io();
     const t = &s.track;
     while (true) {
         // During a read, the bytes it took are neither pending nor counted.
         const reads = t.reads.load(.seq_cst);
         if (reads % 2 == 0) {
             const read = t.read_bytes.load(.seq_cst);
-            const pending = pty_mod.pendingOutput(master);
+            const pending = blk: {
+                // Keeps the pty open, so its descriptor is not reused
+                // meanwhile.
+                s.terminal_mutex.lockUncancelable(io);
+                defer s.terminal_mutex.unlock(io);
+                const master = s.pty.posix.master;
+                if (master < 0) return null;
+                break :blk pty_mod.pendingOutput(master);
+            };
             if (t.reads.load(.seq_cst) == reads) return read + pending;
         }
         if (io_mod.nowNanos() >= deadline) return null;
@@ -567,6 +586,9 @@ pub const Handler = struct {
     /// Erases of the whole screen: ED 2, kitty's ED 22, and ED 0 with the
     /// cursor at the top left cell. ED 3 erases only the history.
     full_clears: u64 = 0,
+    /// The session whose program writes the output, which follows its
+    /// shell marks; null for a screen restored from the store.
+    session: ?*Session = null,
 
     pub fn vt(self: *Handler, comptime action: Action.Tag, value: Action.Value(action)) void {
         switch (action) {
@@ -578,6 +600,9 @@ pub const Handler = struct {
             else => {},
         }
         self.inner.vt(action, value);
+        if (action == .semantic_prompt) if (self.session) |s| {
+            if (s.marks.take(s.gpa, &s.terminal, value, s.track.input_seq.load(.acquire))) |ended| events.publishCommandEnded(s.id, ended.code);
+        };
     }
 
     pub fn deinit(self: *Handler) void {
@@ -698,9 +723,7 @@ test "OSC 4/10/11 color queries are answered" {
 
     var term = try vt.Terminal.init((vt.TinyIo.init).io(), alloc, .{ .cols = 80, .rows = 24 });
     defer term.deinit(alloc);
-    // Mirrors Session.start: ghostty's default theme colors.
-    term.colors.foreground.set(.{ .r = 0xdc, .g = 0xd7, .b = 0xba });
-    term.colors.background.set(.{ .r = 0x1f, .g = 0x1f, .b = 0x28 });
+    session_mod.setDefaultColors(&term);
 
     var handler = term.vtHandler();
     handler.effects = .readonly;
@@ -715,6 +738,15 @@ test "OSC 4/10/11 color queries are answered" {
     // Foreground/background report the configured defaults (16-bit rgb).
     try std.testing.expect(std.mem.indexOf(u8, test_resp.items, "\x1b]10;rgb:dcdc/d7d7/baba") != null);
     try std.testing.expect(std.mem.indexOf(u8, test_resp.items, "\x1b]11;rgb:1f1f/1f1f/2828") != null);
+
+    // Only a color the program set is an override; its reset brings
+    // tuppet's back.
+    try std.testing.expect(term.colors.background.override == null);
+    stream.nextSlice("\x1b]11;rgb:10/20/30\x1b\\");
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x10, .g = 0x20, .b = 0x30 }, term.colors.background.override.?);
+    stream.nextSlice("\x1b]111\x1b\\");
+    try std.testing.expect(term.colors.background.override == null);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x1f, .g = 0x1f, .b = 0x28 }, term.colors.background.get().?);
 }
 
 test "OSC 52 clipboard policy: writes dropped, reads never answered" {

@@ -44,7 +44,8 @@ fn optionsFromTerminal(t: *const vt.Terminal, cols: u16, rows: u16) mouse_encode
 }
 
 /// Parse a button name ("left", "right", "middle", "up", "down", or
-/// "1".."9") into the button enum. Wheel buttons map to four/five.
+/// "1".."9" as X11 numbers them: 2 is middle, 3 right) into the button
+/// enum. Wheel buttons map to four/five.
 pub fn parseButton(name: []const u8) ?mouse.Button {
     const Buttons = std.StaticStringMap(mouse.Button).initComptime(.{
         .{ "left", .left },
@@ -53,8 +54,8 @@ pub fn parseButton(name: []const u8) ?mouse.Button {
         .{ "up", .four },
         .{ "down", .five },
         .{ "1", .left },
-        .{ "2", .right },
-        .{ "3", .middle },
+        .{ "2", .middle },
+        .{ "3", .right },
         .{ "4", .four },
         .{ "5", .five },
         .{ "6", .six },
@@ -124,8 +125,17 @@ pub fn parseEvent(button_name: []const u8, action_name: []const u8, mods_spec: [
         return .{ .button = null, .action = action, .mods = mods };
     }
     const button = parseButton(button_name) orelse return error.InvalidButton;
-    if ((button == .four or button == .five) and action == .release) return error.WheelHasNoRelease;
+    if (isWheel(button) and action == .release) return error.WheelHasNoRelease;
     return .{ .button = button, .action = action, .mods = mods };
+}
+
+/// Whether `button` is the wheel, up and down (4, 5) or left and right (6,
+/// 7), which only presses.
+pub fn isWheel(button: mouse.Button) bool {
+    return switch (button) {
+        .four, .five, .six, .seven => true,
+        else => false,
+    };
 }
 
 pub fn eventErrorText(err: EventError) []const u8 {
@@ -134,7 +144,7 @@ pub fn eventErrorText(err: EventError) []const u8 {
         error.InvalidAction => "invalid action (choose press, release, or motion)",
         error.InvalidMods => "invalid modifiers (use each of c, a or m, and s at most once)",
         error.NoButtonNeedsMotion => "button 'none' is only valid with --action motion",
-        error.WheelHasNoRelease => "the wheel (up, down, 4, 5) has no release event",
+        error.WheelHasNoRelease => "the wheel (up, down, 4..7) has no release event",
     };
 }
 
@@ -194,6 +204,8 @@ test "parseButton and parseAction" {
     try testing.expectEqual(mouse.Button.left, parseButton("left").?);
     try testing.expectEqual(mouse.Button.four, parseButton("up").?);
     try testing.expectEqual(mouse.Button.nine, parseButton("9").?);
+    try testing.expectEqual(mouse.Button.middle, parseButton("2").?);
+    try testing.expectEqual(mouse.Button.right, parseButton("3").?);
     try testing.expectEqual(@as(?mouse.Button, null), parseButton("10"));
     try testing.expectEqual(@as(?mouse.Button, null), parseButton("11"));
     try testing.expectEqual(@as(?mouse.Button, null), parseButton("nope"));
@@ -209,6 +221,7 @@ test "parseEvent validates button and action combinations" {
     try testing.expectEqual(@as(?mouse.Button, null), hover.button);
     try testing.expectError(error.NoButtonNeedsMotion, parseEvent("none", "press", ""));
     try testing.expectError(error.WheelHasNoRelease, parseEvent("up", "release", ""));
+    try testing.expectError(error.WheelHasNoRelease, parseEvent("7", "release", ""));
     try testing.expectError(error.InvalidMods, parseEvent("left", "press", "cc"));
 }
 

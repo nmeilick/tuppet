@@ -210,7 +210,7 @@ fn resolveDefault(c: ?vt.color.RGB, dr: u8, dg: u8, db: u8) Rgba {
 /// Resolve a cell style color (none/palette/rgb) to RGBA. Bold palette
 /// colors use the bright variants.
 fn styleColor(c: anytype, fallback: Rgba, t: *const vt.Terminal, bold: bool) Rgba {
-    return switch (c) {
+    return switch (c.value()) {
         .none => fallback,
         .palette => |idx| blk: {
             const i: usize = if (bold and idx < 8) idx + 8 else idx;

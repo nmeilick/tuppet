@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const vt = @import("vt");
 const track = @import("track.zig");
 const names = @import("names.zig");
+const regex = @import("regex.zig");
 
 const Key = vt.ScreenSet.Key;
 
@@ -75,6 +76,14 @@ pub const Condition = struct {
     match: ?[]const u8 = null,
     /// Compare ASCII letters regardless of case.
     icase: bool = false,
+    /// match is a regular expression (see regex.zig), at most
+    /// regex.max_pattern_len bytes; ^ and $ hold at the line's ends.
+    regex: bool = false,
+    /// With match and after_input: what the input typed, whose echo does
+    /// not count. Copies of it on the line the cursor was on at the input
+    /// are left out (without the input's snapshot: on the lines changed
+    /// after it), and on every line when match is a part of it.
+    typed: ?[]const u8 = null,
     /// Only what happened after this seq counts: text on a line whose
     /// text changed after it, an end after it.
     since: ?u64 = null,
@@ -87,6 +96,10 @@ pub const Condition = struct {
     /// input, or the wait's start, the text has not changed for this
     /// long, and no output waits to be read or settled.
     settled_ms: ?u64 = null,
+    /// With settled_ms and after_input: the change must be to the text of
+    /// a line other than the one the cursor was on at the input, so the
+    /// input's echo alone is no change.
+    past_input_line: bool = false,
     /// With match: the text was on the screen at the wait's start or came
     /// after it, and is gone from the screen now.
     absent: bool = false,
@@ -96,6 +109,26 @@ pub const Condition = struct {
     /// that began after it.
     hidden_input: bool = false,
     hit: ?Hit = null,
+
+    /// The fields an older daemon does not know go out only when set, so
+    /// that it takes the conditions that do not use them.
+    pub fn jsonStringify(c: Condition, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(Condition).@"struct".field_names) |name| {
+            const v = @field(c, name);
+            const newer = comptime std.mem.eql(u8, name, "regex") or std.mem.eql(u8, name, "typed") or std.mem.eql(u8, name, "past_input_line");
+            const skip = switch (@typeInfo(@TypeOf(v))) {
+                .optional => v == null and (newer or !jw.options.emit_null_optional_fields),
+                .bool => newer and !v,
+                else => false,
+            };
+            if (!skip) {
+                try jw.objectField(name);
+                try jw.write(v);
+            }
+        }
+        try jw.endObject();
+    }
 
     /// Whether the condition is `since` or `after_input` alone: some
     /// line's text changed after that point.
@@ -161,7 +194,26 @@ pub fn problem(gpa: std.mem.Allocator, until: []const Condition) !?[]const u8 {
             if (std.mem.findAny(u8, text, "\r\n") != null) {
                 return try std.fmt.allocPrint(gpa, "until[{d}].match must not contain a line break: text is matched one line at a time", .{i});
             }
+            if (c.regex) {
+                if (text.len > regex.max_pattern_len) return try std.fmt.allocPrint(gpa, "until[{d}].match is longer than {d} bytes, the most a regex takes", .{ i, regex.max_pattern_len });
+                var why: []const u8 = "";
+                if (regex.compile(gpa, text, .{ .icase = c.icase }, &why)) |re| {
+                    var compiled = re;
+                    compiled.deinit(gpa);
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.BadPattern => return try std.fmt.allocPrint(gpa, "until[{d}].match is no valid regex: {s}", .{ i, why }),
+                }
+            }
         } else if (c.icase) return try std.fmt.allocPrint(gpa, "until[{d}].icase needs match", .{i});
+        if (c.regex and c.match == null) return try std.fmt.allocPrint(gpa, "until[{d}].regex needs match", .{i});
+        if (c.typed) |text| {
+            if (c.match == null or c.absent or c.after_input == null) return try std.fmt.allocPrint(gpa, "until[{d}].typed needs match and after_input", .{i});
+            if (text.len == 0 or text.len > max_match_len) return try std.fmt.allocPrint(gpa, "until[{d}].typed must be 1 to {d} bytes", .{ i, max_match_len });
+            if (std.mem.findAny(u8, text, "\r\n") != null) return try std.fmt.allocPrint(gpa, "until[{d}].typed must not contain a line break", .{i});
+        }
+        if (c.past_input_line and (c.settled_ms == null or c.after_input == null))
+            return try std.fmt.allocPrint(gpa, "until[{d}].past_input_line needs settled_ms and after_input", .{i});
         if (c.since != null and c.after_input != null) return try std.fmt.allocPrint(gpa, "until[{d}] takes since or after_input, not both", .{i});
         if (c.hit) |h| if (!std.mem.eql(u8, h.name, "*")) if (names.nameError(h.name)) |why| {
             return try std.fmt.allocPrint(gpa, "until[{d}].hit.name must be an alert's name or \"*\": {s}", .{ i, why });
@@ -222,6 +274,102 @@ fn countIn(comptime icase: bool, text: []const u8, needle: []const u8) usize {
     return n;
 }
 
+/// What a match condition looks for: its text or the regex compiled from
+/// it, and the typed text whose echo does not count.
+pub const Needle = struct {
+    text: []const u8,
+    icase: bool = false,
+    re: ?*const regex.Regex = null,
+    typed: ?[]const u8 = null,
+    /// The match is a part of the typed text, so no copy of that counts,
+    /// on any line.
+    anywhere: bool = false,
+    /// The bytes a regex may still search in this check.
+    budget: ?*usize = null,
+
+    pub fn of(c: *const Condition, re: ?*const regex.Regex) Needle {
+        var n: Needle = .{ .text = c.match.?, .icase = c.icase, .re = re };
+        if (c.typed) |typed| {
+            n.typed = typed;
+            n.anywhere = if (re) |r| if (r.find(typed, 0)) |span| span.start > 0 or span.end < typed.len else false else typed.len > n.text.len and
+                (if (c.icase) std.ascii.findIgnoreCase(typed, n.text) else std.mem.find(u8, typed, n.text)) != null;
+        }
+        return n;
+    }
+
+    /// How often it occurs in `text`; on a line that shows the echo,
+    /// outside the copies of the typed text.
+    pub fn countIn(n: Needle, text: []const u8, echo: bool) usize {
+        const typed = n.typed orelse return n.plain(text);
+        if (!echo and !n.anywhere) return n.plain(text);
+        if (n.re) |r| return regexCount(r, text, typed, n.budget);
+        var total: usize = 0;
+        var from: usize = 0;
+        while (std.mem.findPos(u8, text, from, typed)) |at| {
+            total += n.plain(text[from..at]);
+            from = at + typed.len;
+        }
+        return total + n.plain(text[from..]);
+    }
+
+    fn plain(n: Needle, text: []const u8) usize {
+        if (n.re) |r| return regexCount(r, text, null, n.budget);
+        return count(text, n.text, n.icase);
+    }
+};
+
+/// A regex looks at this much of a line, and searches at most
+/// `max_regex_scan` bytes in one check of a condition: a pattern that
+/// searches far past its matches costs the rest of the line each time,
+/// and the budget keeps one from stalling the session's waits.
+pub const max_regex_line = 4096;
+pub const max_regex_scan = 256 << 10;
+
+/// How often `r` matches `line`, without overlap, leaving out matches that
+/// overlap a copy of `typed`. The whole line is matched, so ^ and $ hold
+/// only at its ends; a match that ends where a long line was cut does not
+/// count. Each search takes what it looks at from `budget`.
+fn regexCount(r: *const regex.Regex, line: []const u8, typed: ?[]const u8, budget: ?*usize) usize {
+    const text = regexText(line);
+    const cut = text.len < line.len;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (from < text.len) {
+        if (budget) |b| {
+            if (b.* == 0) break;
+            b.* -|= text.len - from;
+        }
+        const span = r.find(text, from) orelse break;
+        if (typed) |t| if (copyOver(text, t, span)) |end| {
+            from = end;
+            continue;
+        };
+        if (cut and span.end == text.len) break;
+        n += 1;
+        from = span.end;
+    }
+    return n;
+}
+
+/// What a regex looks at of `line`: at most max_regex_line bytes, cut
+/// before a UTF-8 character rather than inside one.
+fn regexText(line: []const u8) []const u8 {
+    var end = @min(line.len, max_regex_line);
+    while (end < line.len and end + 3 > max_regex_line and line[end] & 0xc0 == 0x80) end -= 1;
+    return line[0..end];
+}
+
+/// The end of a copy of `typed` that overlaps `span`, if any.
+fn copyOver(text: []const u8, typed: []const u8, span: regex.Span) ?usize {
+    const at = std.mem.findPos(u8, text, (span.start + 1) -| typed.len, typed) orelse return null;
+    return if (at < span.end) at + typed.len else null;
+}
+
+/// Whether the rows [top, top + rows) hold `row`.
+fn holds(top: i64, rows: u32, row: i64) bool {
+    return row >= top and row < top + rows;
+}
+
 /// A logical line of a scan.
 pub const Line = struct {
     /// The absolute number of its first row, and its row count.
@@ -240,6 +388,8 @@ pub const Line = struct {
     /// a resize brought it back from there. Only a match without since or
     /// after_input goes by its text alone.
     unknown: bool = false,
+    /// Its text did not fit into the scan, which has none of it.
+    dropped: bool = false,
 };
 
 /// The text of the active screen, and of the rows that scrolled into
@@ -267,6 +417,9 @@ pub const Scan = struct {
     snap_displaced: std.ArrayListUnmanaged(track.SnapText) = .empty,
     snap_text: std.ArrayListUnmanaged(u8) = .empty,
     snap_version: ?u64 = null,
+    /// The absolute row the cursor was on at the input, when the snapshot
+    /// is valid and knows it.
+    snap_cursor_row: ?i64 = null,
     /// Output waits on the pty, or was read and not settled yet; the
     /// caller of `collect` sets it.
     output_pending: bool = false,
@@ -329,6 +482,7 @@ pub const Scan = struct {
             (snap.seq == scan.input_seq and snap.key == key and snap.generation == t.screens.generation(key));
         scan.snap_lines.clearRetainingCapacity();
         scan.snap_displaced.clearRetainingCapacity();
+        scan.snap_cursor_row = if (scan.input_seq != 0 and scan.snap_valid) snap.cursor_row else null;
         if (scan.input_seq != 0 and scan.snap_valid) {
             try scan.snap_lines.appendSlice(scan.gpa, snap.lines.items);
             try scan.snap_displaced.appendSlice(scan.gpa, snap.displaced.items);
@@ -380,6 +534,7 @@ pub const Scan = struct {
             .blank_seq = blank_seq,
             .change_seq = change_seq,
             .unknown = unknown,
+            .dropped = !fits,
         });
     }
 
@@ -387,8 +542,11 @@ pub const Scan = struct {
         return scan.text.items[line.start..][0..line.len];
     }
 
-    /// How often the snapshot showed `needle` on the rows of `line`.
-    fn snapshotCount(scan: *const Scan, line: Line, needle: []const u8, icase: bool) usize {
+    /// How often the snapshot showed `needle` on the rows of `line`; a
+    /// snapshot line that held `cursor_row`, or without it any where
+    /// `echo` says the line does now, counts outside the copies of the
+    /// typed text.
+    fn snapshotCount(scan: *const Scan, line: Line, needle: Needle, cursor_row: ?i64, echo_now: bool) usize {
         const lines = scan.snap_lines.items;
         var i = std.sort.partitionPoint(track.SnapLine, lines, line.top, struct {
             fn before(abs: i64, l: track.SnapLine) bool {
@@ -397,16 +555,17 @@ pub const Scan = struct {
         }.before);
         var n: usize = 0;
         while (i < lines.len and lines[i].top < line.top + line.rows) : (i += 1) {
-            n += count(scan.snap_text.items[lines[i].start..][0..lines[i].len], needle, icase);
+            const echo = if (cursor_row) |row| holds(lines[i].top, lines[i].rows, row) else echo_now;
+            n += needle.countIn(scan.snap_text.items[lines[i].start..][0..lines[i].len], echo);
         }
         return n;
     }
 
     /// How often the snapshot showed `needle` on lines that a resize took
     /// off their rows.
-    fn displacedCount(scan: *const Scan, needle: []const u8, icase: bool) usize {
+    fn displacedCount(scan: *const Scan, needle: Needle) usize {
         var n: usize = 0;
-        for (scan.snap_displaced.items) |d| n += count(scan.snap_text.items[d.start..][0..d.len], needle, icase);
+        for (scan.snap_displaced.items) |d| n += needle.countIn(scan.snap_text.items[d.start..][0..d.len], true);
         return n;
     }
 };
@@ -475,14 +634,17 @@ pub const Memory = struct {
 
 /// Whether `needle` is on a line of the active screen of `t` now;
 /// terminal_mutex must be held.
-pub fn onScreen(gpa: std.mem.Allocator, t: *vt.Terminal, needle: []const u8, icase: bool) bool {
+pub fn onScreen(gpa: std.mem.Allocator, t: *vt.Terminal, of: Needle) bool {
+    var budget: usize = max_regex_scan;
+    var needle = of;
+    needle.budget = &budget;
     var text: std.ArrayListUnmanaged(u8) = .empty;
     defer text.deinit(gpa);
     var it = track.LineIterator.active(t.screens.active);
     while (it.next()) |line| {
         text.clearRetainingCapacity();
         track.appendLineText(gpa, &text, line) catch return false;
-        if (count(text.items, needle, icase) > 0) return true;
+        if (needle.countIn(text.items, false) > 0) return true;
     }
     return false;
 }
@@ -522,11 +684,15 @@ pub const Verdict = struct {
     /// Lines without a known change were skipped: they may have changed
     /// after the condition's seq, or not.
     unknown: bool = false,
+    /// The check looked at the history rows of the scan from the window's
+    /// `from` on; a condition that some other part held off did not.
+    scanned: bool = false,
 };
 
 /// Whether `c` holds. A condition with match or settled_ms needs `scan`;
-/// one with settled_ms or absent needs `memory`.
-pub fn check(c: *const Condition, scan: ?*const Scan, facts: Facts, w: Window, absent: ?*Absent, memory: ?*Memory) Verdict {
+/// one with settled_ms or absent needs `memory`; one with regex needs `re`,
+/// compiled from its match.
+pub fn check(c: *const Condition, re: ?*const regex.Regex, scan: ?*const Scan, facts: Facts, w: Window, absent: ?*Absent, memory: ?*Memory) Verdict {
     if (c.hit != null) {
         for (facts.hits) |h| {
             if (hitCounts(c, h, facts.input_seq)) break;
@@ -540,13 +706,26 @@ pub fn check(c: *const Condition, scan: ?*const Scan, facts: Facts, w: Window, a
     }
     if (c.idleDeadline(facts.last_text_change, w.start)) |at| if (facts.now < at) return .{};
     if (c.settled_ms != null) {
-        const v = settled(c, scan.?, facts, w, memory.?);
-        if (!v.met) return v;
+        var v = settled(c, scan.?, facts, w, memory.?);
+        if (!v.met) {
+            v.scanned = c.match == null;
+            return v;
+        }
     }
-    if (c.changes()) return changedText(c, scan.?, w);
-    const needle = c.match orelse return .{ .met = true };
-    if (c.absent) return gone(c, needle, scan.?, w, memory.?);
-    return findText(c, needle, scan.?, w, absent);
+    if (c.changes()) return scanned(changedText(c, scan.?, w));
+    if (c.match == null) return .{ .met = true };
+    std.debug.assert(c.regex == (re != null));
+    var budget: usize = max_regex_scan;
+    var needle: Needle = .of(c, re);
+    needle.budget = &budget;
+    if (c.absent) return scanned(gone(needle, scan.?, w, memory.?));
+    return scanned(findText(c, needle, scan.?, w, absent));
+}
+
+fn scanned(v: Verdict) Verdict {
+    var out = v;
+    out.scanned = true;
+    return out;
 }
 
 /// Whether the screen changed after the condition's start point and has
@@ -555,9 +734,12 @@ fn settled(c: *const Condition, scan: *const Scan, facts: Facts, w: Window, memo
     var v: Verdict = .{};
     if (!memory.changed) {
         const after = c.since orelse if (c.after_input) |a| a.inputSeq(scan.input_seq) else w.start_seq;
+        // The input line is known only from the latest input's snapshot.
+        const input_row = if (c.past_input_line and after == scan.input_seq) scan.snap_cursor_row else null;
         for (scan.lines.items, 0..) |line, i| {
             if (i < scan.history and line.top < w.from) continue;
-            if (line.change_seq > after) {
+            if (input_row) |row| if (holds(line.top, line.rows, row)) continue;
+            if (if (c.past_input_line) line.text_seq > after else line.change_seq > after) {
                 memory.changed = true;
                 break;
             }
@@ -573,11 +755,11 @@ fn settled(c: *const Condition, scan: *const Scan, facts: Facts, w: Window, memo
 /// Whether the needle, on the screen at the wait's start or since, is
 /// gone from it. Rows that scrolled into the history since the last
 /// check showed it too.
-fn gone(c: *const Condition, needle: []const u8, scan: *const Scan, w: Window, memory: *Memory) Verdict {
+fn gone(needle: Needle, scan: *const Scan, w: Window, memory: *Memory) Verdict {
     // Rows whose text did not fit may show it.
     if (scan.dropped > 0) return .{};
     for (scan.lines.items, 0..) |line, i| {
-        if (count(scan.lineText(line), needle, c.icase) == 0) continue;
+        if (needle.countIn(scan.lineText(line), false) == 0) continue;
         if (i >= scan.history) {
             memory.seen = true;
             return .{};
@@ -611,7 +793,7 @@ fn changedText(c: *const Condition, scan: *const Scan, w: Window) Verdict {
     return v;
 }
 
-fn findText(c: *const Condition, needle: []const u8, scan: *const Scan, w: Window, absent: ?*Absent) Verdict {
+fn findText(c: *const Condition, needle: Needle, scan: *const Scan, w: Window, absent: ?*Absent) Verdict {
     const after_input = c.after_input != null;
     const input_seq = if (c.after_input) |a| a.inputSeq(scan.input_seq) else scan.input_seq;
     // Without a snapshot of this screen taken at the input, what changed
@@ -620,15 +802,19 @@ fn findText(c: *const Condition, needle: []const u8, scan: *const Scan, w: Windo
     const changed_after: ?u64 = c.since orelse if (fallback) input_seq else null;
     const truncated = fallback and scan.snap_truncated and input_seq == scan.input_seq;
     const compare = after_input and !fallback;
+    // The echo is on the line that held the cursor at the input; without
+    // that row, on any line that changed after it.
+    const cursor_row = if (compare) scan.snap_cursor_row else null;
     var unknown = false;
     // Occurrences on lines a resize displaced that no line has taken yet:
     // a redraw may bring them back on any row.
     var displaced: ?usize = null;
     for (scan.lines.items, 0..) |line, i| {
         if (i < scan.history and line.top < w.from) continue;
-        const n = count(scan.lineText(line), needle, c.icase);
+        const echo = if (cursor_row) |row| holds(line.top, line.rows, row) else line.text_seq > input_seq;
+        const n = needle.countIn(scan.lineText(line), echo);
         if (compare) if (absent) |a| {
-            if (n == 0 and line.text_seq > scan.input_seq and scan.snapshotCount(line, needle, c.icase) > 0) a.add(line);
+            if (n == 0 and !line.dropped and line.text_seq > scan.input_seq and scan.snapshotCount(line, needle, cursor_row, echo) > 0) a.add(line);
         };
         if (n == 0) continue;
         const new = if (changed_after) |seq| blk: {
@@ -637,9 +823,9 @@ fn findText(c: *const Condition, needle: []const u8, scan: *const Scan, w: Windo
         } else if (compare) blk: {
             if (line.blank_seq > scan.input_seq) break :blk true;
             if (absent) |a| if (a.any(line)) break :blk true;
-            const shown = scan.snapshotCount(line, needle, c.icase);
+            const shown = scan.snapshotCount(line, needle, cursor_row, echo);
             if (n <= shown) break :blk false;
-            const left = displaced orelse scan.displacedCount(needle, c.icase);
+            const left = displaced orelse scan.displacedCount(needle);
             const taken = @min(n - shown, left);
             displaced = left - taken;
             break :blk n - shown > taken;
@@ -702,7 +888,7 @@ const Fixture = struct {
     fn verdictIn(f: *Fixture, c: Condition, from: ?i64, absent: ?*Absent) !Verdict {
         try f.scan.collect(&f.tracker, &f.term, from);
         const facts: Facts = .{ .now = 0, .last_text_change = 0, .end_seq = null, .input_seq = f.scan.input_seq };
-        return check(&c, &f.scan, facts, .{ .start = 0, .from = from orelse 0 }, absent, &f.memory);
+        return check(&c, null, &f.scan, facts, .{ .start = 0, .from = from orelse 0 }, absent, &f.memory);
     }
 
     fn holds(f: *Fixture, c: Condition) !bool {
@@ -733,6 +919,10 @@ test "conditions are decoded strictly and checked for what they can wait for" {
     try std.testing.expectEqual(AfterInput.latest, until[0].after_input.?);
     try std.testing.expectEqual(@as(u64, 12), until[2].after_input.?.seq);
     try std.testing.expectEqual(@as(?[]const u8, null), try problem(gpa, until));
+    // A condition that does not use the newer fields leaves them out, so
+    // an older daemon takes it.
+    const json = try std.json.Stringify.valueAlloc(gpa, Condition{ .match = "x" }, .{ .emit_null_optional_fields = false });
+    try std.testing.expectEqualStrings("{\"match\":\"x\",\"icase\":false,\"absent\":false,\"ended\":false,\"hidden_input\":false}", json);
     try std.testing.expectError(error.BadRequest, parse(gpa, "[{\"after_input\":\"first\"}]"));
     try std.testing.expectError(error.BadRequest, parse(gpa, "[{\"matc\":\"x\"}]"));
 
@@ -828,6 +1018,55 @@ test "after an input only a new occurrence counts" {
     try std.testing.expect(!try f.holds(.{ .match = "DONE", .after_input = .latest }));
 }
 
+test "the echo of the typed text does not count, also for a regex, nor as the change past the input line" {
+    const f = try Fixture.create(40, 6);
+    defer f.destroy();
+    f.feed("$ ");
+    _ = f.input();
+    const typed = "cd /opt/x && pwd";
+    const part: Condition = .{ .match = "/opt/x", .after_input = .latest, .typed = typed };
+    const whole: Condition = .{ .match = "pwd", .after_input = .latest, .typed = "pwd" };
+    f.feed(typed);
+    try std.testing.expect(!try f.holds(part));
+    // A part of the typed text: its copies count nowhere, other text does.
+    f.feed("\r\n" ++ typed ++ "\r\n");
+    try std.testing.expect(!try f.holds(part));
+    f.feed("/opt/x\r\n$ ");
+    try std.testing.expect(try f.holds(part));
+    // The whole typed text counts off the input's line.
+    _ = f.input();
+    f.feed("pwd");
+    try std.testing.expect(!try f.holds(whole));
+    f.feed("\r\npwd");
+    try std.testing.expect(try f.holds(whole));
+
+    var why: []const u8 = "";
+    var re = try regex.compile(std.testing.allocator, "^/opt/\\w+$", .{}, &why);
+    defer re.deinit(std.testing.allocator);
+    _ = f.input();
+    f.feed("\r\n$ cd /opt/y");
+    const rc: Condition = .{ .match = "^/opt/\\w+$", .regex = true, .after_input = .latest, .typed = "cd /opt/y" };
+    try f.scan.collect(&f.tracker, &f.term, null);
+    const facts: Facts = .{ .now = 0, .last_text_change = 0, .end_seq = null, .input_seq = f.scan.input_seq };
+    try std.testing.expect(!check(&rc, &re, &f.scan, facts, .{ .start = 0, .from = 0 }, null, &f.memory).met);
+    f.feed("\r\n/opt/y");
+    try f.scan.collect(&f.tracker, &f.term, null);
+    try std.testing.expect(check(&rc, &re, &f.scan, facts, .{ .start = 0, .from = 0 }, null, &f.memory).met);
+
+    // Settled: the echo on the input's line is no change; the next line is.
+    f.feed("\r\n$ ");
+    _ = f.input();
+    const settle: Condition = .{ .settled_ms = 1, .after_input = .latest, .past_input_line = true };
+    f.feed("sleep 9");
+    f.memory = .{};
+    try f.scan.collect(&f.tracker, &f.term, null);
+    const later: Facts = .{ .now = std.time.ns_per_s, .last_text_change = 0, .end_seq = null, .input_seq = f.scan.input_seq };
+    try std.testing.expect(!check(&settle, null, &f.scan, later, .{ .start = 0, .from = 0 }, null, &f.memory).met);
+    f.feed("\r\nout");
+    try f.scan.collect(&f.tracker, &f.term, null);
+    try std.testing.expect(check(&settle, null, &f.scan, later, .{ .start = 0, .from = 0 }, null, &f.memory).met);
+}
+
 test "after an input, a redraw that brings back what a shrinking resize cut off is not new" {
     const f = try Fixture.create(20, 10);
     defer f.destroy();
@@ -863,6 +1102,30 @@ test "a bundled wait counts a needle that went away and came back on its row" {
     try std.testing.expect((try f.verdictIn(latest, null, &absent)).met);
 }
 
+test "a bundled wait takes no line whose text did not fit as one its needle left" {
+    const gpa = std.testing.allocator;
+    var scan: Scan = .{ .gpa = gpa, .input_seq = 1, .snap_valid = true };
+    defer scan.deinit();
+    try scan.snap_text.appendSlice(gpa, "$ ");
+    try scan.snap_lines.append(gpa, .{ .top = 0, .rows = 1, .start = 0, .len = 2 });
+    try scan.lines.append(gpa, .{ .top = 0, .rows = 1, .start = 0, .len = 0, .text_seq = 2, .blank_seq = 0, .dropped = true });
+    var absent: Absent = .{ .gpa = gpa };
+    defer absent.deinit();
+    var memory: Memory = .{};
+    const facts: Facts = .{ .now = 0, .last_text_change = 0, .end_seq = null, .input_seq = 1 };
+    _ = check(&.{ .match = "$ ", .after_input = .latest }, null, &scan, facts, .{ .start = 0, .from = 0 }, &absent, &memory);
+    try std.testing.expectEqual(0, absent.rows.count());
+}
+
+test "a regex looks at a long line up to the start of a character" {
+    var line: [max_regex_line + 2]u8 = @splat('a');
+    line[max_regex_line - 2 ..][0..2].* = "ä".*;
+    try std.testing.expectEqual(max_regex_line, regexText(&line).len);
+    @memset(&line, 'a');
+    line[max_regex_line - 1 ..][0..2].* = "é".*;
+    try std.testing.expectEqual(max_regex_line - 1, regexText(&line).len);
+}
+
 test "a match counts on rows that scrolled into the history since the wait started" {
     const f = try Fixture.create(10, 3);
     defer f.destroy();
@@ -881,14 +1144,14 @@ test "idle counts from the wait's start with after_input, and ended needs an end
     const ms = std.time.ns_per_ms;
     const w: Window = .{ .start = 100 * ms, .from = 0 };
     const quiet: Facts = .{ .now = 150 * ms, .last_text_change = 0, .end_seq = null, .input_seq = 0 };
-    try std.testing.expect(check(&.{ .idle_ms = 100 }, null, quiet, w, null, null).met);
-    try std.testing.expect(!check(&.{ .idle_ms = 100, .after_input = .latest }, null, quiet, w, null, null).met);
+    try std.testing.expect(check(&.{ .idle_ms = 100 }, null, null, quiet, w, null, null).met);
+    try std.testing.expect(!check(&.{ .idle_ms = 100, .after_input = .latest }, null, null, quiet, w, null, null).met);
     var later = quiet;
     later.now = 200 * ms;
-    try std.testing.expect(check(&.{ .idle_ms = 100, .after_input = .latest }, null, later, w, null, null).met);
+    try std.testing.expect(check(&.{ .idle_ms = 100, .after_input = .latest }, null, null, later, w, null, null).met);
     const ended: Facts = .{ .now = 0, .last_text_change = 0, .end_seq = 7, .input_seq = 0 };
-    try std.testing.expect(!check(&.{ .ended = true, .since = 7 }, null, ended, w, null, null).met);
-    try std.testing.expect(check(&.{ .ended = true, .since = 6 }, null, ended, w, null, null).met);
+    try std.testing.expect(!check(&.{ .ended = true, .since = 7 }, null, null, ended, w, null, null).met);
+    try std.testing.expect(check(&.{ .ended = true, .since = 6 }, null, null, ended, w, null, null).met);
 }
 
 test "hidden input holds while the terminal hides it, and after an input only once it began anew" {
@@ -896,22 +1159,22 @@ test "hidden input holds while the terminal hides it, and after an input only on
     var facts: Facts = .{ .now = 0, .last_text_change = 0, .end_seq = null, .input_seq = 10, .input_ns = 500 };
     const hidden: Condition = .{ .hidden_input = true };
     const after: Condition = .{ .hidden_input = true, .after_input = .latest };
-    try std.testing.expect(!check(&hidden, null, facts, w, null, null).met);
+    try std.testing.expect(!check(&hidden, null, null, facts, w, null, null).met);
     // A prompt that hid input before the latest input.
     facts.hidden = .{ .seq = 10, .ns = 400 };
-    try std.testing.expect(check(&hidden, null, facts, w, null, null).met);
-    try std.testing.expect(!check(&after, null, facts, w, null, null).met);
-    try std.testing.expect(!check(&.{ .hidden_input = true, .since = 10 }, null, facts, w, null, null).met);
+    try std.testing.expect(check(&hidden, null, null, facts, w, null, null).met);
+    try std.testing.expect(!check(&after, null, null, facts, w, null, null).met);
+    try std.testing.expect(!check(&.{ .hidden_input = true, .since = 10 }, null, null, facts, w, null, null).met);
     // The next prompt, after the input.
     facts.hidden = .{ .seq = 10, .ns = 600 };
-    try std.testing.expect(check(&after, null, facts, w, null, null).met);
+    try std.testing.expect(check(&after, null, null, facts, w, null, null).met);
     // An input before the latest one, and a since, are compared by seq.
     const earlier: Condition = .{ .hidden_input = true, .after_input = .{ .seq = 7 } };
     facts.hidden = .{ .seq = 7, .ns = 600 };
-    try std.testing.expect(!check(&earlier, null, facts, w, null, null).met);
+    try std.testing.expect(!check(&earlier, null, null, facts, w, null, null).met);
     facts.hidden = .{ .seq = 11, .ns = 600 };
-    try std.testing.expect(check(&earlier, null, facts, w, null, null).met);
-    try std.testing.expect(check(&.{ .hidden_input = true, .since = 10 }, null, facts, w, null, null).met);
+    try std.testing.expect(check(&earlier, null, null, facts, w, null, null).met);
+    try std.testing.expect(check(&.{ .hidden_input = true, .since = 10 }, null, null, facts, w, null, null).met);
     try std.testing.expectEqualStrings("hidden_input", after.kind());
 }
 
@@ -937,7 +1200,7 @@ test "settled holds once the screen changed after the start and its text stayed 
         fn check_(fx: *Fixture, cond_: Condition, now: i64, start_seq: u64) !bool {
             try fx.scan.collect(&fx.tracker, &fx.term, null);
             const facts: Facts = .{ .now = now, .last_text_change = 0, .end_seq = null, .input_seq = fx.scan.input_seq };
-            return check(&cond_, &fx.scan, facts, .{ .start = 0, .from = 0, .start_seq = start_seq }, null, &fx.memory).met;
+            return check(&cond_, null, &fx.scan, facts, .{ .start = 0, .from = 0, .start_seq = start_seq }, null, &fx.memory).met;
         }
     }.check_;
     // Quiet, but nothing changed after the start.
@@ -948,7 +1211,7 @@ test "settled holds once the screen changed after the start and its text stayed 
     try std.testing.expect(try at(f, c, 150 * ms, start));
     // Output still waiting on the pty holds it back.
     f.scan.output_pending = true;
-    try std.testing.expect(!check(&c, &f.scan, .{ .now = 150 * ms, .last_text_change = 0, .end_seq = null, .input_seq = 0 }, .{ .start = 0, .from = 0, .start_seq = start }, null, &f.memory).met);
+    try std.testing.expect(!check(&c, null, &f.scan, .{ .now = 150 * ms, .last_text_change = 0, .end_seq = null, .input_seq = 0 }, .{ .start = 0, .from = 0, .start_seq = start }, null, &f.memory).met);
     try std.testing.expectEqualStrings("settled", c.kind());
 }
 
@@ -958,7 +1221,7 @@ test "absent holds once text on the screen at the start, or that came, is gone, 
     defer f.destroy();
     f.feed("Loading...");
     const loading: Condition = .{ .match = "loading", .icase = true, .absent = true };
-    f.memory.seen = onScreen(gpa, &f.term, "loading", true);
+    f.memory.seen = onScreen(gpa, &f.term, .{ .text = "loading", .icase = true });
     try std.testing.expect(!try f.holds(loading));
     f.feed("\r\x1b[2KDone");
     try std.testing.expect(try f.holds(loading));
@@ -1006,7 +1269,7 @@ test "a truncated input snapshot falls back to the lines changed after the input
     _ = f.input();
     try std.testing.expect(f.tracker.snapshot.truncated);
     const latest: Condition = .{ .match = "x", .after_input = .latest };
-    try std.testing.expectEqual(Verdict{ .truncated = true }, try f.verdict(latest));
+    try std.testing.expectEqual(Verdict{ .truncated = true, .scanned = true }, try f.verdict(latest));
     f.feed("x");
-    try std.testing.expectEqual(Verdict{ .met = true, .truncated = true }, try f.verdict(latest));
+    try std.testing.expectEqual(Verdict{ .met = true, .truncated = true, .scanned = true }, try f.verdict(latest));
 }

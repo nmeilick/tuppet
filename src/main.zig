@@ -11,6 +11,8 @@ const daemon = @import("daemon.zig");
 const client = @import("client.zig");
 const attach_client = @import("attach_client.zig");
 const sweep = @import("sweep.zig");
+const play = @import("play.zig");
+const start_run = @import("start_run.zig");
 const plat = @import("plat.zig");
 const protocol = @import("protocol.zig");
 const build_options = @import("build_options");
@@ -30,8 +32,22 @@ pub const panic = std.debug.FullPanic(struct {
 /// output must not be able to grow the daemon log without bound.
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{ .scope = .stream, .level = .err }},
-    .logFn = daemon.logFn,
+    .logFn = logFn,
 };
+
+/// Whether this process is `tuppet daemon`.
+var serving = false;
+
+/// The daemon logs as daemon.logFn does. A client writes no line of the
+/// terminal emulator's, which are about a session's output and not about
+/// the command, and none at all while it paints a terminal.
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (!serving) {
+        if (scope != .default and scope != .gpa) return;
+        if (attach_client.painting.load(.acquire)) return;
+    }
+    daemon.logFn(level, scope, format, args);
+}
 
 const usage_text =
     \\tuppet - a TUI puppet: drive terminal programs from scripts
@@ -51,6 +67,15 @@ const usage_text =
     \\  tuppet run [-a] [-n NAME] [-s WxH] [-C DIR] [-r] [conditions] [-j] <cmd...>
     \\                                    start a session and print its id, then wait
     \\                                    for the conditions; or attach to it (-a)
+    \\  tuppet run --over <session> [-t DUR] [-j] <cmd...>
+    \\                                    show the new session in a box over another,
+    \\                                    wait until its program ends, and say how
+    \\  tuppet start [<id>...] [-d] [--new] [-A]
+    \\                                    open a session, bring it to a known state
+    \\                                    with the steps of the start file (a login,
+    \\                                    say), then attach; several ids or a group
+    \\                                    one after another, detached; --check,
+    \\                                    --record ID; see 'tuppet help start'
     \\  tuppet list [<session>...] [-j]   list sessions: id, name, state, age, command
     \\  tuppet stop <session>... [-j]     terminate the programs' process groups
     \\  tuppet remove <session>... [-f] [-j]
@@ -58,6 +83,10 @@ const usage_text =
     \\  tuppet restart <session> [-j]     run an ended session's command again
     \\  tuppet rename <session> <name> [-j]
     \\                                    give a session another name
+    \\  tuppet update <session> [--label TEXT] [--group G] [--action SPEC]...
+    \\                                    change what a drawn attach of a group
+    \\                                    shows about a session; also flag,
+    \\                                    side, respawn, lease, commands
     \\  tuppet events [<session>...] [-i DUR] [--count N] [-t DUR] [-v] [-j]
     \\                                    follow what happens to sessions: starts,
     \\                                    ends, bells, notifications, alert hits
@@ -75,8 +104,9 @@ const usage_text =
     \\                                    secrets, mouse clicks (left, right, middle,
     \\                                    up, down, none, or 1..9 at zero-based
     \\                                    cells), and wait for what follows (-m,
-    \\                                    --gone, -e, --settled), with guards; see
-    \\                                    'tuppet help do'
+    \\                                    --gone, -e, --settled), with guards; or
+    \\                                    the steps of a start-file block (--use);
+    \\                                    see 'tuppet help do'
     \\  tuppet resize <session> WxH [-j]  resize the pty and reflow the screen
     \\
     \\output:
@@ -96,6 +126,9 @@ const usage_text =
     \\  tuppet record <session> --mark LABEL
     \\                                    append a marker to the active recording
     \\  tuppet record <session> --stop    stop the recording
+    \\  tuppet play FILE.cast [--speed N] [--max-pause DUR]
+    \\                                    play a recording into this terminal: Space
+    \\                                    pauses, q quits
     \\  tuppet wait <session>... [conditions] [--any] [--view] [-j]
     \\                                    block until a condition holds: -m TEXT on
     \\                                    screen, --gone TEXT gone, -e the program
@@ -103,7 +136,8 @@ const usage_text =
     \\                                    -i DUR quiet, --hit NAME an alert; see
     \\                                    'tuppet help conditions'
     \\  tuppet attach [<session> | -] [--read-only] [--force] [--detach-key KEY]
-    \\                [--no-resize]       connect this terminal to the session live
+    \\                [--no-resize] [--drawn | --no-drawn] [--no-detach]
+    \\                                    connect this terminal to the session live
     \\                                    (detach with Ctrl-]; - is the session
     \\                                    detached from last); without a session,
     \\                                    open the session picker
@@ -125,9 +159,10 @@ const usage_text =
     \\
     \\exit codes: 0 ok, 1 error, 2 bad arguments, 3 timeout, 4 the session
     \\ended (or was removed) first, 5 a guard refused the input (do) or a
-    \\sweep refused to start, 128+n interrupted by signal n. The one
-    \\exception is attach (and run -a), which exits with the program's own
-    \\code when it ends; see 'tuppet help attach'.
+    \\sweep refused to start, 128+n interrupted by signal n. The
+    \\exceptions are attach (and run -a), which exits with the program's
+    \\own code when it ends (see 'tuppet help attach'), and run --over
+    \\(see 'tuppet help run').
     \\
     \\coding agents:
     \\  tuppet llm-skill                  print a SKILL.md that teaches coding agents
@@ -152,11 +187,20 @@ const usage_text =
 const run_help =
     \\tuppet run - start a session in a new emulated terminal
     \\
-    \\usage: tuppet run [-a] [-n NAME] [-s WxH] [-C DIR] [--scrollback SIZE]
+    \\usage: tuppet run [-a [--drawn | --no-drawn] [--no-detach] [--alt-screen]
+    \\                  [--pass LIST] [-k KEY]] [-n NAME] [-s WxH] [-C DIR]
+    \\                  [--scrollback SIZE]
     \\                  [-r [--record-format cast|trace] | --record-file FILE]
+    \\                  [--passwords]
     \\                  [--alert NAME=TEXT]... [--no-default-alerts]
     \\                  [--if-exists fail|keep|replace] [conditions] [--stats]
+    \\                  [--group G] [--label TEXT] [--accent] [--mark M]
+    \\                  [--meta K=V]... [--action SPEC]...
+    \\                  [--side-of SESSION [--side-view VIEW]] [--lease]
     \\                  [-j] [--] <cmd...>
+    \\       tuppet run --over <session> [-s WxH] [--title TEXT]
+    \\                  [--backdrop frozen|live] [--grab pause|now|never]
+    \\                  [-t DUR] [-n NAME] [-j] [--] <cmd...>
     \\
     \\Runs <cmd...> on a pty owned by the daemon and prints the new
     \\session id to stdout. The command runs in your current directory
@@ -173,6 +217,27 @@ const run_help =
     \\counts. It prints the same outcome line and exits with the same
     \\codes; when the wait fails, the session keeps running, and the
     \\message says how to stop it. -a cannot be combined with conditions.
+    \\
+    \\With --over, the new session is a box: a drawn attach of <session>
+    \\shows it over that session (see 'tuppet help attach'), and it is an
+    \\ordinary session otherwise, which view, key, do, and wait work on.
+    \\run prints the box's id, waits as long as it takes until the box's
+    \\program has ended, removes the box, and prints one line:
+    \\
+    \\  ended <id> exit=N held=yes|no shown=yes|no
+    \\  stopped <id> reason=unseen|under|stopped held=yes|no shown=yes|no
+    \\  lost <id>
+    \\
+    \\held says that a client typed into the box (an attach that writes),
+    \\shown that one showed it. reason is unseen when -t ran out, under
+    \\when <session> ended, and stopped when the box was stopped another
+    \\way; lost is a box lost with its daemon, or removed meanwhile. The
+    \\exit code is the program's own when it ended by itself in a box that
+    \\was held (shown, with --grab never), 3 for reason=unseen, and 4
+    \\otherwise; the outcome line tells these apart from a program that
+    \\exits with 3 or 4 itself. Interrupted, run stops the box first and
+    \\exits 128+n; killed, it leaves the box running. --over cannot be
+    \\combined with -a, conditions, or --if-exists.
     \\
     \\Alerts watch the session from the program's first byte (see 'tuppet
     \\help alert'): the ones --alert gives, and the defaults in the
@@ -193,10 +258,16 @@ const run_help =
     \\options:
     \\  -a, --attach      attach this terminal to the session right away
     \\                    instead of printing its id, as 'tuppet attach' does
+    \\  --drawn, --no-drawn, --no-detach, --alt-screen, --pass LIST,
+    \\  -k, --detach-key KEY
+    \\                    with -a: as for 'tuppet attach' (see 'tuppet help
+    \\                    attach'); a drawn attach the daemon cannot serve
+    \\                    fails before the session starts
     \\  -n, --name NAME   name the session
     \\  -s, --size WxH    terminal size in cells, 1..1000 per side
     \\                    (default 120x40, or TUPPET_SIZE; with -a this
-    \\                    terminal's size, and an explicit size stays fixed)
+    \\                    terminal's size, and an explicit size stays fixed;
+    \\                    with --over 64x12, the box's program area)
     \\  -C, --cwd DIR     working directory for the command (default: the
     \\                    current directory)
     \\  --scrollback SIZE memory for history, in bytes or with K, M, or G
@@ -212,6 +283,8 @@ const run_help =
     \\  --record-file FILE
     \\                    record to FILE instead, which tuppet never deletes:
     \\                    asciicast for FILE.cast, a trace for FILE.trace
+    \\  --passwords       with -r or --record-file: record passwords as
+    \\                    typed, not as a marker (see 'tuppet help record')
     \\  --alert NAME=TEXT watch for TEXT under NAME (see 'tuppet help alert');
     \\                    one per alert, at most 32 with the defaults
     \\  --no-default-alerts
@@ -220,11 +293,34 @@ const run_help =
     \\  --if-exists W     what to do when a running session has the name:
     \\                    fail (default), keep (print its id and start
     \\                    nothing), or replace (stop it and start anew)
+    \\  --over SESSION    start the session as a box over SESSION (see
+    \\                    above)
+    \\  --title TEXT      with --over: the text on the box's border, at
+    \\                    most 64 bytes (default: the name, or #<id>)
+    \\  --backdrop B      with --over: how SESSION shows while the box has
+    \\                    the keyboard: frozen (default) or live; not with
+    \\                    --grab never
+    \\  --grab G          with --over: when the box takes the keyboard:
+    \\                    pause (default: once you pause typing), now, or
+    \\                    never (a notice that takes no keys)
+    \\  -t, --timeout DUR with conditions: as for 'tuppet wait' (default
+    \\                    30s, at most 10m); with --over: stop the box when
+    \\                    it was not held (shown, with --grab never)
+    \\                    within DUR (1ms to 24h)
+    \\  --group G         a member of group G, with the lowest free number;
+    \\                    --label, --accent, --mark, --meta, and --action
+    \\                    as for 'tuppet update'
+    \\  --side-of SESSION the side session of SESSION, shown first at
+    \\                    --side-view (compact, half, or full; default
+    \\                    compact); see 'tuppet help side'
+    \\  --lease           print the id and keep the session alive only while
+    \\                    this command runs (see 'tuppet help lease')
     \\  --stats           with conditions: add what the program did while
     \\                    run waited to the outcome line (see 'tuppet help
     \\                    conditions')
     \\  -j, --json        print the session's status as JSON instead of
-    \\                    its id (and the wait's reply as a second line)
+    \\                    its id (and the wait's reply as a second line,
+    \\                    instead of the outcome line with --over)
     \\  --                treat the rest as the command even if it starts
     \\                    with a dash
     \\
@@ -235,6 +331,7 @@ const run_help =
     \\  tuppet run -r --scrollback 4M make test
     \\  tuppet run -n build --if-exists replace -s 120x40 -- make -j8
     \\  tuppet run -n agent --alert 'approve=Do you want to proceed?' -- ./agent
+    \\  tuppet run --over agent --title 'confirm deploy' -t 10m -- ./confirm
     \\
 ;
 
@@ -251,7 +348,9 @@ const list_help =
     \\
     \\STATE is "running", "quiet 3m" (running, but its screen text has not
     \\changed for that long), "password?" (running, and reading input
-    \\without echo, as password prompts do), the name of an alert (cut to
+    \\without echo, as password prompts do), "box waits" (a box that
+    \\takes the keyboard runs over it, and nobody types into the box yet;
+    \\see 'tuppet help run'), the name of an alert (cut to
     \\12 characters) that hit since the session was last seen, "bell" (the
     \\program rang the bell since the session was last seen), "done"
     \\(exited 0), "stopped" (by 'tuppet stop'), "failed N" (exit code N,
@@ -263,7 +362,8 @@ const list_help =
     \\! marks a session that needs you: since it was last seen, it rang
     \\the bell, sent a desktop notification (OSC 9 or OSC 777), had an
     \\alert hit, or ended, unless 'tuppet stop' ended it (whoever stopped
-    \\it knows). 'tuppet ack' marks it as seen.
+    \\it knows). 'tuppet ack' marks it as seen. A box that waits over it
+    \\marks it too, until no box waits; an ack does not clear that.
     \\
     \\Ended sessions stay listed, even across daemon restarts, until
     \\'tuppet remove' or 7 days after they ended (TUPPET_KEEP, see 'tuppet
@@ -380,7 +480,9 @@ const do_help =
     \\
     \\usage: tuppet do <session> STEP... [-t DUR] [--if-input-seq N]
     \\                 [--reply-to N] [--unless-attached] [--any-input]
-    \\                 [--record-file FILE] [--stats] [-j]
+    \\                 [--record-file FILE [--passwords]] [--stats] [-j]
+    \\       tuppet do <session> [-t DUR] [--unless-attached]
+    \\                 --use NAME [ARG...]
     \\
     \\Runs its steps in order. Input steps that follow each other are
     \\typed as one batch: no other input, a person's at an attached
@@ -445,6 +547,8 @@ const do_help =
     \\                    instead of hits after the latest input
     \\  --icase           -m and --gone in this step ignore the case of ASCII
     \\                    letters
+    \\  --regex           -m and --gone in this step take a regex ('tuppet
+    \\                    help conditions')
     \\  -w, --within DUR  this step's deadline, at most 10m
     \\'tuppet help conditions' explains them; in do they always count what
     \\came after the latest input.
@@ -460,11 +564,19 @@ const do_help =
     \\                      after it, and the session still keeps it
     \\  --unless-attached   type and resize nothing while a writer is
     \\                      attached
+    \\  --at-prompt SEQ     type nothing unless the shell waits at its prompt
+    \\                      with prompt_seq SEQ (see 'tuppet help commands'),
+    \\                      nothing was typed since it appeared, the session
+    \\                      is on its normal screen, and bracketed paste is
+    \\                      on; the first batch must be one -p of one line
+    \\                      of printable text, pasted without Enter
     \\  --any-input         let --secret type without hidden input
     \\  --record-file FILE  record the whole run to FILE with its input
     \\                      events: asciicast for FILE.cast, a trace for
     \\                      FILE.trace (see 'tuppet help record'); the
     \\                      recording stops when do ends, also on Ctrl-C
+    \\  --passwords         with --record-file: record passwords as typed,
+    \\                      not as a marker (see 'tuppet help record')
     \\  --stats             add what the program did to each condition step's
     \\                      line (see 'tuppet help conditions')
     \\  -j, --json          print each condition step's reply as JSON, as
@@ -489,6 +601,17 @@ const do_help =
     \\arguments; 3 a condition step timed out; 4 the session ended or was
     \\removed first; 5 a guard refused the input.
     \\
+    \\--use NAME [ARG...] runs the steps of the block NAME of the start file
+    \\(see 'tuppet help start') instead: the words after NAME are its
+    \\arguments, as given, and -t is how long a check waits unless it
+    \\says (default 10s). The block must start with the expect of the
+    \\prompt it is used at, and nothing is typed unless the cursor's line
+    \\ends with that prompt and no input comes in between. Steps, failure
+    \\texts, passwords, and exit codes are those of 'tuppet start -d';
+    \\on success it prints nothing. Pass a password as '$APP_PW' in single
+    \\quotes, so that the shell does not put its value on the command
+    \\line.
+    \\
     \\examples:
     \\  tuppet do 2 -s make -k '<Enter>' -m '$ ' -t 10m
     \\  tuppet do 2 -k j --settled 200ms
@@ -498,6 +621,7 @@ const do_help =
     \\      -k '<Enter>' -m '$ '
     \\  tuppet do 2 --mouse left 10 3 -m Saved -w 2s
     \\  tuppet do 2 --reply-to 4 -k 'y<Enter>' --hit approve -w 10m
+    \\  tuppet do 2 --use become app '$APP_PW'
     \\  tuppet do vim -k ':wq<Enter>' -e --record-file quit.trace
     \\
 ;
@@ -520,7 +644,11 @@ const events_help =
     \\Sessions start, end ("done", "failed N", "stopped"), are removed, and
     \\renamed; programs ring the bell, send desktop notifications (OSC 9
     \\and OSC 777), and ask for a password ("password?"); alerts hit (the
-    \\hit's number, its alerts, and its line); writers attach and detach.
+    \\hit's number, its alerts, and its line); writers attach and detach;
+    \\the person chooses an action in a group attach's switcher ("action
+    \\KEY [VALUE]") or asks for a side session ("side-requested"); a side
+    \\session's view changes ("side-view VIEW"); a shell's marks report a
+    \\command's end ("command-ended CODE").
     \\Without sessions every session counts, also the ones started later;
     \\names and patterns pick sessions as they are named now, so a session
     \\renamed to a matching name joins, and one renamed away leaves ("no
@@ -844,7 +972,7 @@ const record_help =
     \\tuppet record - start, annotate, or stop a screen recording
     \\
     \\usage: tuppet record <session> --start FILE [conditions] [-t DUR]
-    \\                     [--input] [-j]
+    \\                     [--input] [--passwords] [-j]
     \\       tuppet record <session> --mark LABEL [-j]
     \\       tuppet record <session> --stop [-j]
     \\
@@ -869,7 +997,8 @@ const record_help =
     \\  -t, --timeout DUR
     \\                 stop after DUR (at most 24h)
     \\  --input        record input events in a cast too (a trace always
-    \\                 has them); secrets show as a marker only
+    \\                 has them)
+    \\  --passwords    record passwords as typed instead of a marker
     \\  -j, --json     print the daemon's reply
     \\
     \\The daemon checks the conditions and the time, so they stop the
@@ -883,6 +1012,14 @@ const record_help =
     \\it too. After a recording stopped by itself, one --stop reports it;
     \\without a recording, --stop and --mark fail.
     \\
+    \\Passwords: what tuppet knows is one is recorded as a marker
+    \\("secret input"), not as typed: a 'tuppet do --secret', and what
+    \\is typed while the program reads without echo, as sudo, ssh, and
+    \\read -s do. tuppet sees that only for programs on its own terminal:
+    \\a password typed on a host that ssh reached looks like any other
+    \\input and is recorded as typed. --passwords records every password
+    \\as typed.
+    \\
     \\examples:
     \\  tuppet record 2 --start demo.cast
     \\  tuppet record 2 --start flow.trace -m 'Tests passed' -e -t 10m
@@ -891,12 +1028,244 @@ const record_help =
     \\
 ;
 
+const start_help =
+    \\tuppet start - open a session and bring it to a known state
+    \\
+    \\usage: tuppet start [<id>...] [-d] [--new] [-A]
+    \\       tuppet start --check [<id>]
+    \\       tuppet start --record <id> [-- <command>...]
+    \\
+    \\Runs the steps of the start block for <id> in a new session named
+    \\<id>: each types something and waits for the text that should
+    \\follow, as 'tuppet do' does; then it attaches this terminal. The
+    \\steps may log in through hops, start a dev server, or answer an
+    \\installer. A step that fails stops the run: tuppet says which step,
+    \\where it is in the file, and what the session showed, and offers
+    \\to attach, to edit the file at that line, or to stop the session.
+    \\Without <id>, it lists the ids and groups the file has.
+    \\
+    \\Several ids, or a group, start one after another, and none is
+    \\attached: each says when it is ready, and tuppet prints the
+    \\sessions' ids and exits with the code of the first that failed. A
+    \\session that runs already is kept; one whose start failed or was
+    \\cut short with Ctrl-C is replaced, unless something was typed into
+    \\it since or someone is attached. So running the same start again
+    \\finishes what did not.
+    \\
+    \\The steps live in $XDG_CONFIG_HOME/tuppet/start (by default
+    \\~/.config/tuppet/start; TUPPET_START names another file, empty
+    \\reads none). tuppet refuses the file when another user owns it or
+    \\group or others may write it. A block starts with a line at the
+    \\left margin; its lines are indented, a keyword and the rest of the
+    \\line as literal text. Quotes ("...", with \" and \\ inside, and no
+    \\other backslash) keep spaces at its ends. A check may take how
+    \\long it waits in parentheses right after the keyword: expect(30s).
+    \\With (re), a text is a regex, taken as written ('tuppet help
+    \\conditions'): expect(re, 30s) ^me@db\d+:. Lines starting with # are
+    \\comments; a # later in a line is text.
+    \\
+    \\  steps jump
+    \\      send     ssh jump.example.com
+    \\      expect   me@jump:~$
+    \\
+    \\  steps become user pw=$SUDO_PW
+    \\      send     sudo -iu %{user}
+    \\      when     [sudo] password for me:
+    \\          secret %{pw}
+    \\      expect   %{user}@
+    \\
+    \\  start db1 db2 db*
+    \\      use      jump
+    \\      send     ssh %i.internal
+    \\      expect(30s) me@%i:~$
+    \\      fail     me@jump:~$
+    \\      use      become app $APP_PW
+    \\      send     cd /srv/app && git status
+    \\
+    \\blocks:
+    \\  start ID...       ids or patterns (* and ?); an exact id goes
+    \\                    before a pattern. %i or %{id} is the id started
+    \\  steps NAME [P | P=DEFAULT]...
+    \\                    steps for 'use' only; %{P} is a parameter
+    \\  use NAME [ARG]... the steps of a steps block, or of a start block
+    \\                    with a single id and no command, dir, size, or
+    \\                    timeout, at this place (8 deep at most)
+    \\  group NAME ID...  ids that 'tuppet start NAME' starts, on this line
+    \\                    alone: exact ids of start blocks, not groups
+    \\
+    \\inputs:
+    \\  send TEXT         type TEXT and Enter
+    \\  type TEXT         type TEXT
+    \\  keys KEYS         keys as 'tuppet key' takes them: <C-c>, <Up>
+    \\  secret [$VAR]     type a password and Enter: the variable's
+    \\                    value, or asked on the terminal without echo
+    \\  ask               type an answer asked on the terminal, and Enter
+    \\
+    \\checks, each with an optional (DUR) and (re) where it takes a text:
+    \\  expect TEXT       wait for TEXT to appear anew anywhere on a line
+    \\                    after the input; the input's own echo does not
+    \\                    count
+    \\  or TEXT           another text for the expect above
+    \\  gone TEXT         wait for TEXT to leave the screen
+    \\  settle QUIET      wait for the screen to change, then stay
+    \\                    unchanged for QUIET
+    \\  ended [STATUS]    wait for the program to end, with exit status
+    \\                    STATUS if given; the last step, and then
+    \\                    nothing is attached
+    \\Checks are optional. An input without one waits until the screen
+    \\changed below the input's line and then stayed still for 300 ms,
+    \\at most 2s, and goes on either way: it does not wait for a command
+    \\to finish, a program that prints all the time costs the 2s, and a
+    \\pager takes the next input (PAGER=cat helps). A block may end with
+    \\an input, typed before the terminal attaches. After each command
+    \\that changes where input goes (ssh, sudo, su), an expect tells
+    \\where it went; without one, a failed hop shows only later.
+    \\A block's first input waits until the program takes input: a
+    \\shell with line editing or a full-screen program once it reads
+    \\keys one at a time and its output paused 300 ms, a program that
+    \\reads whole lines once its output stayed still 1s; at most 5s,
+    \\which a program that prints nothing always waits.
+    \\For a remote shell (command ssh HOST), start with an expect for
+    \\its prompt, as --record does.
+    \\
+    \\questions that only sometimes come:
+    \\  when TEXT         when TEXT appears anew after the input, once
+    \\                    the output pauses, type the answer below it,
+    \\                    indented deeper: a send, type, keys, or secret
+    \\                    line. It answers once per input, while the
+    \\                    checks after it wait, up to the next input, or
+    \\                    while an input right before it pauses; first in
+    \\                    a block, from the program's start. The checks
+    \\                    wait as usual whether it comes or not:
+    \\
+    \\      send     ssh web1
+    \\      when     continue connecting (yes/no/[fingerprint])?
+    \\          send yes
+    \\      expect   me@web1:~$
+    \\
+    \\settings, above a block's first step:
+    \\  command WORDS     the program (default $SHELL); for variables,
+    \\                    command env LC_ALL=C bash -l
+    \\  dir PATH          its directory (default the current one)
+    \\  size WxH          the session's size (default the terminal's)
+    \\  timeout DUR       how long a check waits (default 10s, at most 10m)
+    \\  fail TEXT         text that fails the checks of this block and of
+    \\                    the blocks it uses
+    \\  nofail [TEXT]     leaves a failure text out of this block's own
+    \\                    checks; without TEXT, all the built-in ones
+    \\The first four are for start blocks only. 'fail' and 'nofail' at the
+    \\left margin before the first block apply to the whole file; a fail
+    \\right under a check (and its or lines) fails that check only, as
+    \\when the prompt a hop started from comes back:
+    \\
+    \\      expect   me@db1:~$
+    \\      fail     me@jump:~$
+    \\
+    \\A check fails at once when a failure text appears after the input,
+    \\or when the session ends, except for ended. Besides the fail lines,
+    \\built-in English texts fail checks (Permission denied, Connection
+    \\refused, Host key verification failed, Sorry, try again, command
+    \\not found, and others; see --check); a bare nofail turns them off,
+    \\and under another language LC_ALL=C keeps them working. A failure
+    \\text that is part of the input, or of what the check waits for, is
+    \\left out of that check.
+    \\
+    \\Passwords: a secret follows the expect of its prompt, or answers a
+    \\when that waits for it, which suits a sudo that asks only
+    \\sometimes. tuppet types the password only where a program waits for
+    \\it: its prompt on the cursor's line once output pauses, and nothing
+    \\typed into the session since. Variables that secrets read are left
+    \\out of the session's environment, and their values out of what
+    \\tuppet prints. An unset one is asked once in a run: once it worked,
+    \\the next sessions that read it get it too.
+    \\
+    \\options:
+    \\  -d, --detached    do not attach (also outside a terminal): print
+    \\                    the session's id; exit 1 when a failure text
+    \\                    stopped the run or the program ended with
+    \\                    another status, 3 on a timeout, 4 when the
+    \\                    session ended, 5 when nothing was typed for
+    \\                    safety (input came after a password prompt, or
+    \\                    the prompt was not on the cursor's line)
+    \\  --new             another session even if one has the name: ID-2
+    \\  -A, --atomic      when a start fails or Ctrl-C ends it, stop every
+    \\                    session this run opened, and start no more:
+    \\                    all run, or none of those it opened
+    \\  --check [ID]      read the file and report every problem, with
+    \\                    notes on loose checks; with an id, print the
+    \\                    steps as they would run
+    \\  --record ID       start COMMAND (default $SHELL) attached; do the
+    \\                    steps by hand, then press the detach key; tuppet
+    \\                    shows the block it wrote and asks before
+    \\                    appending it to the file
+    \\
+    \\While the steps run, a line shows the step and the session's
+    \\current line; Ctrl-C stops them and attaches. 'tuppet do SESSION
+    \\--use NAME' runs a block's steps in a session that runs already.
+    \\
+    \\examples:
+    \\  tuppet start db3
+    \\  tuppet start --check db3
+    \\  APP_PW=$(pass show app) tuppet start -A db1 db2 web
+    \\  APP_PW=$(pass show app) tuppet start -d db3
+    \\
+;
+
+const play_help =
+    \\tuppet play - play a recording into this terminal
+    \\
+    \\usage: tuppet play FILE.cast [--speed N] [--max-pause DUR]
+    \\
+    \\Plays an asciicast v2 recording, such as 'tuppet record' and 'tuppet
+    \\run --record' make, in this terminal at the pace it was recorded.
+    \\Space pauses and resumes, q or Ctrl-C quits, and after the last
+    \\frame play waits for any key. These keys work whatever keyboard and
+    \\mouse modes the recording turns on.
+    \\
+    \\The recording passes through the filter of 'tuppet attach', which
+    \\removes queries and the modes that make a terminal report on its
+    \\own, so this terminal never answers the recording. Recorded input
+    \\is left out. At the end play leaves the alternate screen, resets
+    \\the modes the recording may have set, and puts the cursor below
+    \\the last frame.
+    \\
+    \\Inside a tuppet session ($TUPPET_SESSION and $TUPPET_SESSION_SOCKET
+    \\set, and this terminal at the session's size, which a tmux pane in a
+    \\session is not), play resizes the session to the recording's size
+    \\and follows its resizes; an attach that resizes the session
+    \\meanwhile gets the recording's size back, and at the end the
+    \\session gets the size it had before, or the one the attach asked
+    \\for. Anywhere else the recording plays as it is: when it is larger
+    \\than this terminal, play says so once and waits 1.5 seconds.
+    \\
+    \\options:
+    \\  --speed N        play N times as fast (a number above 0, such as
+    \\                   2 or 0.5)
+    \\  --max-pause DUR  wait at most DUR between two frames (default:
+    \\                   the recording's idle_time_limit, else no limit)
+    \\
+    \\Outside a terminal play fails with exit 2. A recording you do not
+    \\trust is safest played in a session of its own under a drawn
+    \\attach, which paints only what tuppet's copy of the screen holds:
+    \\
+    \\  tuppet run -a --drawn -- tuppet play demo.cast
+    \\
+    \\exit codes: 0 after q or the key after the last frame, 1 a recording
+    \\that cannot be read or the terminal gone, 128+n interrupted by
+    \\signal n.
+    \\
+    \\examples:
+    \\  tuppet play demo.cast
+    \\  tuppet play demo.cast --speed 2 --max-pause 1s
+    \\
+;
+
 const wait_help =
     \\tuppet wait - block until a condition holds
     \\
     \\usage: tuppet wait <session>... [-m TEXT] [--gone TEXT] [-e] [-i DUR]
     \\                   [--settled DUR] [--hidden-input] [--hit NAME]
-    \\                   [--icase] [--after-input] [--since SEQ]
+    \\                   [--icase] [--regex] [--after-input] [--since SEQ]
     \\                   [--after-hit N] [-t DUR] [--any] [--view] [--stats]
     \\                   [-j]
     \\
@@ -914,8 +1283,8 @@ const wait_help =
     \\  --hit NAME        the alert NAME ('*': any alert) hit after the
     \\                    latest input, or with --after-hit N after hit N
     \\Several are alternatives. --after-input and --since apply to all of
-    \\them but --gone, --icase to -m and --gone, and --after-hit to --hit;
-    \\'tuppet help conditions' explains each one and its limits.
+    \\them but --gone, --icase and --regex to -m and --gone, and --after-hit
+    \\to --hit; 'tuppet help conditions' explains each one and its limits.
     \\
     \\It prints one line with the outcome, the condition that was met (its
     \\kind and its place among the conditions, counting from 0), the
@@ -1007,6 +1376,13 @@ const conditions_help =
     \\                    ones after the latest input
     \\  --icase           with -m and --gone: ignore the case of ASCII
     \\                    letters
+    \\  --regex           with -m and --gone: TEXT is a regex of at most 256
+    \\                    bytes, matched on each line: . [a-z] [^ ] \d \w \s
+    \\                    (and \D \W \S), \t, * + ? {n} {n,} {n,m} (m at
+    \\                    most 32), | and ( ), and ^ and $ for the line's
+    \\                    ends; a backslash before one of \ . ^ $ | ? * + ( )
+    \\                    [ ] { } / stands for that character. A pattern
+    \\                    that can match empty text fails
     \\
     \\modifiers (they apply to every condition; --gone takes none):
     \\  --after-input     only what is new since the latest input counts:
@@ -1130,7 +1506,7 @@ const alert_help =
     \\
     \\The file is a small subset of TOML: comments, sections, and
     \\key = value lines. Besides [alerts], with NAME = "TEXT" lines, it
-    \\takes [attach] for the detach key and the bell (see 'tuppet help
+    \\takes [attach] and [side] for attaching (see 'tuppet help
     \\attach'), and [png] and [png.presets] for the fonts of tuppet png
     \\(see 'tuppet help fonts'); anything else fails with the file and
     \\line. Only the CLI reads it.
@@ -1150,20 +1526,25 @@ const alert_help =
 const daemon_help =
     \\tuppet daemon - run the daemon in the foreground
     \\
-    \\usage: tuppet daemon [--socket PATH] [--log PATH]
+    \\usage: tuppet daemon [--socket PATH] [--log PATH] [--idle-exit] [--keep-fresh]
     \\
     \\The daemon owns the sessions and their ptys. Any other command
     \\starts it detached when it cannot reach one, so running it by hand
     \\is only needed for debugging or under a supervisor. It listens on
     \\$XDG_RUNTIME_DIR/tuppet-<uid>.sock, or on
-    \\/tmp/tuppet-<uid>/tuppet.sock when XDG_RUNTIME_DIR is unset or
-    \\empty. An auto-started daemon logs to the same path with .log in
-    \\place of .sock.
+    \\/tmp/tuppet-<uid>/tuppet.sock when XDG_RUNTIME_DIR is unset,
+    \\empty, or relative. An auto-started daemon logs to the same path
+    \\with .log in place of .sock.
     \\
     \\Without --socket the daemon exits after 30 s with no programs
     \\running and no clients (not on Windows); the next command starts a
     \\new one. TUPPET_IDLE_EXIT sets the wait as a duration (such as 30s
-    \\or 5m), and TUPPET_IDLE_EXIT=0 keeps the daemon running. SIGTERM or
+    \\or 5m), and TUPPET_IDLE_EXIT=0 keeps the daemon running.
+    \\--idle-exit makes any daemon, also one with --socket, exit after a
+    \\minute with no programs running and no clients. --keep-fresh
+    \\refreshes the times of the socket's folder, the socket, and its
+    \\lock every hour, so that age-based cleaning of /tmp leaves a
+    \\long-lived daemon alone. SIGTERM or
     \\SIGINT shuts it down as 'tuppet shutdown' does: every session stops
     \\and is saved, and the daemon exits 0. A second signal makes it exit
     \\at once, with status 1.
@@ -1284,12 +1665,133 @@ const help_help =
     \\
 ;
 
+const update_help =
+    \\tuppet update - change what a caller says about a session
+    \\
+    \\usage: tuppet update <session> [--label TEXT] [--accent | --no-accent]
+    \\                     [--mark M | --no-mark] [--group G] [--meta K=V]...
+    \\                     [--action SPEC]... [--no-actions] [-j]
+    \\
+    \\Changes, after 'tuppet run', what a drawn attach of a group shows
+    \\about the session (see 'tuppet help attach'). Only the options given
+    \\change; an empty --label or --mark takes it away. --group moves the
+    \\session into another group, where it gets the next free number (the
+    \\lowest no session of that group has); --group '' takes it out of
+    \\its group. --meta stores short values that the status returns and
+    \\tuppet does not read; an empty value takes a key away. --action
+    \\replaces the actions the switcher offers, and --no-actions takes
+    \\them away. A program in a session can update its own session
+    \\through TUPPET_SESSION and TUPPET_SESSION_SOCKET.
+    \\
+    \\An action SPEC is KEY[!]:NAME, where KEY is one character other than
+    \\a digit, / \ d f h; '!' asks for a second press while the session's
+    \\program runs. KEY:NAME:A|B|C makes the switcher ask for one of the
+    \\choices, KEY:NAME:?HINT for a line of text. tuppet only reports the
+    \\action ('tuppet events' prints action KEY [VALUE]).
+    \\
+    \\options:
+    \\  --label TEXT    the label shown next to the name (at most 64 bytes)
+    \\  --accent        show the name inverted at the bar's left end
+    \\  --mark M        a short mark next to the member (at most 16 bytes)
+    \\  --group G       move the session into group G
+    \\  --meta K=V      keep V under K
+    \\  --action SPEC   an action of the switcher, once per action
+    \\  -j, --json      print the reply
+    \\
+;
+
+const side_help =
+    \\tuppet side - set the view of a side session
+    \\
+    \\usage: tuppet side <session> --view compact|half|full [-j]
+    \\       tuppet side <session> --request [-j]
+    \\
+    \\A side session ('tuppet run --side-of NAME') is shown in a pane with
+    \\the session it is tied to. --view sets its view: compact, a few rows
+    \\with the keys on the session in front; half or full, drawn over it
+    \\with the keys on the side session. <session> is the side session or
+    \\the session it is tied to. A program in the side session sets its own
+    \\view with 'tuppet side $TUPPET_SESSION --view compact', for example
+    \\after acting. Events report the view as side-view.
+    \\
+    \\--request reports side-requested for a session without a side
+    \\session, as the side key of a drawn attach does; whoever follows the
+    \\events may start one.
+    \\
+;
+
+const lease_help =
+    \\tuppet lease - keep a session alive while this command runs
+    \\
+    \\usage: tuppet lease <session> [-j]
+    \\
+    \\Prints the session's id (its status with -j) and waits. When this
+    \\command ends for any reason, the daemon stops the session as 'tuppet
+    \\stop' does; when the session ends first, this command exits 0.
+    \\'tuppet run --lease' starts a session and holds its lease the same
+    \\way. Leases are kept by the daemon's hang-up watcher, not by request
+    \\slots, so any number of them can be open. Linux only.
+    \\
+;
+
+const respawn_help =
+    \\tuppet respawn - start an ended session's program again in its place
+    \\
+    \\usage: tuppet respawn <session> [--env NAME=VALUE]... [-j]
+    \\
+    \\Starts the command of an ended session again in a new session that
+    \\takes its place: it shows the old screen and history, and keeps the
+    \\name, directory, size, alerts, group, number, label, actions, and
+    \\the side session tied to it; the ended session is removed. It
+    \\prints the new session's id. Its environment is exactly the --env
+    \\entries plus the session's own variables (TERM, TUPPET_SESSION,
+    \\TUPPET_SESSION_SOCKET); nothing comes from this command's or the
+    \\daemon's environment, so give PATH when the command needs it.
+    \\
+;
+
+const flag_help =
+    \\tuppet flag - flag a session as needing attention
+    \\
+    \\usage: tuppet flag <session> --attention TEXT | --clear [-j]
+    \\
+    \\A drawn attach of the session's group marks a flagged member with !
+    \\and the text, and Space in its switcher goes there. The flag stays
+    \\until --clear, or until the member comes to the front of an attach.
+    \\
+;
+
+const commands_help =
+    \\tuppet commands - the commands a session's shell reported
+    \\
+    \\usage: tuppet commands <session> [N] [-j]
+    \\
+    \\A shell that prints OSC 133 marks (A and B around its primary prompt,
+    \\C when a command starts, D;CODE when it ended) tells tuppet its
+    \\commands. tuppet keeps the last 50: each command line (from B to C,
+    \\up to 4 KiB), its output (from C to D, the last 64 KiB), and its
+    \\exit code. This prints the last N (all kept by default): a line with
+    \\the number, the exit code, and the command, then the output indented.
+    \\The status gains shell (unknown, prompt, or running), prompt_seq,
+    \\last_exit, and paste_mode, and events report command-ended. tuppet
+    \\takes the marks as they come and checks nothing about who printed
+    \\them. 'tuppet do --at-prompt SEQ -p TEXT' puts one line on a prompt
+    \\that waits (see 'tuppet help do').
+    \\
+;
+
 const attach_help =
     \\tuppet attach - connect this terminal to a session live
     \\
-    \\usage: tuppet attach <session> [-r] [-f] [-k KEY] [--no-resize]
+    \\usage: tuppet attach <session> [-r [--no-keys]] [-f] [-k KEY]
+    \\                         [--label TEXT] [--no-resize]
+    \\                         [--drawn | --no-drawn] [--no-detach]
+    \\                         [--alt-screen] [--pass LIST] [--history N]
     \\       tuppet attach - [options]
-    \\       tuppet attach [-k KEY] [--no-resize]
+    \\       tuppet attach [-k KEY] [--no-resize] [--drawn | --no-drawn]
+    \\       tuppet attach [<session>] --drawn --group NAME [--end-with SESSION]
+    \\                         [--title TEXT] [--quiet-detach] [--no-detach]
+    \\                         [options]
     \\
     \\Shows the session's screen in this terminal and keeps it live. By
     \\default this attach is the session's writer: keystrokes go to the
@@ -1316,6 +1818,13 @@ const attach_help =
     \\terminal writes the session's output as it comes, marks nothing
     \\seen, and ends when the session does.
     \\
+    \\--history N first writes the session's last N older lines, the ones
+    \\above its screen: in a terminal they go into its scrollback, right
+    \\above the session and in order; outside one, 'attach -r' writes them
+    \\before the stream. A daemon too old for it says so on stderr, and the
+    \\attach goes on without them. It is a usage error with -r in a
+    \\terminal.
+    \\
     \\Without a session, opens the session picker, as a bare 'tuppet'
     \\does: your sessions, newest first, with a live preview, and a header
     \\that counts the ones that need you. Enter shows a session full
@@ -1330,13 +1839,115 @@ const attach_help =
     \\the [attach] section of the config file sets another; 'bell = false'
     \\there keeps the bell quiet. The terminal is restored on every exit.
     \\
+    \\--drawn paints the session itself, from tuppet's copy of its screen;
+    \\the program's output never reaches this terminal as written. It
+    \\paints on the normal screen, so lines that leave the session's
+    \\screen go into this terminal's own scrollback, once and in order,
+    \\and its search and copy keep working. It paints on the alternate
+    \\screen while the program is on its own, while a box has the
+    \\keyboard, while the window is smaller than the session (it says
+    \\so), and always with --alt-screen. When the window is resized, lines
+    \\next to the cut may appear twice in the scrollback; and a window that
+    \\shrinks can move tuppet's own line, or a --grab never box, into the
+    \\scrollback before tuppet repaints. At the end the last screen stays,
+    \\with the cursor below it. tuppet sets the input modes the
+    \\program asked for (cursor keys, keypad, mouse, focus, keyboard
+    \\protocols), keeps bracketed paste on and passes the brackets only to
+    \\a program that asked for them, and passes on the bell,
+    \\notifications, clipboard writes, and links (--pass chooses which),
+    \\never a clipboard read or the window title. After a broken stream it attaches again for up to 5 s.
+    \\When the program ends, so does the attach. What a drawn attach does
+    \\not do:
+    \\  - pictures, which tuppet's sessions do not store
+    \\  - anything else tuppet's copy of the screen does not hold
+    \\  - Windows, which has no attach
+    \\'drawn = true' in [attach] makes it the default for attach, run -a,
+    \\and the picker's 'a'; --no-drawn overrides that, and it never applies
+    \\to -r. Older tuppet versions refuse a config file with keys they do
+    \\not know, such as drawn, box_pause, set_aside, alt_screen, or pass.
+    \\
+    \\A drawn attach also shows boxes that 'tuppet run --over' starts over
+    \\the session. A box arrives as a line at the bottom right (the top
+    \\right on the alternate screen) and rings the bell once; it opens
+    \\once you paused typing for box_pause (1s unless [attach] says
+    \\otherwise), and takes keys only after the terminal
+    \\answered a cursor report and keys paused another 500 ms. The border
+    \\says wait…, then keys here. When it closes, a receipt shows and keys
+    \\are dropped until they pause for 500 ms. Every key but Esc and the
+    \\detach key goes to the program in the box. Esc (once the box has the
+    \\keys) or the detach key sets an open box aside (no other box opens by
+    \\itself until that one ended); the detach key opens a box that waits
+    \\and dismisses a receipt, and detaches only when no box is there. For
+    \\a second after either key acted on a box, more presses of it do
+    \\nothing, so pressing it over and over never detaches. With
+    \\'set_aside = false' in [attach], Esc goes to the box's program and
+    \\the detach key detaches from an open box. With --no-detach the
+    \\detach key never detaches while this attach writes; with both, an
+    \\open box keeps the keys until its program ends.
+    \\
     \\options:
     \\  -r, --read-only       only watch; keyboard input other than the
     \\                        detach key is ignored
+    \\  --no-keys             with -r: the viewer takes no key but the
+    \\                        detach key and shows no keys, for a caller
+    \\                        that lets someone only watch
     \\  -f, --force           take over writing from the current writer,
     \\                        which continues read-only
     \\  -k, --detach-key KEY  ^X, <C-x>, or one character (default ^])
+    \\  --label TEXT          what this writer calls itself, shown as the
+    \\                        session's writer (default: the terminal's
+    \\                        name, such as pts/3); at most 64 bytes,
+    \\                        without control characters
     \\  --no-resize           never resize the session to this terminal
+    \\  --drawn               paint the session from tuppet's copy of its
+    \\                        screen (not with -r, not outside a terminal)
+    \\  --no-drawn            pass the program's output on, also when the
+    \\                        config file says drawn = true
+    \\  --pass LIST           with --drawn: what of the session's and its
+    \\                        boxes' output reaches this terminal: a list of
+    \\                        bell, notifications, clipboard, and links, or
+    \\                        none (default all four; pass in [attach]).
+    \\                        tuppet's own bell for a box stays under bell
+    \\  --alt-screen          with --drawn: always paint on the alternate
+    \\                        screen, leaving this terminal's scrollback
+    \\                        alone (alt_screen = true in [attach])
+    \\  --no-detach           with --drawn: the detach key does nothing, and
+    \\                        the attach lasts until the program ends (exit
+    \\                        0 then means the program exited with 0); once
+    \\                        another client took over writing, the key
+    \\                        detaches again
+    \\  --history N           first write the last N older lines, 0 to
+    \\                        100000 (default 0)
+    \\  --group NAME          with --drawn: show the members of group NAME one
+    \\                        at a time, <session> first (default: the lowest
+    \\                        number); see 'Groups' below
+    \\  --end-with SESSION    with --group: end when SESSION ends, with its
+    \\                        code
+    \\  --title TEXT          with --group: the switcher's frame shows TEXT
+    \\                        instead of the group's name
+    \\  --quiet-detach        with --group: print nothing on detach (by
+    \\                        default tuppet says how to return)
+    \\
+    \\Groups: 'tuppet run --group NAME' makes sessions members of a group,
+    \\with numbers. --group shows them one at a time. From the second
+    \\member on, a bar on the bottom row names the member in front and the
+    \\others, with their numbers, state, marks, and ! with what needs
+    \\attention. F12 (switch_key) or the detach key (menu_key) opens the
+    \\switcher: digits, / to filter, Space for the next member that needs
+    \\attention, Enter to go, Esc to stay, F12 again to go back, \ sends
+    \\F12 on, d detaches (not with --no-detach), f steps the side pane, h
+    \\shows the history in $PAGER, and the caller's action letters ('tuppet
+    \\help update'); letters wait half a second after it opened. The
+    \\detach key twice sends it on. After a switch, keys are dropped until
+    \\the terminal answered; only the member in front writes into this
+    \\terminal's scrollback, after a dim line with its name (switch_marks).
+    \\An ended member stays dimmed until Enter or x closes (removes) it; r
+    \\is reported as an action. A member another window types in shows
+    \\read-only until Enter takes it over. F11 ([side] key) steps the side
+    \\session ('tuppet run --side-of') through compact (a pane below, or
+    \\beside on wide windows, or a strip in the bar; keys stay on the
+    \\member), half, and full (keys go to it); Esc goes back to compact.
+    \\On a member without one, F11 reports side-requested.
     \\
     \\exit codes (the one exception to the codes every other command
     \\uses: attach and run -a end with the program's own code):
@@ -1346,18 +1957,27 @@ const attach_help =
     \\  1     error, the writer role is taken, or this viewer fell too far
     \\        behind
     \\  2     bad arguments, or a writer attach outside a terminal
-    \\  4     the session was lost, so there is no screen to show
+    \\  4     the session was lost, so there is no screen to show, also
+    \\        while a drawn attach attached again
     \\  128+n this attach was ended by signal n; the session keeps running
     \\
     \\config file ($XDG_CONFIG_HOME/tuppet/config.toml, or TUPPET_CONFIG):
     \\  [attach]
     \\  bell = false
     \\  detach_key = "^A"
+    \\  drawn = true
+    \\  alt_screen = false
+    \\  pass = "bell,notifications"
+    \\  box_pause = "1s"
+    \\  set_aside = false
     \\
     \\examples:
     \\  tuppet attach 2
     \\  tuppet attach build -r
+    \\  tuppet attach build -r --no-keys -k ^Q
     \\  tuppet attach -
+    \\  tuppet attach agent --drawn --no-detach
+    \\  tuppet attach build --history 1000
     \\
 ;
 
@@ -1510,6 +2130,12 @@ const help_entries = [_]struct { name: []const u8, text: []const u8 }{
     .{ .name = "remove", .text = remove_help },
     .{ .name = "restart", .text = restart_help },
     .{ .name = "rename", .text = rename_help },
+    .{ .name = "update", .text = update_help },
+    .{ .name = "side", .text = side_help },
+    .{ .name = "lease", .text = lease_help },
+    .{ .name = "respawn", .text = respawn_help },
+    .{ .name = "flag", .text = flag_help },
+    .{ .name = "commands", .text = commands_help },
     .{ .name = "events", .text = events_help },
     .{ .name = "ack", .text = ack_help },
     .{ .name = "alert", .text = alert_help },
@@ -1519,6 +2145,7 @@ const help_entries = [_]struct { name: []const u8, text: []const u8 }{
     .{ .name = "view", .text = view_help },
     .{ .name = "png", .text = png_help },
     .{ .name = "record", .text = record_help },
+    .{ .name = "play", .text = play_help },
     .{ .name = "wait", .text = wait_help },
     .{ .name = "conditions", .text = conditions_help },
     .{ .name = "fonts", .text = fonts_help },
@@ -1527,6 +2154,7 @@ const help_entries = [_]struct { name: []const u8, text: []const u8 }{
     .{ .name = "llm-skill", .text = llm_skill_help },
     .{ .name = "attach", .text = attach_help },
     .{ .name = "sweep", .text = sweep_help },
+    .{ .name = "start", .text = start_help },
     .{ .name = "help", .text = help_help },
 };
 
@@ -1576,7 +2204,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         gpa.free(argv);
     }
 
-    runMain(gpa, argv[1..]) catch |err| switch (err) {
+    runMain(gpa, argv[@min(1, argv.len)..]) catch |err| switch (err) {
         // Usage errors already printed their message and hint.
         error.UsageError => std.process.exit(2),
         else => {
@@ -1607,10 +2235,13 @@ fn runMain(gpa: std.mem.Allocator, args_in: []const []const u8) !void {
     if (args.len > 0 and std.mem.eql(u8, args[0], "--socket")) {
         if (args.len < 2) return usageFail("missing value for --socket", .{});
         if (args[1].len == 0) return usageFail("--socket needs a non-empty path", .{});
+        // The endpoint travels in JSON strings too: the store, replies.
+        if (!std.unicode.utf8ValidateSlice(args[1])) return usageFail("the --socket path '{f}' is not valid UTF-8", .{std.unicode.fmtUtf8(args[1])});
         client.socket_override = args[1];
         args = args[2..];
     } else if (std.c.getenv("TUPPET_SOCKET")) |env| {
         const value = std.mem.span(env);
+        if (!std.unicode.utf8ValidateSlice(value)) client.runtimeFail("TUPPET_SOCKET '{f}' is not valid UTF-8", .{std.unicode.fmtUtf8(value)});
         if (value.len > 0) client.socket_override = value;
     }
     // Arguments travel to the daemon in JSON strings, which carry UTF-8
@@ -1628,6 +2259,8 @@ fn runMain(gpa: std.mem.Allocator, args_in: []const []const u8) !void {
     }
     return runCommand(gpa, args[0], args[1..]);
 }
+
+const daemon_usage = "usage: tuppet daemon [--socket PATH] [--log PATH] [--idle-exit] [--keep-fresh]";
 
 fn runCommand(gpa: std.mem.Allocator, cmd: []const u8, rest: []const []const u8) !void {
     // `tuppet <command> --help`: per-command help. Later, help is an
@@ -1654,15 +2287,20 @@ fn runCommand(gpa: std.mem.Allocator, cmd: []const u8, rest: []const []const u8)
                 i += 1;
                 if (rest[i].len == 0) return usageFail("{s} needs a non-empty path", .{a});
                 if (a[2] == 's') opts.socket = rest[i] else opts.log = rest[i];
+            } else if (std.mem.eql(u8, a, "--idle-exit")) {
+                opts.idle_exit = true;
+            } else if (std.mem.eql(u8, a, "--keep-fresh")) {
+                opts.keep_fresh = true;
             } else {
-                if (std.mem.startsWith(u8, a, "-")) return client.unknownOption(a, "usage: tuppet daemon [--socket PATH] [--log PATH]");
-                return usageFail("unexpected argument '{s}' (usage: tuppet daemon [--socket PATH] [--log PATH])", .{a});
+                if (std.mem.startsWith(u8, a, "-")) return client.unknownOption(a, daemon_usage);
+                return usageFail("unexpected argument '{s}' ({s})", .{ a, daemon_usage });
             }
         }
         if (opts.log != null and opts.socket == null) return usageFail("--log requires --socket", .{});
         // The daemon changes to / before it opens either path.
         if (opts.socket) |p| opts.socket = try client.absolutePath(gpa, p);
         if (opts.log) |p| opts.log = try client.absolutePath(gpa, p);
+        serving = true;
         return daemon.run(gpa, opts);
     }
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -1728,8 +2366,24 @@ fn dispatch(gpa: std.mem.Allocator, cmd: []const u8, rest: []const []const u8) !
         return attach_client.cmdAttach(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "sweep")) {
         return sweep.cmdSweep(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "play")) {
+        return play.cmdPlay(gpa, rest);
     } else if (std.mem.eql(u8, cmd, "shutdown")) {
         return client.cmdShutdown(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "start")) {
+        return start_run.cmdStart(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "update")) {
+        return client.cmdUpdate(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "side")) {
+        return client.cmdSide(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "lease")) {
+        return client.cmdLease(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "respawn")) {
+        return client.cmdRespawn(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "flag")) {
+        return client.cmdFlag(gpa, rest);
+    } else if (std.mem.eql(u8, cmd, "commands")) {
+        return client.cmdCommands(gpa, rest);
     }
     return usageFail("unknown command '{s}'", .{cmd});
 }
@@ -1772,23 +2426,36 @@ comptime {
     _ = @import("status.zig");
     _ = @import("view.zig");
     _ = @import("styles.zig");
+    _ = @import("paint.zig");
+    _ = @import("drawn.zig");
+    _ = @import("boxes.zig");
     _ = @import("words.zig");
     _ = @import("cond.zig");
+    _ = @import("regex.zig");
     _ = @import("evaluator.zig");
     _ = @import("hangup.zig");
     _ = @import("sample.zig");
     _ = @import("batch.zig");
     _ = @import("events.zig");
+    _ = @import("over.zig");
+    _ = @import("marks.zig");
+    _ = @import("member.zig");
+    _ = @import("group.zig");
     _ = @import("alert.zig");
     _ = @import("config.zig");
     _ = @import("sweep.zig");
+    _ = @import("play.zig");
+    _ = @import("start.zig");
+    _ = @import("start_run.zig");
+    _ = @import("start_record.zig");
 }
 
 test "every dispatched command has a help text" {
     const commands = [_][]const u8{
-        "run",    "list", "stop",  "remove", "restart",  "rename", "key",       "do",
-        "resize", "view", "png",   "record", "wait",     "daemon", "llm-skill", "attach",
-        "events", "ack",  "alert", "sweep",  "shutdown",
+        "run",    "list",  "stop",    "remove", "restart",  "rename", "key",       "do",
+        "resize", "view",  "png",     "record", "wait",     "daemon", "llm-skill", "attach",
+        "events", "ack",   "alert",   "sweep",  "shutdown", "play",   "start",     "update",
+        "side",   "lease", "respawn", "flag",   "commands",
     };
     for (commands) |name| {
         const text = commandHelp(name) orelse return error.MissingHelp;

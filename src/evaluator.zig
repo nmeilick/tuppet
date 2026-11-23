@@ -9,7 +9,8 @@
 //! as a wait for hidden input or an events subscriber. It finds the
 //! changes that events report (see events.zig), writes the frames of a
 //! trace recording (see record.zig), and takes the alert hits that
-//! settles found (see alert.zig), at most every 50 ms.
+//! settles found (see alert.zig), at most every 50 ms. On a box with
+//! unseen_ms, it stops the box when that ran out (see over.zig).
 //!
 //! Each wait is a refcounted Waiter. The request thread that blocks on
 //! it (or the recording whose conditions it checks), the evaluator while
@@ -20,6 +21,7 @@ const std = @import("std");
 const io_mod = @import("io.zig");
 const vt = @import("vt");
 const cond = @import("cond.zig");
+const regex = @import("regex.zig");
 const protocol = @import("protocol.zig");
 const status = @import("status.zig");
 const view = @import("view.zig");
@@ -31,6 +33,7 @@ const events = @import("events.zig");
 const record = @import("record.zig");
 const alert = @import("alert.zig");
 const ptyio = @import("ptyio.zig");
+const over = @import("over.zig");
 
 const Session = session_mod.Session;
 
@@ -84,6 +87,8 @@ pub const Waiter = struct {
     absent: []cond.Absent = &.{},
     /// One per condition: what its earlier checks found.
     memory: []cond.Memory = &.{},
+    /// One per condition: its match compiled, when it is a regex.
+    regexes: []?regex.Regex = &.{},
     /// The session's seq when the wait started.
     start_seq: u64 = 0,
     bundled: bool = false,
@@ -110,6 +115,9 @@ pub const Waiter = struct {
     /// The latest check skipped lines whose change the tracker no longer
     /// knew.
     unknown: bool = false,
+    /// Every condition that needs a scan looked at its history rows in
+    /// the latest check; until they do, `from` stays.
+    scanned: bool = false,
     /// The epoch whose skipped screen lines `lost` counts already: a
     /// screen line becomes unknown only at a resize, and stays so until it
     /// changes.
@@ -128,6 +136,7 @@ pub const Waiter = struct {
         w.until = try a.dupe(cond.Condition, opts.until);
         for (w.until) |*c| {
             if (c.match) |text| c.match = try a.dupe(u8, text);
+            if (c.typed) |text| c.typed = try a.dupe(u8, text);
             if (c.hit) |*h| h.name = try a.dupe(u8, h.name);
             if (c.needsScan()) w.matches = true;
             if (c.hidden_input) w.samples = true;
@@ -137,6 +146,16 @@ pub const Waiter = struct {
         for (w.absent) |*abs| abs.* = .{ .gpa = gpa };
         w.memory = try a.alloc(cond.Memory, w.until.len);
         @memset(w.memory, .{});
+        w.regexes = try a.alloc(?regex.Regex, w.until.len);
+        @memset(w.regexes, null);
+        errdefer for (w.regexes) |*re| if (re.*) |*r| r.deinit(gpa);
+        for (w.until, w.regexes) |c, *re| if (c.regex) {
+            var why: []const u8 = "";
+            re.* = regex.compile(gpa, c.match.?, .{ .icase = c.icase }, &why) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.BadPattern => return error.BadRegex,
+            };
+        };
         w.bundled = opts.bundled;
         w.view = opts.view;
         w.on_answer = opts.on_answer;
@@ -153,6 +172,7 @@ pub const Waiter = struct {
     pub fn release(w: *Waiter) void {
         if (w.refs.fetchSub(1, .acq_rel) != 1) return;
         for (w.absent) |*abs| abs.deinit();
+        for (w.regexes) |*re| if (re.*) |*r| r.deinit(w.gpa);
         w.arena.deinit();
         w.gpa.destroy(w);
     }
@@ -179,14 +199,20 @@ pub const Waiter = struct {
         };
     }
 
+    fn compiled(w: *const Waiter, i: usize) ?*const regex.Regex {
+        return if (w.regexes[i]) |*r| r else null;
+    }
+
     /// The first condition that holds.
     fn check(w: *Waiter, scan: ?*const cond.Scan, facts: cond.Facts) ?u32 {
         w.unknown = false;
+        w.scanned = true;
         for (w.until, 0..) |*c, i| {
             if (c.needsScan() and scan == null) continue;
-            const v = cond.check(c, scan, facts, .{ .start = w.start, .from = w.from, .start_seq = w.start_seq }, if (w.bundled) &w.absent[i] else null, &w.memory[i]);
+            const v = cond.check(c, w.compiled(i), scan, facts, .{ .start = w.start, .from = w.from, .start_seq = w.start_seq }, if (w.bundled) &w.absent[i] else null, &w.memory[i]);
             if (v.truncated) w.truncated = true;
             if (v.unknown) w.unknown = true;
+            if (c.needsScan() and !v.scanned) w.scanned = false;
             if (v.met) return @intCast(i);
         }
         return null;
@@ -197,13 +223,15 @@ pub const Waiter = struct {
     /// screen; terminal_mutex must be held.
     fn begin(w: *Waiter, s: *Session, from_start: bool) void {
         w.start_seq = if (from_start and s.track.epoch == 0) s.track.start_seq else s.track.seq.load(.acquire);
-        for (w.until, w.memory) |c, *m| {
-            if (c.absent) m.seen = cond.onScreen(w.gpa, &s.terminal, c.match.?, c.icase);
+        for (w.until, w.memory, 0..) |*c, *m, i| {
+            if (c.absent) m.seen = cond.onScreen(w.gpa, &s.terminal, .of(c, w.compiled(i)));
         }
     }
 
-    /// The scan checked the history rows up to its screen.
+    /// The scan checked the history rows up to its screen, unless the
+    /// latest check held some condition off before it looked at them.
     fn covered(w: *Waiter, scan: *const cond.Scan) void {
+        if (!w.scanned) return;
         if (scan.key == .primary and w.from < scan.first) w.lost += @intCast(scan.first - w.from);
         if (w.unknown) {
             for (scan.lines.items[0..scan.history]) |line| {
@@ -217,7 +245,8 @@ pub const Waiter = struct {
             }
         }
         w.dropped = @max(w.dropped, scan.dropped);
-        w.from = @max(w.from, scan.primary_top);
+        // The history is scanned only while the primary screen is active.
+        if (scan.key == .primary) w.from = @max(w.from, scan.primary_top);
     }
 
     /// The session's status and the screen, as of the answer.
@@ -363,7 +392,8 @@ pub fn register(s: *Session, w: *Waiter, from_start: bool) !bool {
         w.begin(s, from_start);
         e.mutex.lockUncancelable(io);
         defer e.mutex.unlock(io);
-        if (e.done or e.finishing) return false;
+        // A finishing evaluator still takes it into its last pass.
+        if (e.done) return false;
         try e.waiters.append(s.gpa, w);
         w.retain();
         if (w.samples) e.wanted += 1;
@@ -373,11 +403,9 @@ pub fn register(s: *Session, w: *Waiter, from_start: bool) !bool {
     return true;
 }
 
-/// Check `w` once on `s`, which has ended, and answer it.
+/// Check `w` once on `s`, which has ended, and answer it; `register`
+/// refused it.
 pub fn answerNow(s: *Session, w: *Waiter) void {
-    s.lockTerminal();
-    w.begin(s, false);
-    s.unlockTerminal();
     var scan: cond.Scan = .{ .gpa = w.gpa };
     defer scan.deinit();
     evaluate(s, &scan, &.{w}, true);
@@ -495,15 +523,18 @@ fn run(s: *Session) void {
             if (now >= last_hits + pass_interval_ns) {
                 took_hits = hits.take(s, false);
                 last_hits = now;
+                // The take may have held back the end of a burst.
+                later = @min(later, @max(s.hits.flushDue(), last_hits + pass_interval_ns));
             } else later = @min(later, last_hits + pass_interval_ns);
         } else later = @min(later, flush_at);
         if (s.recording_trace.load(.acquire) and framed != seen) {
             if (now >= last_frame + pass_interval_ns) {
                 // A settle without a visible text change keeps the slot.
                 if (record.traceFrame(s)) last_frame = now;
-                framed = s.track.settles.load(.acquire);
+                framed = seen;
             } else later = @min(later, last_frame + pass_interval_ns);
         }
+        if (over.checkUnseen(s, now)) |at| later = @min(later, at);
         if (idle) {
             s.track.waitNotified(seen, later);
             continue;
@@ -802,6 +833,7 @@ const TestWait = struct {
     tracker: track.Tracker,
     scan: cond.Scan,
     w: *Waiter,
+    end_seq: ?u64 = null,
 
     fn create(rows: u16, scrollback: usize) !*TestWait {
         const gpa = std.testing.allocator;
@@ -846,7 +878,7 @@ const TestWait = struct {
     fn pass(f: *TestWait) !bool {
         var settled = false;
         try std.testing.expect(try scanLocked(&f.tracker, &f.term, &f.scan, &.{f.w}, 0, &settled));
-        const facts: cond.Facts = .{ .now = 0, .last_text_change = 0, .end_seq = null, .input_seq = 0 };
+        const facts: cond.Facts = .{ .now = 0, .last_text_change = 0, .end_seq = f.end_seq, .input_seq = 0 };
         if (f.w.check(&f.scan, facts) != null) return true;
         f.w.covered(&f.scan);
         return false;
@@ -876,4 +908,24 @@ test "since skips rows whose change the tracker no longer knows, and counts them
     f.feed(flood.items);
     try std.testing.expect(!try f.pass());
     try std.testing.expect(f.w.reply().lost > 0);
+}
+
+test "rows that scrolled into the history right before the alternate screen came are checked after it" {
+    const f = try TestWait.create(3, 10_000);
+    defer f.destroy();
+    try f.wait(.{ .match = "NEEDLE" });
+    f.feed("NEEDLE\r\n1\r\n2\r\n3\x1b[?1049h");
+    try std.testing.expect(!try f.pass());
+    f.feed("\x1b[?1049l");
+    try std.testing.expect(try f.pass());
+}
+
+test "a match that another part of its condition holds off still sees the rows that scrolled by meanwhile" {
+    const f = try TestWait.create(3, 10_000);
+    defer f.destroy();
+    try f.wait(.{ .match = "NEEDLE", .ended = true });
+    f.feed("NEEDLE\r\n1\r\n2\r\n3");
+    try std.testing.expect(!try f.pass());
+    f.end_seq = f.tracker.seq.raw;
+    try std.testing.expect(try f.pass());
 }

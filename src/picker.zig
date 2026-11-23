@@ -23,11 +23,13 @@ const protocol = @import("protocol.zig");
 const plat = @import("plat.zig");
 const client = @import("client.zig");
 const attach_client = @import("attach_client.zig");
+const attach_filter = @import("attach_filter.zig");
 const words = @import("words.zig");
 const status = @import("status.zig");
 const names = @import("names.zig");
 const store = @import("store.zig");
 const limits = @import("limits.zig");
+const fuzz = @import("fuzz.zig");
 
 const Status = protocol.Status;
 
@@ -36,6 +38,10 @@ const list_interval_ns: i64 = 1000 * std.time.ns_per_ms;
 /// How long the cursor must rest on a row before its preview opens, so
 /// scrolling through the list does not open a stream per row.
 const preview_delay_ns: i64 = 80 * std.time.ns_per_ms;
+/// How long a stream that ended before its session waits before it is
+/// opened again, so a daemon that keeps dropping it is not called in a
+/// busy loop.
+const reopen_ns: i64 = 250 * std.time.ns_per_ms;
 /// How long the viewer's overlay stays after a switch.
 const overlay_ns: i64 = 2500 * std.time.ns_per_ms;
 /// How long a notice stays in the footer.
@@ -70,6 +76,10 @@ pub const Options = struct {
     bell: bool = true,
     /// Show only this session, in the viewer (`tuppet attach -r`).
     only: ?u64 = null,
+    /// "Take control" is a drawn attach.
+    drawn: bool = false,
+    /// With `only`: no key works but the detach key, and no key is shown.
+    no_keys: bool = false,
 };
 
 /// Run the picker; returns the exit code: 0 after q (or Esc in the
@@ -91,7 +101,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
     }
     if (store.lastDetached(gpa)) |id| try p.mru.append(gpa, id);
     try p.refreshList();
-    if (attach_client.nestedSession()) |id| if (opts.detach_key == attach_client.default_detach_key) {
+    if (attach_client.nestedSession()) |id| if (opts.detach_key == attach_client.default_detach_key and !opts.no_keys) {
         p.setNotice("this terminal is tuppet session #{d}; an attach around it takes Ctrl-] first (-k or TUPPET_DETACH_KEY sets another key)", .{id});
     };
     attach_client.installHandlers();
@@ -337,50 +347,54 @@ const Watch = struct {
             return .{ .refused = gpa.dupe(u8, "the daemon did not answer") catch &.{} };
         };
         defer gpa.free(split.line);
-        const Reply = struct { ok: bool, err: []const u8 = "the session cannot be watched", status: ?protocol.Status = null };
-        const reply = std.json.parseFromSlice(Reply, gpa, split.line, .{ .ignore_unknown_fields = true }) catch {
-            gpa.free(split.rest);
-            conn.deinit();
-            return .{ .refused = gpa.dupe(u8, "the daemon sent a malformed reply") catch &.{} };
+        defer gpa.free(split.rest);
+        const size = switch (openReply(gpa, split.line)) {
+            .ok => |size| size,
+            .refused => |why| {
+                conn.deinit();
+                return .{ .refused = why };
+            },
         };
-        defer reply.deinit();
-        const st = reply.value.status orelse protocol.Status{ .cols = 120, .rows = 40 };
-        if (!reply.value.ok) {
-            gpa.free(split.rest);
-            conn.deinit();
-            return .{ .refused = gpa.dupe(u8, reply.value.err) catch &.{} };
-        }
-        if (limits.sizeError(st.cols, st.rows)) |why| {
-            gpa.free(split.rest);
-            conn.deinit();
-            return .{ .refused = std.fmt.allocPrint(gpa, "the session's size {d}x{d} cannot be shown: {s}", .{ st.cols, st.rows, why }) catch &.{} };
-        }
-        const w = gpa.create(Watch) catch {
-            gpa.free(split.rest);
+        const w = create(gpa, id, passive, conn, size) catch {
             conn.deinit();
             return .{ .refused = &.{} };
         };
-        w.* = .{ .gpa = gpa, .id = id, .passive = passive, .conn = conn, .terminal = undefined, .stream = undefined };
-        w.terminal = vt.Terminal.init((vt.TinyIo.init).io(), gpa, .{
-            .cols = st.cols,
-            .rows = st.rows,
-            .max_scrollback_bytes = 0,
-        }) catch {
-            gpa.free(split.rest);
-            conn.deinit();
-            gpa.destroy(w);
-            return .{ .refused = &.{} };
-        };
-        var handler = w.terminal.vtHandler();
-        handler.effects = .readonly;
-        w.stream = vt.TerminalStream.init(.{ .handler = handler, .allocator = gpa });
         // No read timeout: the stream is quiet while the session is.
         var no_timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
         _ = std.c.setsockopt(w.conn.posix.socket.handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, @ptrCast(&no_timeout), @sizeOf(std.posix.timeval));
         w.buf.appendSlice(gpa, split.rest) catch {};
-        gpa.free(split.rest);
         w.drain();
         return .{ .ok = w };
+    }
+
+    /// The size of the session that the reply to a watch's attach opens,
+    /// or why it refuses, owned by `gpa`.
+    fn openReply(gpa: std.mem.Allocator, line: []const u8) union(enum) { ok: [2]u16, refused: []u8 } {
+        const Reply = struct { ok: bool, err: []const u8 = "the session cannot be watched", status: ?protocol.Status = null };
+        const reply = std.json.parseFromSlice(Reply, gpa, line, .{ .ignore_unknown_fields = true }) catch
+            return .{ .refused = gpa.dupe(u8, "the daemon sent a malformed reply") catch &.{} };
+        defer reply.deinit();
+        if (!reply.value.ok) return .{ .refused = gpa.dupe(u8, reply.value.err) catch &.{} };
+        const st = reply.value.status orelse protocol.Status{ .cols = 120, .rows = 40 };
+        if (limits.sizeError(st.cols, st.rows)) |why|
+            return .{ .refused = std.fmt.allocPrint(gpa, "the session's size {d}x{d} cannot be shown: {s}", .{ st.cols, st.rows, why }) catch &.{} };
+        return .{ .ok = .{ st.cols, st.rows } };
+    }
+
+    /// A watch over `conn`, whose copy of the screen is `size` large.
+    fn create(gpa: std.mem.Allocator, id: u64, passive: bool, conn: ipc.Conn, size: [2]u16) !*Watch {
+        const w = try gpa.create(Watch);
+        errdefer gpa.destroy(w);
+        w.* = .{ .gpa = gpa, .id = id, .passive = passive, .conn = conn, .terminal = undefined, .stream = undefined };
+        w.terminal = try vt.Terminal.init((vt.TinyIo.init).io(), gpa, .{
+            .cols = size[0],
+            .rows = size[1],
+            .max_scrollback_bytes = 0,
+        });
+        var handler = w.terminal.vtHandler();
+        handler.effects = .readonly;
+        w.stream = vt.TerminalStream.init(.{ .handler = handler, .allocator = gpa });
+        return w;
     }
 
     fn deinit(w: *Watch) void {
@@ -402,14 +416,18 @@ const Watch = struct {
     fn pump(w: *Watch) void {
         var chunk: [64 * 1024]u8 = undefined;
         const n = std.c.read(w.fd(), &chunk, chunk.len);
-        if (n <= 0) {
-            w.closed = true;
-            w.reopen = w.exit == null;
-            w.dirty = true;
-            return;
-        }
-        w.buf.appendSlice(w.gpa, chunk[0..@intCast(n)]) catch return;
+        // No frame is longer than a reply may be: a longer line ends the
+        // stream.
+        if (n <= 0 or w.buf.items.len + @as(usize, @intCast(n)) > client.max_reply) return w.ended();
+        w.buf.appendSlice(w.gpa, chunk[0..@intCast(n)]) catch return w.ended();
         w.drain();
+    }
+
+    /// The stream ended; unless the session did, it is opened again.
+    fn ended(w: *Watch) void {
+        w.closed = true;
+        w.reopen = w.exit == null;
+        w.dirty = true;
     }
 
     fn drain(w: *Watch) void {
@@ -533,7 +551,7 @@ fn cellStyle(s: anytype, color: bool) Style {
 }
 
 fn vtColor(c: anytype) Color {
-    return switch (c) {
+    return switch (c.value()) {
         .none => .default,
         .palette => |i| .{ .palette = i },
         .rgb => |rgb| .{ .rgb = .{ rgb.r, rgb.g, rgb.b } },
@@ -991,7 +1009,7 @@ const Picker = struct {
         for (1..n + 1) |step| {
             const at = if (backwards) (start + n - step % n) % n else (start + step) % n;
             const s = list[p.shown.items[at]];
-            if (words.needsAttention(s) and !p.isSelf(s.id)) return p.select(s.id);
+            if (words.needsAttention(s, list) and !p.isSelf(s.id)) return p.select(s.id);
         }
         p.setNotice("no session needs you", .{});
     }
@@ -1071,8 +1089,12 @@ const Picker = struct {
         const s = p.current() orelse return;
         const w = p.watch orelse return;
         if (w.id != s.id or w.passive or io_mod.nowNanos() - p.view_since < view_ack_ns) return;
+        // A stream to open again, the key help, or a terminal too small
+        // for the screen: the session is not what the person sees.
+        if (w.reopen or p.help or p.tooSmall()) return;
         const shown = status.shownOf(s);
-        if (p.acked) |last| if (last.id == s.id and (std.meta.eql(last.shown, shown) or !words.needsAttention(s))) return;
+        // No ack clears a waiting box, so boxes do not count here.
+        if (p.acked) |last| if (last.id == s.id and (std.meta.eql(last.shown, shown) or !words.needsAttention(s, &.{}))) return;
         if (p.ack(s.id, shown)) p.acked = .{ .id = s.id, .shown = shown };
     }
 
@@ -1126,7 +1148,10 @@ const Picker = struct {
                 continue;
             }
             if (attach_client.got_winch.swap(false, .acq_rel)) p.full_redraw = true;
-            if (fds[1].revents != 0) if (p.watch) |w| w.pump();
+            if (fds[1].revents != 0) if (p.watch) |w| {
+                w.pump();
+                if (w.closed and w.reopen) p.watch_due = io_mod.nowNanos() + reopen_ns;
+            };
             if (fds[0].revents != 0) {
                 var chunk: [1024]u8 = undefined;
                 const n = std.c.read(0, &chunk, chunk.len);
@@ -1154,6 +1179,10 @@ const Picker = struct {
 
     fn onKey(p: *Picker, key: Key, saved: std.posix.termios) !void {
         p.stale = true;
+        if (p.opts.no_keys) {
+            if (p.isDetachKey(key)) p.quit = true;
+            return;
+        }
         // Keys typed for the session that just had the terminal only
         // move around meanwhile; a Ctrl-C meant for it does not quit.
         if (io_mod.nowNanos() < p.settle_until and !p.isSettleKey(key)) return;
@@ -1175,6 +1204,7 @@ const Picker = struct {
         if (p.prompt != null) return if (key == .mouse) {} else p.onPromptKey(key);
         if (p.filtering) return p.onFilterKey(key);
         if (key == .mouse) return p.onMouse(key.mouse);
+        if (p.mode == .view and p.isDetachKey(key)) return p.back();
         if (try p.onCommonKey(key, saved)) return;
         switch (p.mode) {
             .list => switch (key) {
@@ -1215,7 +1245,7 @@ const Picker = struct {
                 .end => p.move(std.math.maxInt(isize) / 2),
                 // Enter does nothing here: only `a` attaches.
                 .escape, .backspace => p.back(),
-                .control => |b| if (b == p.opts.detach_key or b == attach_client.default_detach_key) p.back(),
+                .control => |b| if (b == attach_client.default_detach_key) p.back(),
                 .char => |c| switch (c) {
                     'q' => p.back(),
                     'k', 'h', 'p' => p.move(-1),
@@ -1285,14 +1315,29 @@ const Picker = struct {
         return true;
     }
 
+    fn isDetachKey(p: *const Picker, key: Key) bool {
+        const want = p.opts.detach_key;
+        return switch (key) {
+            .ctrl_c => want == 0x03,
+            .tab => want == '\t',
+            .enter => want == '\r' or want == '\n',
+            .backspace => want == 0x7f or want == 0x08,
+            .escape => want == 0x1b,
+            .control => |b| b == want,
+            .char => |c| c == want,
+            else => false,
+        };
+    }
+
     /// Whether `key` only moves around, looks, or leaves: what works
     /// right after an attach ended.
     fn isSettleKey(p: *const Picker, key: Key) bool {
+        if (key != .ctrl_c and p.isDetachKey(key)) return true;
         return switch (key) {
             .up, .down, .left, .right, .page_up, .page_down, .home, .end, .tab, .back_tab => true,
             // In `attach -r`'s viewer Esc quits.
             .escape => p.opts.only == null,
-            .control => |b| b == p.opts.detach_key or b == attach_client.default_detach_key,
+            .control => |b| b == attach_client.default_detach_key,
             .char => |c| std.mem.indexOfScalar(u8, "jkhlnpgG-q?", std.math.cast(u8, c) orelse return false) != null,
             else => false,
         };
@@ -1466,9 +1511,10 @@ const Picker = struct {
             defer if (text) |t| p.gpa.free(t);
             return p.setNotice("cannot restart #{d}: {s}", .{ id, text orelse "the request failed" });
         }
-        const new = reply.parsed.value.status.?.id;
+        const new = (reply.parsed.value.status orelse return p.setNotice("cannot restart #{d}: the daemon sent a malformed reply", .{id})).id;
         p.setNotice("restarted #{d} as #{d}", .{ id, new });
         p.selected = new;
+        if (p.opts.only != null) p.opts.only = new;
         p.watch_due = 0;
     }
 
@@ -1509,7 +1555,11 @@ const Picker = struct {
             return p.setNotice("cannot read the history of #{d}: {s}", .{ s.id, text orelse "the request failed" });
         }
         const v = reply.parsed.value;
-        const text = std.mem.trimEnd(u8, v.text, "\n");
+        var filter: attach_filter.Filter = .{};
+        defer filter.deinit(p.gpa);
+        const shown = try filter.feed(p.gpa, v.text);
+        defer p.gpa.free(shown);
+        const text = std.mem.trimEnd(u8, shown, "\n");
         const lines = if (text.len == 0) 0 else std.mem.count(u8, text, "\n") + 1;
         const header = try std.fmt.allocPrint(p.gpa, "history: {d} line{s} kept{s}\n", .{
             lines,
@@ -1554,6 +1604,7 @@ const Picker = struct {
             .resize = p.opts.resize,
             .bell = p.opts.bell,
             .end_on_takeover = true,
+            .drawn = p.opts.drawn,
         }, force) catch |err| {
             p.enter(saved);
             p.setNotice("cannot attach to #{d}: {s}", .{ s.id, reason(err) });
@@ -1653,7 +1704,7 @@ const Picker = struct {
             l.id_w = @max(l.id_w, std.fmt.count("{d}", .{s.id}));
             l.name_w = @max(l.name_w, @min(if (s.name) |n| n.len else 0, 16));
             var state_buf: [32]u8 = undefined;
-            l.state_w = @max(l.state_w, @min(utf8Len(words.stateWord(&state_buf, s)), 14));
+            l.state_w = @max(l.state_w, @min(utf8Len(words.stateWord(&state_buf, s, list)), 14));
             if (p.isSelf(s.id)) {
                 l.writer_w = @max(l.writer_w, self_label.len);
             } else if (s.writer) |w| {
@@ -1674,7 +1725,7 @@ const Picker = struct {
         var need: usize = 0;
         for (list) |s| {
             running += @intFromBool(s.state == .running);
-            need += @intFromBool(words.needsAttention(s));
+            need += @intFromBool(words.needsAttention(s, list));
         }
         var title_buf: [128]u8 = undefined;
         const full = if (p.disconnected)
@@ -1730,12 +1781,12 @@ const Picker = struct {
                 p.cursor = .{ y, 0 };
             }
             _ = g.text(y, 0, 1, if (sel) "›" else " ", base);
-            if (words.needsAttention(s)) _ = g.text(y, 1, 1, "!", if (sel) base else p.style(3, .{ .bold = true }));
+            if (words.needsAttention(s, list)) _ = g.text(y, 1, 1, "!", if (sel) base else p.style(3, .{ .bold = true }));
             var id_buf: [24]u8 = undefined;
             x = column(g, y, 3, l.id_w, std.fmt.bufPrint(&id_buf, "{d}", .{s.id}) catch "", base, true);
             if (l.name_w > 0) x = column(g, y, x, l.name_w, s.name orelse "", base, false);
             var state_buf: [32]u8 = undefined;
-            const state = words.stateWord(&state_buf, s);
+            const state = words.stateWord(&state_buf, s, list);
             var st = base;
             if (!sel) st = p.style(stateColor(s), .{ .faint = s.state == .lost or s.damaged != null });
             x = column(g, y, x, l.state_w, state, st, false);
@@ -1805,7 +1856,7 @@ const Picker = struct {
             if (s.name != null) " " else "",
             s.name orelse "",
             words.commandText(&cmd_buf, s.argv),
-            words.stateWord(&state_buf, s),
+            words.stateWord(&state_buf, s, p.all()),
             size[0],
             size[1],
         });
@@ -1844,14 +1895,14 @@ const Picker = struct {
         var crop_buf: [48]u8 = undefined;
         const crop = if (cropped) fmtCut(&crop_buf, " · {d}x{d} of {d}x{d}", .{ g.cols, g.rows, s.cols, s.rows }) else "";
         const line1 = if (p.opts.only != null)
-            fmtCut(&buf, " #{d}{s}{s} · {s} · {s}{s} ", .{ s.id, if (s.name != null) " " else "", s.name orelse "", words.commandText(&cmd_buf, s.argv), words.stateWord(&state_buf, s), crop })
+            fmtCut(&buf, " #{d}{s}{s} · {s} · {s}{s} ", .{ s.id, if (s.name != null) " " else "", s.name orelse "", words.commandText(&cmd_buf, s.argv), words.stateWord(&state_buf, s, p.all()), crop })
         else
             fmtCut(&buf, " ◂ #{d}{s}{s} · {s} · {s}{s}  {d}/{d} ▸ ", .{
                 s.id,
                 if (s.name != null) " " else "",
                 s.name orelse "",
                 words.commandText(&cmd_buf, s.argv),
-                words.stateWord(&state_buf, s),
+                words.stateWord(&state_buf, s, p.all()),
                 crop,
                 pos,
                 p.shown.items.len,
@@ -1859,12 +1910,15 @@ const Picker = struct {
         var line2_buf: [300]u8 = undefined;
         const back_word = if (p.opts.only != null) "quit" else "back";
         const room = g.cols -| 2;
+        const ended = if (p.watch) |w| (if (w.exit) |e| e else "ended") else "ended";
         const line2 = if (p.prompt != null)
             p.promptText(&line2_buf)
         else if (p.noticeShown()) |n|
             n
         else if (p.ended_view == s.id)
-            fmtCut(&line2_buf, "{s} · Esc {s}", .{ if (p.watch) |w| (if (w.exit) |e| e else "ended") else "ended", back_word })
+            (if (p.opts.no_keys) ended else fmtCut(&line2_buf, "{s} · Esc {s}", .{ ended, back_word }))
+        else if (p.opts.no_keys)
+            ""
         else if (p.offer_force == s.id)
             fitHints(&line2_buf, &.{ .{ "A take over", 0 }, .{ "←/→ switch", 1 }, .{ "Esc back", 0 } }, room)
         else if (p.opts.only != null)
@@ -1874,7 +1928,7 @@ const Picker = struct {
         const width = @min(g.cols, @max(utf8Len(line1), utf8Len(line2) + 2));
         const x = g.cols -| width;
         const box: Style = .{ .attrs = .{ .inverse = true } };
-        for (0..2) |r| {
+        for (0..if (line2.len > 0) 2 else 1) |r| {
             if (r >= g.rows) break;
             for (g.row(r)[x..][0..width]) |*c| c.* = .{ .style = box };
         }
@@ -1972,7 +2026,13 @@ const Picker = struct {
     fn flush(p: *Picker) !void {
         var w: std.Io.Writer.Allocating = .init(p.gpa);
         defer w.deinit();
-        const out = &w.writer;
+        try p.writeFrame(&w.writer);
+        try plat.stdoutWriteAll(w.written());
+        p.full_redraw = false;
+    }
+
+    /// The bytes that bring the terminal from the last frame to this one.
+    fn writeFrame(p: *Picker, out: *std.Io.Writer) !void {
         try out.writeAll("\x1b[?2026h");
         if (p.full_redraw) try out.writeAll("\x1b[0m\x1b[2J");
         const g = &p.grid;
@@ -1990,12 +2050,13 @@ const Picker = struct {
                     try writeSgr(out, c.style, p.color);
                     cur = c.style;
                 }
+                const cp: u21 = if (c.cp == 0) ' ' else if (status.isControl(c.cp)) 0xfffd else c.cp;
                 if (p.ascii) {
-                    try out.writeByte(if (c.cp == 0) ' ' else if (c.cp < 0x80) @intCast(c.cp) else asciiFallback(c.cp));
+                    try out.writeByte(if (cp < 0x80) @intCast(cp) else asciiFallback(cp));
                     continue;
                 }
                 var utf8: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(c.cp, &utf8) catch blk: {
+                const n = std.unicode.utf8Encode(cp, &utf8) catch blk: {
                     utf8[0] = '?';
                     break :blk 1;
                 };
@@ -2008,8 +2069,6 @@ const Picker = struct {
         // for screen readers and magnifiers that follow it.
         if (p.cursor) |c| try out.print("\x1b[{d};{d}H", .{ c[0] + 1, c[1] + 1 });
         try out.writeAll("\x1b[?2026l");
-        try plat.stdoutWriteAll(w.written());
-        p.full_redraw = false;
     }
 };
 
@@ -2071,7 +2130,7 @@ fn layoutWidth(l: Layout) usize {
 /// gets -+F, so a LESS=-F does not quit it before the history is read;
 /// after any other pager, which may have just printed the text (cat),
 /// wait for a key.
-fn page(gpa: std.mem.Allocator, header: []const u8, text: []const u8) void {
+pub fn page(gpa: std.mem.Allocator, header: []const u8, text: []const u8) void {
     const pager = if (std.c.getenv("PAGER")) |env| std.mem.span(env) else "";
     if (pager.len == 0) {
         if (pipeTo(gpa, &.{ "less", "-R", "-+F", "+G" }, header, text)) return;
@@ -2228,6 +2287,92 @@ test "text is clipped by width, wide characters included, and never panics" {
     g.row(0)[1] = .{ .cp = 'x' };
     g.repair();
     try std.testing.expectEqual(@as(u21, ' '), g.row(0)[0].cp);
+}
+
+test "the viewer only refuses or ends, whatever a daemon that is not trusted sends" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var bounded: fuzz.Bounded = .{ .child = std.testing.allocator, .limit = 64 << 20 };
+    const gpa = bounded.allocator();
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[1]);
+    // The watch closes the other end.
+    const watch = try Watch.create(gpa, 3, false, .{ .posix = .{ .socket = .{ .handle = fds[0], .address = undefined } } }, .{ 80, 24 });
+    defer watch.deinit();
+    var prng: std.Random.DefaultPrng = .init(0x7069636b6572);
+    const rand = prng.random();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(std.testing.allocator);
+    var frame: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..2000) |_| {
+        try fuzz.line(rand, .reply, &line, std.testing.allocator);
+        switch (Watch.openReply(gpa, line.items)) {
+            .ok => |size| try std.testing.expectEqual(@as(?[]const u8, null), limits.sizeError(size[0], size[1])),
+            .refused => |why| gpa.free(why),
+        }
+
+        try fuzz.line(rand, .frame, &line, std.testing.allocator);
+        watch.frame(line.items);
+
+        // The list and the viewer paint what the daemon says of its
+        // sessions, and only the picker's own sequences reach the
+        // terminal.
+        try fuzz.line(rand, .list, &line, std.testing.allocator);
+        const parsed = std.json.parseFromSlice(protocol.ListResp, gpa, line.items, .{ .ignore_unknown_fields = true }) catch continue;
+        var p: Picker = .{ .gpa = gpa, .opts = .{ .no_keys = rand.boolean() }, .color = rand.boolean(), .ascii = rand.boolean(), .self_id = null };
+        defer p.deinit();
+        p.sessions = .{ .parsed = parsed, .line = try gpa.dupe(u8, line.items), .gpa = gpa };
+        if (rand.boolean()) p.opts.only = 3;
+        p.applyFilter(null) catch continue;
+        if (p.shown.items.len > 0) p.selected = p.all()[p.shown.items[0]].id;
+        p.mode = if (rand.boolean()) .view else .list;
+        p.ended_view = if (rand.boolean()) p.selected else null;
+        p.overlay_pinned = true;
+        p.watch = watch;
+        defer p.watch = null;
+        try p.grid.resize(gpa, 80, 24);
+        try p.prev.resize(gpa, 80, 24);
+        switch (p.mode) {
+            .list => p.drawList(),
+            .view => p.drawView(),
+        }
+        p.grid.repair();
+        frame.clearRetainingCapacity();
+        try p.writeFrame(&frame.writer);
+        const out = frame.written();
+        try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+        for (out, 0..) |b, i| {
+            try std.testing.expect(b >= 0x20 or b == 0x1b);
+            if (b == 0x1b) try std.testing.expect(i + 1 < out.len and out[i + 1] == '[');
+        }
+        var it = std.unicode.Utf8View.initUnchecked(out).iterator();
+        while (it.nextCodepoint()) |cp| if (cp >= 0x80) try std.testing.expect(!status.isControl(cp));
+    }
+    try std.testing.expect(!bounded.exceeded);
+}
+
+test "a watch drops a stream whose line outgrows any reply, to open it again" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[1]);
+    const watch = try Watch.create(gpa, 3, false, .{ .posix = .{ .socket = .{ .handle = fds[0], .address = undefined } } }, .{ 80, 24 });
+    defer watch.deinit();
+    try watch.buf.appendNTimes(gpa, 'x', client.max_reply);
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(fds[1], "x", 1));
+    watch.pump();
+    try std.testing.expect(watch.closed and watch.reopen);
+}
+
+test "the viewer of attach -r quits on a detach key that is a plain character" {
+    var p: Picker = .{ .gpa = std.testing.allocator, .opts = .{ .only = 3, .detach_key = 'z' }, .color = false, .ascii = true, .self_id = null };
+    defer p.deinit();
+    try p.grid.resize(p.gpa, 80, 24);
+    p.mode = .view;
+    try p.onKey(.{ .char = 'z' }, undefined);
+    try std.testing.expect(p.quit);
 }
 
 test "narrow lists drop COMMAND, then AGE, then cut names, then drop the writer" {

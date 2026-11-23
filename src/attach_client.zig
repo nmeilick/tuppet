@@ -2,6 +2,7 @@
 //! viewer, or as its writer.
 
 const std = @import("std");
+const vt = @import("vt");
 const builtin = @import("builtin");
 const io_mod = @import("io.zig");
 const ipc = @import("ipc.zig");
@@ -16,8 +17,10 @@ const status = @import("status.zig");
 const store = @import("store.zig");
 const config_mod = @import("config.zig");
 const limits = @import("limits.zig");
+const drawn_mod = @import("drawn.zig");
+const fuzz = @import("fuzz.zig");
 
-const usage = "usage: tuppet attach [<session> | -] [-r] [-f] [-k KEY] [--no-resize]";
+const usage = "usage: tuppet attach [<session> | -] [-r [--no-keys]] [-f] [-k KEY] [--label TEXT] [--no-resize] [--drawn | --no-drawn] [--no-detach] [--alt-screen] [--pass LIST] [--history N]";
 
 /// Set from signal handlers; the main loop acts on them.
 pub var got_winch: std.atomic.Value(bool) = .{ .raw = false };
@@ -42,18 +45,65 @@ pub fn cmdAttach(gpa: std.mem.Allocator, args: []const []const u8) !void {
     var force = false;
     var resize = true;
     var key_flag: ?u8 = null;
+    var drawn_flag: ?bool = null;
+    var no_detach = false;
+    var alt_screen = false;
+    var pass: ?config_mod.Pass = null;
+    var no_keys = false;
+    var label: ?[]const u8 = null;
+    var history: u32 = 0;
+    var group: ?[]const u8 = null;
+    var end_with: ?[]const u8 = null;
+    var title: ?[]const u8 = null;
+    var quiet_detach = false;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (client.isOpt(a, "--read-only", "-r")) {
+        if (std.mem.eql(u8, a, "--group")) {
+            const g = try client.optValue(args, &i);
+            if (names.nameErrorOf(g, "group name")) |why| return client.cliFail("invalid group '{s}': {s}", .{ g, why });
+            group = g;
+        } else if (std.mem.eql(u8, a, "--end-with")) {
+            const ref_value = try client.optValue(args, &i);
+            if (names.refError(ref_value)) |why| return client.cliFail("invalid session '{s}': {s}", .{ ref_value, why });
+            end_with = ref_value;
+        } else if (std.mem.eql(u8, a, "--title")) {
+            const value = try client.optValue(args, &i);
+            if (labelError(value)) |why| return client.cliFail("invalid title '{f}': {s}", .{ status.cleaned(value), why });
+            title = value;
+        } else if (std.mem.eql(u8, a, "--quiet-detach")) {
+            quiet_detach = true;
+        } else if (client.isOpt(a, "--read-only", "-r")) {
             read_only = true;
+        } else if (std.mem.eql(u8, a, "--no-keys")) {
+            no_keys = true;
+        } else if (std.mem.eql(u8, a, "--label")) {
+            const value = try client.optValue(args, &i);
+            if (labelError(value)) |why| return client.cliFail("invalid label '{f}': {s}", .{ status.cleaned(value), why });
+            label = value;
         } else if (client.isOpt(a, "--force", "-f")) {
             force = true;
         } else if (std.mem.eql(u8, a, "--no-resize")) {
             resize = false;
+        } else if (std.mem.eql(u8, a, "--drawn")) {
+            drawn_flag = true;
+        } else if (std.mem.eql(u8, a, "--no-drawn")) {
+            drawn_flag = false;
+        } else if (std.mem.eql(u8, a, "--no-detach")) {
+            no_detach = true;
+        } else if (std.mem.eql(u8, a, "--alt-screen")) {
+            alt_screen = true;
+        } else if (std.mem.eql(u8, a, "--pass")) {
+            const spec = try client.optValue(args, &i);
+            pass = config_mod.parsePass(spec) orelse
+                return client.cliFail("invalid --pass '{s}' (use a list of bell, notifications, clipboard, and links, or none)", .{spec});
         } else if (client.isOpt(a, "--detach-key", "-k")) {
             const spec = try client.optValue(args, &i);
             key_flag = config_mod.parseDetachKey(spec) orelse
                 return client.cliFail("invalid detach key '{s}' (use ^X, <C-x>, or one character)", .{spec});
+        } else if (std.mem.eql(u8, a, "--history")) {
+            const text = try client.optValue(args, &i);
+            history = protocol.parseDecimal(u32, text) orelse protocol.max_history_rows + 1;
+            if (history > protocol.max_history_rows) return client.cliFail("invalid --history '{s}' (a number of lines from 0 to {d})", .{ text, protocol.max_history_rows });
         } else if (std.mem.eql(u8, a, "-") or !std.mem.startsWith(u8, a, "-")) {
             if (ref != null) return client.cliFail("attach takes one session (got '{s}' and '{s}')", .{ ref.?, a });
             ref = a;
@@ -62,12 +112,48 @@ pub fn cmdAttach(gpa: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
     if (read_only and force) return client.cliFail("--force takes over writing and cannot be combined with --read-only", .{});
+    if (read_only and drawn_flag == true) return client.cliFail("--drawn paints the session for its writer and cannot be combined with --read-only", .{});
+    if (read_only and no_detach) return client.cliFail("--no-detach goes with a drawn attach as the writer and cannot be combined with --read-only", .{});
+    if (read_only and label != null) return client.cliFail("--label names the writer and cannot be combined with --read-only", .{});
+    if (no_keys and !read_only) return client.cliFail("--no-keys goes with --read-only: a writer's keys go to the program", .{});
+    if (drawn_flag == true) try checkDrawnSupported();
     const defaults = try settingsFor(gpa, key_flag);
+    // The config file's `drawn` never applies to the read-only viewer.
+    const drawn = !read_only and (drawn_flag orelse defaults.drawn);
+    if (no_detach and !drawn) return client.cliFail("--no-detach needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+    if (alt_screen and !drawn) return client.cliFail("--alt-screen needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+    if (pass != null and !drawn) return client.cliFail("--pass needs a drawn attach (--drawn, or drawn = true in the config file)", .{});
+    if (end_with != null and group == null) return client.cliFail("--end-with goes with --group", .{});
+    if (title != null and group == null) return client.cliFail("--title goes with --group", .{});
+    if (quiet_detach and group == null) return client.cliFail("--quiet-detach goes with --group", .{});
+    if (group) |g| {
+        if (!drawn or read_only) return client.cliFail("--group shows its members in a drawn attach: give --drawn, and no -r", .{});
+        if (force) return client.cliFail("--group takes no --force: a member another window types in offers Enter to take it over", .{});
+        try checkWriterTerminal("attach --group");
+        var settings = defaults;
+        settings.drawn = true;
+        settings.resize = resize;
+        settings.no_detach = no_detach;
+        settings.paint_alt = settings.paint_alt or alt_screen;
+        settings.pass = pass orelse settings.pass;
+        settings.label = label;
+        settings.history = history;
+        settings.group = g;
+        settings.end_with = end_with;
+        settings.title = title;
+        settings.quiet_detach = quiet_detach;
+        if (history > 0 and settings.paint_alt) return client.cliFail("--history writes older lines into this terminal's scrollback, which the alternate screen does not have", .{});
+        if (!no_keys) warnNested(settings.detach_key);
+        try attachSession(gpa, ref orelse "", settings, false, null);
+    }
     const given = ref orelse {
-        if (read_only or force) return client.cliFail("{s} needs a session: tuppet attach <session> {s}", .{ if (read_only) "--read-only" else "--force", if (read_only) "-r" else "-f" });
-        return pick(gpa, .{ .detach_key = defaults.detach_key, .resize = resize, .bell = defaults.bell });
+        if (read_only or force or no_detach or label != null or history > 0) return client.cliFail("{s} needs a session: tuppet attach <session> {s}", .{
+            if (read_only) "--read-only" else if (force) "--force" else if (no_detach) "--no-detach" else if (label != null) "--label" else "--history",
+            if (read_only) "-r" else if (force) "-f" else if (no_detach) "--no-detach" else if (label != null) "--label TEXT" else "--history N",
+        });
+        return pick(gpa, .{ .detach_key = defaults.detach_key, .resize = resize, .bell = defaults.bell, .drawn = drawn });
     };
-    if (!read_only) try checkWriterTerminal("attach");
+    if (!read_only) try checkWriterTerminal(if (drawn) "attach --drawn" else "attach");
     var id_buf: [24]u8 = undefined;
     const target = if (std.mem.eql(u8, given, "-")) blk: {
         const id = store.lastDetached(gpa) orelse
@@ -79,15 +165,34 @@ pub fn cmdAttach(gpa: std.mem.Allocator, args: []const []const u8) !void {
     // one session: it fits the session to this terminal and labels the
     // crop.
     if (builtin.os.tag != .windows and read_only and std.c.isatty(0) == 1 and std.c.isatty(1) == 1) {
+        if (history > 0) return client.cliFail("--history applies to the raw attach, the drawn attach, and 'attach -r' outside a terminal, not to the viewer that -r opens in one", .{});
         const id = try client.resolveOne(gpa, target);
         if (try selfSession(gpa) == id) client.runtimeFail("session {d} is this terminal; showing it here would feed its screen back into itself", .{id});
-        std.process.exit(try picker.run(gpa, .{ .detach_key = defaults.detach_key, .bell = defaults.bell, .only = id }));
+        std.process.exit(try picker.run(gpa, .{ .detach_key = defaults.detach_key, .bell = defaults.bell, .only = id, .no_keys = no_keys }));
     }
     var settings = defaults;
     settings.write = !read_only;
     settings.resize = resize and !read_only;
-    warnNested(settings.detach_key);
+    settings.drawn = drawn;
+    settings.no_detach = no_detach;
+    settings.paint_alt = settings.paint_alt or alt_screen;
+    settings.pass = pass orelse settings.pass;
+    settings.label = label;
+    settings.history = history;
+    if (history > 0 and (settings.alt_screen or (drawn and settings.paint_alt))) return client.cliFail("--history writes older lines into this terminal's scrollback, which the alternate screen does not have", .{});
+    if (!no_keys) warnNested(settings.detach_key);
     try attachSession(gpa, target, settings, force, null);
+}
+
+/// Why `label` cannot be a writer's label, or null when it can: the
+/// daemon would cut or change it.
+fn labelError(label: []const u8) ?[]const u8 {
+    if (label.len == 0) return "it is empty";
+    if (label.len > status.max_label_len) return std.fmt.comptimePrint("it is longer than {d} bytes", .{status.max_label_len});
+    if (!std.unicode.utf8ValidateSlice(label)) return "it is not UTF-8";
+    var it = std.unicode.Utf8View.initUnchecked(label).iterator();
+    while (it.nextCodepoint()) |cp| if (status.isControl(cp)) return "it has control characters";
+    return null;
 }
 
 /// Attach settings from the environment and the config file: the detach
@@ -106,7 +211,38 @@ pub fn settingsFor(gpa: std.mem.Allocator, flag: ?u8) !Settings {
         if (value.len > 0) key = config_mod.parseDetachKey(value) orelse
             return client.cliFail("invalid TUPPET_DETACH_KEY '{s}' (use ^X, <C-x>, or one character)", .{value});
     };
-    return .{ .detach_key = key, .bell = config.bell };
+    return .{
+        .detach_key = key,
+        .bell = config.bell,
+        .drawn = config.drawn,
+        .box_pause_ms = config.box_pause_ms,
+        .paint_alt = config.alt_screen,
+        .pass = config.pass,
+        .set_aside = config.set_aside,
+        .switch_key = config.switch_key,
+        .switch_marks = config.switch_marks,
+        .side = .{
+            .key = config.side.key,
+            .sizes = sideSizes(config.side.sizes),
+            .layout = config.side.layout,
+            .rows = config.side.rows,
+            .front_min = config.side.front_min,
+            .pane_min = config.side.pane_min,
+        },
+    };
+}
+
+/// The config file's side sizes, kept past the config's arena.
+fn sideSizes(sizes: []const config_mod.SideView) []const config_mod.SideView {
+    const all = [_]config_mod.SideView{ .compact, .half, .full };
+    if (sizes.len == 3) return &all;
+    if (sizes[1] == .half) return all[0..2];
+    return &.{ .compact, .full };
+}
+
+/// `--drawn` is a usage error where a drawn attach cannot work at all.
+pub fn checkDrawnSupported() error{UsageError}!void {
+    if (builtin.os.tag == .windows) return client.cliFail("--drawn is not available on Windows", .{});
 }
 
 /// The session this terminal runs in, of whichever daemon.
@@ -153,7 +289,7 @@ fn pick(gpa: std.mem.Allocator, opts: picker.Options) !void {
     for (sessions) |s| {
         var state_buf: [32]u8 = undefined;
         var cmd_buf: [512]u8 = undefined;
-        try msg.writer.print("\n  {d}  {s}  {s}  {s}", .{ s.id, s.name orelse "-", words.stateWord(&state_buf, s), words.commandText(&cmd_buf, s.argv) });
+        try msg.writer.print("\n  {d}  {f}  {f}  {s}", .{ s.id, status.cleaned(s.name orelse "-"), status.cleaned(words.stateWord(&state_buf, s, sessions)), words.commandText(&cmd_buf, s.argv) });
     }
     try msg.writer.writeAll("\nrun 'tuppet help attach' for usage\n");
     plat.stderrWriteAll(msg.written()) catch {};
@@ -227,9 +363,15 @@ pub fn attach(gpa: std.mem.Allocator, ref: []const u8, settings: Settings, force
     if (builtin.os.tag == .windows) return error.Unsupported;
     // Checked before the attach: a forced one would take the writer role
     // from the terminal this one runs in.
-    if (try selfSession(gpa)) |self| if (try picks(gpa, ref, self)) {
+    if (ref.len > 0) if (try selfSession(gpa)) |self| if (try picks(gpa, ref, self)) {
         return .{ .kind = .refused, .code = client.exit_code.failed, .message = try std.fmt.allocPrint(gpa, "tuppet: session {d} is this terminal; attaching to it would feed its screen back into itself\n", .{self}) };
     };
+    if (settings.drawn and settings.write) return drawn_mod.attach(gpa, ref, settings, force);
+    var history = settings.history;
+    if (history > 0 and !try client.daemonSupports(gpa, "history")) {
+        plat.stderrWriteAll("tuppet: the daemon is an older tuppet without --history; attaching without older lines\n") catch {};
+        history = 0;
+    }
     var label_buf: [64]u8 = undefined;
     // The first redraw comes at this terminal's size, not the session's.
     var size = if (settings.write and settings.resize) terminalSize() else null;
@@ -245,9 +387,10 @@ pub fn attach(gpa: std.mem.Allocator, ref: []const u8, settings: Settings, force
             .session = ref,
             .mode = if (settings.write) .write else .read,
             .force = force,
-            .label = if (settings.write) terminalLabel(&label_buf) else null,
+            .label = if (settings.write) settings.label orelse terminalLabel(&label_buf) else null,
             .cols = if (size) |sz| sz[0] else null,
             .rows = if (size) |sz| sz[1] else null,
+            .history = if (history > 0) history else null,
         });
         defer gpa.free(req);
         try conn.sendLine(req);
@@ -255,46 +398,73 @@ pub fn attach(gpa: std.mem.Allocator, ref: []const u8, settings: Settings, force
         const line = split.line;
         rest = split.rest;
         defer gpa.free(line);
-        const reply = std.json.parseFromSlice(struct { ok: bool, status: ?protocol.Status = null }, gpa, line, .{ .ignore_unknown_fields = true }) catch
-            return error.BadReply;
-        defer reply.deinit();
-        if (!reply.value.ok) {
-            const parsed = std.json.parseFromSlice(protocol.ErrorReply, gpa, line, .{ .ignore_unknown_fields = true }) catch return error.BadReply;
-            defer parsed.deinit();
-            // A daemon from before attach requests carried a size refuses
-            // it: attach without, and send the size in a frame after.
-            if (size != null and std.mem.eql(u8, parsed.value.code, @tagName(protocol.Code.bad_request))) {
+        switch (try attachReply(gpa, line, size != null)) {
+            .retry_unsized => {
                 size = null;
                 conn.deinit();
                 gpa.free(rest);
                 rest = &.{};
                 continue;
-            }
-            const message = try std.fmt.allocPrint(gpa, "tuppet: {s}\n", .{parsed.value.err});
-            conn.deinit();
-            return .{ .kind = .refused, .code = client.exitFor(parsed.value.code), .message = message };
+            },
+            .refused => |outcome| {
+                conn.deinit();
+                return outcome;
+            },
+            .attached => |st| {
+                if (settings.write) ack(gpa, st.id, st.shown);
+                session_size = st.size;
+                break st.id;
+            },
         }
-        const st = reply.value.status orelse return error.BadReply;
-        if (settings.write) ack(gpa, st.id, status.shownOf(st));
-        session_size = .{ st.cols, st.rows };
-        break st.id;
     };
     defer conn.deinit();
     var id_buf: [20]u8 = undefined;
     const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
     var final: ?status.Shown = null;
     const outcome = run(gpa, &conn, id, id_text, settings, size, session_size, rest, &final);
+    settle(gpa, id, settings.write, outcome, final);
+    return outcome;
+}
+
+/// What the daemon's reply to an attach request says.
+const Reply = union(enum) {
+    attached: struct { id: u64, size: [2]u16, shown: status.Shown },
+    /// A daemon from before attach requests carried a size refused one:
+    /// attach without, and send the size in a frame after.
+    retry_unsized,
+    refused: Outcome,
+};
+
+/// Read the reply to an attach request; `sized` says that the request
+/// carried a size.
+fn attachReply(gpa: std.mem.Allocator, line: []const u8, sized: bool) !Reply {
+    const reply = std.json.parseFromSlice(struct { ok: bool, status: ?protocol.Status = null }, gpa, line, .{ .ignore_unknown_fields = true }) catch
+        return error.BadReply;
+    defer reply.deinit();
+    if (reply.value.ok) {
+        const st = reply.value.status orelse return error.BadReply;
+        return .{ .attached = .{ .id = st.id, .size = .{ st.cols, st.rows }, .shown = status.shownOf(st) } };
+    }
+    const parsed = std.json.parseFromSlice(protocol.ErrorReply, gpa, line, .{ .ignore_unknown_fields = true }) catch return error.BadReply;
+    defer parsed.deinit();
+    if (sized and std.mem.eql(u8, parsed.value.code, @tagName(protocol.Code.bad_request))) return .retry_unsized;
+    const message = try std.fmt.allocPrint(gpa, "tuppet: {f}\n", .{status.cleaned(parsed.value.err)});
+    return .{ .refused = .{ .kind = .refused, .code = client.exitFor(parsed.value.code), .message = message } };
+}
+
+/// After an attach to session `id` ended: remember it for `attach -`
+/// when it was left running, and as its writer, ack what it showed.
+pub fn settle(gpa: std.mem.Allocator, id: u64, write: bool, outcome: Outcome, final: ?status.Shown) void {
     switch (outcome.kind) {
         .detached, .taken => store.setLastDetached(gpa, id),
         else => {},
     }
-    if (settings.write) switch (outcome.kind) {
+    if (write) switch (outcome.kind) {
         .exited => ack(gpa, id, final),
         .detached, .taken => ack(gpa, id, null),
         .failed => if (outcome.code > 128) ack(gpa, id, null),
         .refused => {},
     };
-    return outcome;
 }
 
 /// Whether `ref` picks session `id` alone.
@@ -309,7 +479,7 @@ fn picks(gpa: std.mem.Allocator, ref: []const u8, id: u64) !bool {
 /// Tell the daemon what this terminal showed of session `id`: `shown`,
 /// or, without it, the session as it is now, all of which a writer has
 /// had on its screen.
-fn ack(gpa: std.mem.Allocator, id: u64, shown: ?status.Shown) void {
+pub fn ack(gpa: std.mem.Allocator, id: u64, shown: ?status.Shown) void {
     var id_buf: [20]u8 = undefined;
     const ref = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch unreachable;
     const values = shown orelse blk: {
@@ -326,7 +496,7 @@ fn ack(gpa: std.mem.Allocator, id: u64, shown: ?status.Shown) void {
 extern "c" fn ttyname(fd: c_int) ?[*:0]const u8;
 
 /// The terminal this attach runs in, such as "pts/3", as its writer label.
-fn terminalLabel(buf: []u8) ?[]const u8 {
+pub fn terminalLabel(buf: []u8) ?[]const u8 {
     if (builtin.os.tag == .windows) return null;
     const name = ttyname(0) orelse return null;
     const path = std.mem.span(name);
@@ -348,6 +518,42 @@ pub const Settings = struct {
     /// End the attach when another client takes over writing, instead of
     /// going on read-only (the picker shows the session in its viewer).
     end_on_takeover: bool = false,
+    /// Paint the session from a copy of its screen (drawn.zig) instead of
+    /// passing its output on.
+    drawn: bool = false,
+    /// In a drawn attach, the detach key does not detach: the attach lasts
+    /// until the program ends.
+    no_detach: bool = false,
+    /// In a drawn attach, the person may set an open box aside with Esc
+    /// or the detach key; null reads it from the config file.
+    set_aside: ?bool = null,
+    /// In a drawn attach, how long keys pause before a box opens by
+    /// itself; null reads it from the config file.
+    box_pause_ms: ?u64 = null,
+    /// A drawn attach paints on the alternate screen, as the picker's
+    /// does, instead of on the normal screen with its scrollback.
+    paint_alt: bool = false,
+    /// Write this many older rows of the session first.
+    history: u32 = 0,
+    /// What a drawn attach passes on.
+    pass: config_mod.Pass = .{},
+    /// What the writer calls itself; null takes the terminal's name, such
+    /// as "pts/3".
+    label: ?[]const u8 = null,
+    /// This terminal's default foreground and background, when known.
+    colors: ?[2]vt.color.RGB = null,
+    /// A drawn attach of this group: its members one at a time.
+    group: ?[]const u8 = null,
+    /// With `group`: end at once when this session ends, with its status.
+    end_with: ?[]const u8 = null,
+    /// With `group`: what the switcher's frame calls the group instead of
+    /// its name.
+    title: ?[]const u8 = null,
+    /// With `group`: detach without saying how to come back.
+    quiet_detach: bool = false,
+    switch_key: config_mod.Key = .{ .function = 12 },
+    switch_marks: bool = true,
+    side: config_mod.Side = .{},
 };
 
 /// How long the session's screen waits after a takeover notice, so it
@@ -368,6 +574,7 @@ fn run(gpa: std.mem.Allocator, conn: *ipc.Conn, id: u64, id_text: []const u8, se
     installHandlers();
     const saved = if (stdin_tty) plat.tcgetattr(0) catch null else null;
     if (saved) |orig| setRaw(orig);
+    if (stdout_tty) painting.store(true, .release);
     if (settings.alt_screen and stdout_tty) plat.stdoutWriteAll("\x1b[?1049h") catch {};
     var state: Loop = .{ .gpa = gpa, .sock = sock, .id = id, .id_text = id_text, .settings = settings, .sent_size = size };
     state.filter.stay_on_screen = settings.alt_screen;
@@ -393,8 +600,6 @@ fn run(gpa: std.mem.Allocator, conn: *ipc.Conn, id: u64, id_text: []const u8, se
     };
     const outcome = state.loop();
     final.* = state.final;
-    if (saved) |orig| plat.tcsetattr(0, .FLUSH, orig) catch {};
-    forgetRaw();
     if (stdout_tty) {
         // Leave the session's state behind: the alternate screen, a soft
         // reset (scroll region, origin, insert, cursor and keypad modes,
@@ -411,8 +616,16 @@ fn run(gpa: std.mem.Allocator, conn: *ipc.Conn, id: u64, id_text: []const u8, se
             reset_modes ++ "\r\n";
         plat.stdoutWriteAll(tail) catch {};
     }
+    // After the reset: reports the terminal sent until it turned them off
+    // are flushed, not left for the shell.
+    if (saved) |orig| plat.tcsetattr(0, .FLUSH, orig) catch {};
+    forgetRaw();
     return outcome;
 }
+
+/// What a drawn attach found for alternate scroll (1007) in a DECRQM
+/// answer, to put back after a failure: 1 on, else leave it.
+pub var alt_scroll_found: std.atomic.Value(u32) = .{ .raw = 0 };
 
 /// The terminal settings to put back if tuppet panics or fails while the
 /// terminal is raw.
@@ -422,25 +635,37 @@ var raw_saved_copy: std.posix.termios = undefined;
 /// Modes a session or the picker may have set, as a terminal had them
 /// before: mouse and focus reporting, bracketed paste, keyboard
 /// protocols, synchronized output, autowrap, the cursor, colors.
-const reset_modes = "\x1b[?2026l\x1b[0m\x1b[!p\x1b[?7h\x1b[?25h\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1b[0 q" ++
+pub const reset_modes = "\x1b[?2026l\x1b[0m\x1b[!p\x1b[?7h\x1b[?25h\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1b[0 q" ++
     "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<99u\x1b[=0;1u\x1b[>4m";
 
 /// Put the terminal back after a panic or a failure that ends tuppet
 /// while the picker or an attach holds it: cooked mode, the main screen,
 /// and the modes above. Does nothing unless tuppet made it raw.
 pub fn restoreTerminal() void {
+    painting.store(false, .release);
     if (builtin.os.tag == .windows) return;
     const saved = raw_saved.swap(null, .acq_rel) orelse return;
-    plat.stdoutWriteAll(reset_modes ++ "\x1b[<99u\x1b[=0;1u\x1b[?1049l\r\n") catch {};
+    // A drawn attach also sets X10 mouse reports and their encodings,
+    // turns right-to-left reordering and alternate scroll off, and may
+    // stop inside a link.
+    const drawn_modes = "\x1b[?9l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[8h\x1b]8;;\x1b\\";
+    if (alt_scroll_found.load(.acquire) == 1) plat.stdoutWriteAll("\x1b[?1007h") catch {};
+    plat.stdoutWriteAll(reset_modes ++ drawn_modes ++ "\x1b[<99u\x1b[=0;1u\x1b[?1049l\r\n") catch {};
     plat.tcsetattr(0, .FLUSH, saved.*) catch {};
 }
 
 /// The terminal is cooked again: nothing to restore.
 pub fn forgetRaw() void {
     raw_saved.store(null, .release);
+    painting.store(false, .release);
 }
 
+/// Set while the picker or an attach paints this terminal, which no log
+/// line may reach then.
+pub var painting: std.atomic.Value(bool) = .{ .raw = false };
+
 pub fn setRaw(orig: std.posix.termios) void {
+    painting.store(true, .release);
     raw_saved_copy = orig;
     raw_saved.store(&raw_saved_copy, .release);
     var raw = orig;
@@ -472,12 +697,16 @@ pub fn installHandlers() void {
 
 /// Follows what needs attention through an events stream, to ring this
 /// terminal's bell once each time a session other than the attached one
-/// comes to need it.
-const Marks = struct {
+/// comes to need it, and in a raw attach once when a box comes to wait
+/// over the attached one.
+pub const Marks = struct {
     conn: ipc.Conn,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     /// The sessions that need attention now.
     marked: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// With `box_bell`, the boxes that wait over the attached session.
+    waiting: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    box_bell: bool = false,
     synced: bool = false,
 
     fn open(gpa: std.mem.Allocator) ?Marks {
@@ -493,22 +722,41 @@ const Marks = struct {
         };
         var no_timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
         _ = std.c.setsockopt(conn.posix.socket.handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, @ptrCast(&no_timeout), @sizeOf(std.posix.timeval));
-        return .{ .conn = conn };
+        return .{ .conn = conn, .box_bell = true };
     }
 
-    fn deinit(m: *Marks, gpa: std.mem.Allocator) void {
+    /// Open the stream and wait for the daemon's reply to it.
+    pub fn connect(gpa: std.mem.Allocator) !Marks {
+        var conn = try client.connect(gpa);
+        errdefer conn.deinit();
+        try client.sendRequest(gpa, &conn, protocol.EventsReq{});
+        const split = try conn.recvLineSplit(gpa, 1 << 20);
+        defer gpa.free(split.line);
+        defer gpa.free(split.rest);
+        const reply = std.json.parseFromSlice(struct { ok: bool = false }, gpa, split.line, .{ .ignore_unknown_fields = true }) catch return error.BadReply;
+        defer reply.deinit();
+        if (!reply.value.ok) return error.Refused;
+        var no_timeout: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+        _ = std.c.setsockopt(conn.posix.socket.handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, @ptrCast(&no_timeout), @sizeOf(std.posix.timeval));
+        var m: Marks = .{ .conn = conn };
+        try m.buf.appendSlice(gpa, split.rest);
+        return m;
+    }
+
+    pub fn deinit(m: *Marks, gpa: std.mem.Allocator) void {
         m.conn.deinit();
         m.buf.deinit(gpa);
         m.marked.deinit(gpa);
+        m.waiting.deinit(gpa);
     }
 
-    fn fd(m: *Marks) std.posix.fd_t {
+    pub fn fd(m: *Marks) std.posix.fd_t {
         return m.conn.posix.socket.handle;
     }
 
     /// Read what the daemon sent: whether the bell is due, or null once
     /// the stream is over.
-    fn pump(m: *Marks, gpa: std.mem.Allocator, own: u64) ?bool {
+    pub fn pump(m: *Marks, gpa: std.mem.Allocator, own: u64) ?bool {
         var chunk: [16384]u8 = undefined;
         const n = std.c.read(m.fd(), &chunk, chunk.len);
         if (n <= 0) return null;
@@ -532,13 +780,20 @@ const Marks = struct {
         } else if (std.mem.eql(u8, f.type, "resync")) {
             m.synced = false;
             m.marked.clearRetainingCapacity();
+            m.waiting.clearRetainingCapacity();
         } else if (std.mem.eql(u8, f.type, "removed") or std.mem.eql(u8, f.type, "left")) {
-            if (f.id) |id| _ = m.marked.remove(id);
+            if (f.id) |id| {
+                _ = m.marked.remove(id);
+                _ = m.waiting.remove(id);
+            }
         } else if (f.id) |id| if (f.status) |st| {
-            const now = words.needsAttention(st);
+            const now = words.needsAttention(st, &.{});
             const was = m.marked.contains(id);
             if (now) m.marked.put(gpa, id, {}) catch {} else _ = m.marked.remove(id);
-            return m.synced and now and !was and id != own;
+            const none_waited = m.waiting.count() == 0;
+            if (m.box_bell and words.waitsOver(st, own)) m.waiting.put(gpa, id, {}) catch {} else _ = m.waiting.remove(id);
+            const box_came = none_waited and m.waiting.count() > 0;
+            return m.synced and ((now and !was and id != own) or box_came);
         };
         return false;
     }
@@ -567,6 +822,12 @@ const Loop = struct {
     carry: [max_carry]u8 = undefined,
     carry_len: usize = 0,
     carry_since: i64 = 0,
+    /// Where a test takes what would go to this terminal.
+    sink: ?*std.Io.Writer = null,
+    history_started: bool = false,
+    /// The older lines written last end in a line that wraps into the
+    /// screen: the screen starts on a line of its own.
+    history_wrapped: bool = false,
 
     const max_carry = 32;
     /// A held-back end goes to the program when nothing completes it in
@@ -633,7 +894,7 @@ const Loop = struct {
             return;
         }
         self.bell_due = false;
-        plat.stdoutWriteAll("\x07") catch {};
+        self.write(.out, "\x07");
     }
 
     fn readStdin(self: *Loop) ?Outcome {
@@ -689,6 +950,7 @@ const Loop = struct {
     const Frame = struct {
         screen: ?[]const u8 = null,
         out: ?[]const u8 = null,
+        history: ?[]const u8 = null,
         exit: ?struct { code: ?i32 = null, signal: ?[]const u8 = null } = null,
         status: ?protocol.Status = null,
         writer: ?[]const u8 = null,
@@ -702,14 +964,21 @@ const Loop = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const frame = std.json.parseFromSliceLeaky(Frame, a, line, .{ .ignore_unknown_fields = true }) catch return null;
-        if (frame.screen orelse frame.out) |b64| {
+        if (frame.screen orelse frame.out orelse frame.history) |b64| {
             const dec = std.base64.standard.Decoder;
             const len = dec.calcSizeForSlice(b64) catch return null;
             const bytes = a.alloc(u8, len) catch return null;
             dec.decode(bytes, b64) catch return null;
+            if (frame.history != null) {
+                self.startHistory();
+            } else if (self.history_wrapped) {
+                self.write(.out, "\r\n");
+                self.history_wrapped = false;
+            }
             const shown = self.filter.feed(self.gpa, bytes) catch return self.done(.failed, 1, "tuppet: out of memory\n", .{});
             defer self.gpa.free(shown);
-            plat.stdoutWriteAll(shown) catch {};
+            self.write(.out, shown);
+            if (frame.history != null and bytes.len > 0) self.history_wrapped = !std.mem.endsWith(u8, bytes, "\r\n");
             if (self.bell_due) self.ring();
         }
         if (frame.writer != null) {
@@ -721,27 +990,48 @@ const Loop = struct {
             }
             // The daemon follows with a fresh screen; it waits a moment
             // so the notice can be read.
-            plat.stderrWriteAll("\r\ntuppet: another client took over writing; this attach is now read-only\r\n") catch {};
+            self.write(.err, "\r\ntuppet: another client took over writing; this attach is now read-only\r\n");
             self.paused_until = io_mod.nowNanos() + notice_pause_ns;
         }
         // What this terminal types waits for an input batch to finish; a
         // fresh screen follows the hold.
-        if (frame.hold == true) plat.stderrWriteAll("\r\ntuppet: held: automation is typing\r\n") catch {};
+        if (frame.hold == true) self.write(.err, "\r\ntuppet: held: automation is typing\r\n");
         if (frame.@"error") |e| {
-            const note = std.fmt.allocPrint(a, "\r\ntuppet: {s}\r\n", .{e.err}) catch return null;
-            plat.stderrWriteAll(note) catch {};
+            const note = std.fmt.allocPrint(a, "\r\ntuppet: {f}\r\n", .{status.cleaned(e.err)}) catch return null;
+            self.write(.err, note);
         }
         if (frame.end) |end| {
             if (std.mem.eql(u8, end.reason, "too_slow")) return self.done(.failed, 1, "tuppet: this attach fell too far behind the session's output; attach again\n", .{});
-            if (!std.mem.eql(u8, end.reason, "exited")) return self.done(.failed, 1, "tuppet: the daemon ended the attach ({s})\n", .{end.reason});
+            if (!std.mem.eql(u8, end.reason, "exited")) return self.done(.failed, 1, "tuppet: the daemon ended the attach ({f})\n", .{status.cleaned(end.reason)});
         }
         if (frame.exit) |exit| {
             if (frame.status) |st| self.final = status.shownOf(st);
             if (exit.code) |code| return self.done(.exited, @intCast(@as(u32, @bitCast(code)) & 0xff), "tuppet: session exited with code {d}\n", .{code});
             const sig = exit.signal orelse "unknown signal";
-            return self.done(.exited, @truncate(128 + signalNumber(sig)), "tuppet: session killed by {s}\n", .{sig});
+            return self.done(.exited, 128 + signalNumber(sig), "tuppet: session killed by {f}\n", .{status.cleaned(sig)});
         }
         return null;
+    }
+
+    /// Write to this terminal's output or error stream, or with `sink`
+    /// to it.
+    fn write(self: *Loop, comptime to: enum { out, err }, bytes: []const u8) void {
+        if (self.sink) |w| return w.writeAll(bytes) catch {};
+        (if (to == .out) plat.stdoutWriteAll else plat.stderrWriteAll)(bytes) catch {};
+    }
+
+    /// Before the first older lines on the normal screen: they start at
+    /// the cursor, below what the terminal shows, so the rows above them
+    /// scroll into its scrollback as they come, and no blank row below
+    /// the cursor does; the session's first screen then scrolls away only
+    /// the rows above the cursor's.
+    fn startHistory(self: *Loop) void {
+        if (self.history_started) return;
+        self.history_started = true;
+        if (self.filter.history_rows == 0) return;
+        const size = terminalSize() orelse return;
+        self.write(.out, "\x1b[0m");
+        self.filter.history_rows = size[1] - 1;
     }
 
     fn sendData(self: *Loop, bytes: []const u8) void {
@@ -799,7 +1089,9 @@ fn detachKeyStart(input: []const u8, key: u8) ?usize {
     return from + at;
 }
 
-fn isCtrlSequence(seq: []const u8, key: u8) bool {
+/// Whether `seq`, an escape sequence from its '[' on, is the control key
+/// `key` in the kitty keyboard protocol or modifyOtherKeys form.
+pub fn isCtrlSequence(seq: []const u8, key: u8) bool {
     if (seq.len < 2 or seq[0] != '[') return false;
     var params: [3]u32 = .{ 0, 0, 0 };
     var count: usize = 0;
@@ -855,10 +1147,84 @@ test "a detach key split across reads is held until it is complete" {
     try std.testing.expectEqual(@as(?usize, null), detachKeyStart("\x1b[9", 'q'));
 }
 
-fn signalNumber(name: []const u8) u8 {
+test "a raw attach rings once when a box comes to wait over its session" {
+    const gpa = std.testing.allocator;
+    var m: Marks = .{ .conn = undefined, .box_bell = true };
+    defer {
+        m.marked.deinit(gpa);
+        m.waiting.deinit(gpa);
+    }
+    const box = "{\"type\":\"started\",\"id\":5,\"status\":{\"id\":5,\"state\":\"running\",\"over\":{\"id\":1}}}";
+    try std.testing.expectEqual(@as(?bool, false), m.frame(gpa, "{\"type\":\"synced\"}", 1));
+    try std.testing.expectEqual(@as(?bool, true), m.frame(gpa, box, 1));
+    // A second box while one waits, or a box over another session, rings nothing.
+    try std.testing.expectEqual(@as(?bool, false), m.frame(gpa, "{\"type\":\"started\",\"id\":6,\"status\":{\"id\":6,\"over\":{\"id\":1}}}", 1));
+    try std.testing.expectEqual(@as(?bool, false), m.frame(gpa, "{\"type\":\"started\",\"id\":7,\"status\":{\"id\":7,\"over\":{\"id\":3}}}", 1));
+    // Once none waits, the next box to wait rings again.
+    try std.testing.expectEqual(@as(?bool, false), m.frame(gpa, "{\"type\":\"changed\",\"id\":5,\"status\":{\"id\":5,\"writer\":{},\"over\":{\"id\":1}}}", 1));
+    try std.testing.expectEqual(@as(?bool, false), m.frame(gpa, "{\"type\":\"removed\",\"id\":6,\"status\":null}", 1));
+    try std.testing.expectEqual(@as(?bool, true), m.frame(gpa, box, 1));
+}
+
+test "a raw attach only refuses or ends, whatever a daemon that is not trusted sends" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var bounded: fuzz.Bounded = .{ .child = std.testing.allocator, .limit = 16 << 20 };
+    const gpa = bounded.allocator();
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var discard_buf: [256]u8 = undefined;
+    var discard: std.Io.Writer.Discarding = .init(&discard_buf);
+    var loop: Loop = .{ .gpa = gpa, .sock = fds[0], .id = 1, .id_text = "1", .settings = .{ .end_on_takeover = true }, .sink = &discard.writer };
+    defer loop.buf.deinit(gpa);
+    defer loop.filter.deinit(gpa);
+    var marks: Marks = .{ .conn = undefined, .box_bell = true };
+    defer {
+        marks.marked.deinit(gpa);
+        marks.waiting.deinit(gpa);
+    }
+    var prng: std.Random.DefaultPrng = .init(0x7475707065);
+    const rand = prng.random();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(std.testing.allocator);
+    for (0..3000) |_| {
+        try fuzz.line(rand, .reply, &line, std.testing.allocator);
+        if (attachReply(gpa, line.items, rand.boolean())) |reply| switch (reply) {
+            .refused => |outcome| {
+                defer gpa.free(outcome.message.?);
+                try std.testing.expect(fuzz.printable(outcome.message.?));
+            },
+            .attached, .retry_unsized => {},
+        } else |err| try std.testing.expectEqual(error.BadReply, err);
+
+        try fuzz.line(rand, .frame, &line, std.testing.allocator);
+        loop.settings.write = true;
+        if (loop.handleFrame(line.items)) |outcome| {
+            defer if (outcome.message) |m| gpa.free(m);
+            try std.testing.expect(outcome.kind != .detached and outcome.kind != .refused);
+            if (outcome.message) |m| try std.testing.expect(fuzz.printable(m));
+        }
+
+        // The only frame that goes to the daemon is the detach after a
+        // takeover.
+        var sent: [256]u8 = undefined;
+        const n = std.c.recv(fds[1], &sent, sent.len, std.c.MSG.DONTWAIT);
+        if (n > 0) try std.testing.expectEqualStrings("{\"detach\":true}\n", sent[0..@intCast(n)]);
+
+        try fuzz.line(rand, .event, &line, std.testing.allocator);
+        _ = marks.frame(gpa, line.items, 1);
+    }
+    try std.testing.expect(!bounded.exceeded);
+}
+
+/// The number of signal `name`, such as SIGTERM or SIG15, below 128 so
+/// that 128 plus it is an exit code; 0 when it names none.
+pub fn signalNumber(name: []const u8) u8 {
     if (!std.mem.startsWith(u8, name, "SIG")) return 0;
     if (builtin.os.tag != .windows) {
-        if (std.meta.stringToEnum(std.posix.SIG, name[3..])) |sig| return @intCast(@backingInt(sig));
+        if (std.meta.stringToEnum(std.posix.SIG, name[3..])) |sig| return std.math.cast(u7, @backingInt(sig)) orelse 0;
     }
-    return std.fmt.parseInt(u8, name[3..], 10) catch 0;
+    return std.math.cast(u7, std.fmt.parseInt(u8, name[3..], 10) catch 0) orelse 0;
 }

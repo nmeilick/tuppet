@@ -48,7 +48,9 @@ const registry_gpa = std.heap.page_allocator;
 var reg_mutex: std.Io.Mutex = .init;
 /// Serializes loading ended sessions from the store with deleting them,
 /// so a deleted session is never loaded back into memory. Entries leave
-/// `stored` only while it is held.
+/// `stored` only while it is held. Reclaiming memory takes it under a
+/// session's terminal_mutex, so no session lock may be taken while it is
+/// held.
 var load_mutex: std.Io.Mutex = .init;
 
 /// Start the table, indexing the ended sessions of `socket_path` that
@@ -286,7 +288,8 @@ fn markDamaged(id: u64, why: []const u8) void {
 
 /// Why `acquire` found no session with this id.
 pub const Missing = struct {
-    /// no_session, elsewhere, or ended (lost).
+    /// no_session, elsewhere, ended (lost), damaged, or internal when
+    /// the store cannot be read now.
     code: protocol.Code,
     err: []u8,
 };
@@ -302,9 +305,13 @@ pub fn missingReason(gpa: std.mem.Allocator, id: u64) !Missing {
             if (entry.parsed.value.lost or entry.parsed.value.ended_ms == null) {
                 return .{ .code = .ended, .err = try std.fmt.allocPrint(gpa, lost_text, .{id}) };
             }
+            return .{ .code = .internal, .err = try std.fmt.allocPrint(gpa, "session {d} cannot be loaded from the session store now; the daemon's log says why", .{id}) };
         }
     }
-    if (store.readMeta(gpa, id) catch null) |parsed| {
+    const read = store.readMeta(gpa, id) catch |err| if (store.metaDamaged(err)) null else {
+        return .{ .code = .internal, .err = try std.fmt.allocPrint(gpa, "cannot read session {d} from the session store: {s}", .{ id, store.errorText(err) }) };
+    };
+    if (read) |parsed| {
         defer parsed.deinit();
         const meta = parsed.value;
         if (!std.mem.eql(u8, meta.socket, endpoint)) {
@@ -377,6 +384,25 @@ pub fn statusOf(gpa: std.mem.Allocator, id: u64) !?Status {
     st.argv = try dupeArgv(gpa, st.argv);
     if (entry.damage) |why| st.damaged = try gpa.dupe(u8, why);
     return st;
+}
+
+/// The numbers the sessions of `group` have, in memory or only in the
+/// store, in `gpa`.
+pub fn groupNumbers(gpa: std.mem.Allocator, group: []const u8) ![]u32 {
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(gpa);
+    const io = io_mod.io();
+    reg_mutex.lockUncancelable(io);
+    defer reg_mutex.unlock(io);
+    for (registry.values()) |s| {
+        s.member_mutex.lockUncancelable(io);
+        defer s.member_mutex.unlock(io);
+        if (s.member.group) |g| if (std.mem.eql(u8, g, group)) if (s.member.number) |n| try out.append(gpa, n);
+    }
+    for (stored.values()) |entry| if (entry.parsed.value.member) |m| {
+        if (m.group) |g| if (std.mem.eql(u8, g, group)) if (m.number) |n| try out.append(gpa, n);
+    };
+    return out.toOwnedSlice(gpa);
 }
 
 /// What a run `like` a session copies from it.
@@ -618,12 +644,14 @@ fn ackSession(gpa: std.mem.Allocator, id: u64, shown: ?status.Shown) error{NoSes
     }
     const io = io_mod.io();
     load_mutex.lockUncancelable(io);
-    defer load_mutex.unlock(io);
-    // Loaded meanwhile.
+    // Loaded meanwhile: acked without load_mutex, which reclaiming memory
+    // takes under terminal_mutex.
     if (acquireLoaded(id)) |s| {
+        load_mutex.unlock(io);
         defer unref(s);
         return use(s).ack(shown);
     }
+    defer load_mutex.unlock(io);
     const seen, const moved = blk: {
         reg_mutex.lockUncancelable(io);
         defer reg_mutex.unlock(io);
@@ -816,6 +844,21 @@ pub fn trimmer() void {
         trim_wake_mutex.unlock(io);
         trimHistory();
     }
+}
+
+/// Compress the cold history of quiet sessions; false when the target
+/// cannot compress. Each session is held only while it is compressed,
+/// so the others stay free to unload.
+pub fn compressIdle() bool {
+    const gpa = std.heap.page_allocator;
+    const list = acquireAll(gpa) catch return true;
+    defer gpa.free(list);
+    var supported = true;
+    for (list) |s| {
+        if (supported) supported = s.compressIdle();
+        unref(s);
+    }
+    return supported;
 }
 
 /// Give trimmed sessions their own history limits back once the budget

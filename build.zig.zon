@@ -1,12 +1,12 @@
 .{
     .name = .tuppet,
-    .version = "0.3.0",
-    .minimum_zig_version = "0.17.0",
+    .version = "0.4.0",
+    .minimum_zig_version = "0.17.1",
     .fingerprint = 0x606f63c02a5621a1,
     .dependencies = .{
         .ghostty = .{
-            .url = "https://github.com/ghostty-org/ghostty/archive/83fb95624b0439ee660c2679b43b38c8b63769cd.tar.gz",
-            .hash = "ghostty-1.4.0-5UdBC-qohwWqLS0BImOz05t4hVyTwbaKslyTPvKYvAtE",
+            .url = "https://github.com/ghostty-org/ghostty/archive/7fa26e8b675f3248975479d88274c937d7e63905.tar.gz",
+            .hash = "ghostty-1.4.1-dev-5UdBC5uMpgUYOQqmFJzd5xUAFfkvoSOlCtNlD_RqGT9A",
         },
         // GNU Unifont, the bitmap font of every build; tools/unifont.zig packs it.
         .unifont = .{

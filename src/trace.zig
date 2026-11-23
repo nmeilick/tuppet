@@ -97,6 +97,7 @@ fn incompleteUtf8Tail(bytes: []const u8) usize {
 /// {"t":0.000000,"ev":"start","cols":80,"rows":24,"name":"..."}
 pub fn formatStart(gpa: std.mem.Allocator, cols: u16, rows: u16, name: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":0.000000,\"ev\":\"start\",\"cols\":{d},\"rows\":{d},\"name\":", .{ cols, rows });
     try writeJsonString(w, name);
@@ -107,6 +108,7 @@ pub fn formatStart(gpa: std.mem.Allocator, cols: u16, rows: u16, name: []const u
 /// {"t":...,"ev":"snap","screen":["row0",...]}
 pub fn formatSnap(gpa: std.mem.Allocator, t: f64, rows: []const []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":{d:.6},\"ev\":\"snap\",\"screen\":[", .{t});
     for (rows, 0..) |row, i| {
@@ -120,6 +122,7 @@ pub fn formatSnap(gpa: std.mem.Allocator, t: f64, rows: []const []const u8) ![]u
 /// {"t":...,"ev":"diff","rows":[{"r":2,"text":"..."},...]}
 pub fn formatDiff(gpa: std.mem.Allocator, t: f64, changes: []const RowChange) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":{d:.6},\"ev\":\"diff\",\"rows\":[", .{t});
     for (changes, 0..) |change, i| {
@@ -135,6 +138,7 @@ pub fn formatDiff(gpa: std.mem.Allocator, t: f64, changes: []const RowChange) ![
 /// {"t":...,"ev":"mark","label":"..."}
 pub fn formatMark(gpa: std.mem.Allocator, t: f64, label: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":{d:.6},\"ev\":\"mark\",\"label\":", .{t});
     try writeJsonString(w, label);
@@ -149,6 +153,7 @@ pub const Exit = union(enum) { code: i32, signal: []const u8 };
 /// {"t":...,"ev":"stop","reason":"met"[,"exit_code":N | ,"signal":"SIGKILL"]}
 pub fn formatStop(gpa: std.mem.Allocator, t: f64, reason: []const u8, exit: ?Exit) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":{d:.6},\"ev\":\"stop\",\"reason\":\"{s}\"", .{ t, reason });
     if (exit) |e| switch (e) {
@@ -176,6 +181,7 @@ pub const Input = union(enum) {
 /// Trace format: {"t":...,"ev":"in","kind":"key",...}
 pub fn formatIn(gpa: std.mem.Allocator, t: f64, input: Input) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{{\"t\":{d:.6},\"ev\":\"in\",", .{t});
     switch (input) {
@@ -240,6 +246,7 @@ pub fn formatCastOutput(gpa: std.mem.Allocator, t: f64, data: []const u8, carry:
 /// Cast format marker: [t,"m","label"].
 pub fn formatCastMark(gpa: std.mem.Allocator, t: f64, label: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("[{d:.6},\"m\",", .{t});
     try writeJsonString(w, label);
@@ -252,6 +259,7 @@ pub fn formatCastMark(gpa: std.mem.Allocator, t: f64, label: []const u8) ![]u8 {
 /// secrets become "m" markers.
 pub fn formatCastInput(gpa: std.mem.Allocator, t: f64, input: Input) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
     const w = &aw.writer;
     switch (input) {
         .send => |data| {
@@ -284,6 +292,33 @@ pub fn formatCastInput(gpa: std.mem.Allocator, t: f64, input: Input) ![]u8 {
 }
 
 const testing = std.testing;
+
+test "formatting frees what it built when memory runs out" {
+    const input: Input = .{ .mouse = .{ .button = "left", .action = "press", .mods = "", .x = 1, .y = 2 } };
+    const rows = [_][]const u8{ "a", "b" };
+    const changes = [_]RowChange{.{ .r = 0, .text = "a" }};
+    // Out of memory surfaces as WriteFailed too, so each allocation in
+    // turn fails, and the testing allocator reports what leaked.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const gpa = failing.allocator();
+        const all = struct {
+            fn run(a: std.mem.Allocator, in: Input, r: []const []const u8, ch: []const RowChange) !void {
+                a.free(try formatStart(a, 80, 24, "name"));
+                a.free(try formatSnap(a, 0, r));
+                a.free(try formatDiff(a, 0, ch));
+                a.free(try formatMark(a, 0, "mark"));
+                a.free(try formatStop(a, 0, "met", .{ .signal = "SIGKILL" }));
+                a.free(try formatIn(a, 0, in));
+                a.free(try formatCastMark(a, 0, "mark"));
+                a.free(try formatCastInput(a, 0, in));
+            }
+        }.run;
+        all(gpa, input, &rows, &changes) catch continue;
+        break;
+    }
+}
 
 test "splitRows keeps interior blanks and drops the trailing-newline phantom" {
     const rows = try splitRows(testing.allocator, "a\n\nb\n");

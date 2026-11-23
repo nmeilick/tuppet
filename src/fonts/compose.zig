@@ -49,7 +49,8 @@ pub fn cluster(cps: []const u21, buf: *[max_rest]u21, composes: bool) Cluster {
             base = c;
             continue;
         };
-        last = ccc;
+        // A starter left uncomposed blocks every later mark.
+        if (last != 0) last = ccc;
         // n never passes the code point being read.
         if (r != null and r.?.mark) {
             rest[n] = cp;
@@ -124,6 +125,10 @@ test "compose marks onto their base as NFC does, and keep the rest to draw" {
     c = cluster(&.{ 'e', 0x0310, 0x0301 }, &buf, true);
     try std.testing.expectEqual(@as(u21, 'e'), c.base);
     try std.testing.expectEqualSlices(u21, &.{ 0x0310, 0x0301 }, c.marks);
+    // So does a starter, also for marks of a higher class after it.
+    c = cluster(&.{ 'e', 0x034F, 0x0316, 0x0301 }, &buf, true);
+    try std.testing.expectEqual(@as(u21, 'e'), c.base);
+    try std.testing.expectEqualSlices(u21, &.{ 0x0316, 0x0301 }, c.marks);
     // Hangul jamo compose to a syllable: ᄒ ᅡ ᆫ is 한.
     c = cluster(&.{ 0x1112, 0x1161, 0x11AB }, &buf, true);
     try std.testing.expectEqual(@as(u21, 0xD55C), c.base);

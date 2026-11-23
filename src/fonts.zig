@@ -1174,6 +1174,24 @@ test "TrueType faces: the cell, real and synthetic styles, corrupt files" {
     }
 }
 
+test "a font whose ascender and descender add up past 16 bits still slants" {
+    if (!has_truetype) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ft_lib: truetype.Library = undefined;
+    try ft_lib.init(gpa);
+    defer ft_lib.deinit();
+    const raw = try @import("fonts/deflated.zig").inflate(gpa, @embedFile("jetbrains-Regular.bin"));
+    var face = truetype.Face.open(&ft_lib, raw, 0, true) catch |err| {
+        gpa.free(raw);
+        return err;
+    };
+    defer face.deinit(gpa);
+    face.handle.*.ascender = 20000;
+    face.handle.*.descender = 19000;
+    const raster = try face.render(gpa, face.index('I').?, .{ .italic = true }, .{ .width = 12, .height = 27, .baseline = 21, .size = 20 });
+    if (raster) |r| gpa.free(r.data);
+}
+
 test "full builds unpack a built-in font when a lookup reaches it; medium ones name it" {
     if (!has_truetype) return error.SkipZigTest;
     const gpa = std.testing.allocator;

@@ -196,6 +196,14 @@ PLAIN_ID=$("$BIN" run --size 40x10 sh -c 'stty -echo; read pw; stty echo; echo g
     || fail "do with a trace recording at a hidden prompt failed"
 grep -q '"kind":"secret"' "$test_dir/plain.trace" || fail "the trace lacks the hidden input's marker"
 grep -q typedplain "$test_dir/plain.trace" && fail "text typed at a hidden prompt reached the trace"
+# --passwords keeps both as typed.
+KEEP_ID=$("$BIN" run --size 40x10 sh -c 'stty -echo; read pw; read pw2; stty echo; echo got ${#pw} ${#pw2}')
+"$BIN" wait "$KEEP_ID" --hidden-input -t 5s >/dev/null || fail "the third password prompt never hid its input"
+PW=keptsecret "$BIN" do "$KEEP_ID" --secret PW -k '<CR>' -s keptplain -k '<CR>' -m 'got 10 9' --record-file "$test_dir/keep.trace" --passwords >/dev/null \
+    || fail "do --record-file --passwords failed"
+grep -q '"text":"keptsecret"' "$test_dir/keep.trace" || fail "--passwords did not keep the secret"
+grep -q '"text":"keptplain"' "$test_dir/keep.trace" || fail "--passwords did not keep text typed at a hidden prompt"
+grep -q '"kind":"secret"' "$test_dir/keep.trace" && fail "--passwords still wrote a marker"
 
 # --- 10. the session's end stops the recording: reason ended ---------------
 

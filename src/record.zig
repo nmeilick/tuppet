@@ -29,6 +29,8 @@ pub const RecordOptions = struct {
     format: RecordFormat = .cast,
     /// Log input events; implied for the trace format.
     input: bool = false,
+    /// Write passwords as typed instead of a marker.
+    passwords: bool = false,
     /// Stop once one of these holds.
     until: []const cond.Condition = &.{},
     /// Stop this long after the start.
@@ -48,6 +50,7 @@ pub const Recording = struct {
     started_ms: i64,
     format: RecordFormat,
     input: bool,
+    passwords: bool = false,
     /// Answered by the evaluator when `until` holds or `max_ms` is over.
     waiter: ?*evaluator.Waiter = null,
     /// Trace format: the screen, size, and row text hashes of the last
@@ -125,6 +128,7 @@ pub fn startRecording(self: *Session, opts: RecordOptions) !void {
         .started_ms = store.nowMillis(),
         .format = opts.format,
         .input = opts.input or opts.format == .trace,
+        .passwords = opts.passwords,
     };
     errdefer rec.deinit(gpa);
 
@@ -297,7 +301,7 @@ fn finishFile(self: *Session, rec: *Recording, reason: StopReason) !void {
         try plat.writeAll(rec.file, snap_line);
         var exit: ?trace_mod.Exit = null;
         if (reason == .ended and self.state.load(.acquire) == .exited) {
-            const how = try status.exitOf(gpa, self.exit_code.load(.acquire), false);
+            const how = try status.exitOf(gpa, self.exit_code.load(.acquire), false, false);
             exit = if (how.signal) |name| .{ .signal = name } else .{ .code = how.code.? };
         }
         defer if (exit) |e| if (e == .signal) gpa.free(e.signal);
@@ -338,21 +342,24 @@ fn failLocked(self: *Session) void {
 /// Record an input the session is about to write (attach data, a batch
 /// step). A trace gets the frame of what the screen showed before the
 /// input first, so it never shows the screen reacting before the input.
-pub fn recordInput(self: *Session, given: trace_mod.Input) void {
+/// `secret` marks a password: a batch step that says so.
+pub fn recordInput(self: *Session, given: trace_mod.Input, secret: bool) void {
     if (!self.recording_active.load(.acquire)) return;
     // What the program reads without echo, a password most likely, is
-    // kept out like a secret, whoever types it.
-    const input: trace_mod.Input = switch (given) {
+    // kept out like a secret, whoever types it, unless the recording
+    // keeps passwords.
+    const password = secret or switch (given) {
         .send, .key => blk: {
             sample.refresh(self, false);
-            break :blk if (sample.latest(self).hidden()) .secret else given;
+            break :blk sample.latest(self).hidden();
         },
-        else => given,
+        else => false,
     };
     const io = io_mod.io();
     self.record_mutex.lockUncancelable(io);
     defer self.record_mutex.unlock(io);
     if (self.recording == null) return;
+    const input: trace_mod.Input = if (password and !self.recording.?.passwords) .secret else given;
     if (self.recording.?.format == .trace) {
         _ = frameLocked(self);
         if (self.recording == null) return;

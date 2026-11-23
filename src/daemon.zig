@@ -27,6 +27,9 @@ const events = @import("events.zig");
 const alert = @import("alert.zig");
 const limits = @import("limits.zig");
 const budget = @import("budget.zig");
+const over = @import("over.zig");
+const member = @import("member.zig");
+const marks = @import("marks.zig");
 const vt = @import("vt");
 const win32 = if (builtin.os.tag == .windows) @import("win32.zig") else @import("win32_stub.zig");
 
@@ -104,6 +107,9 @@ var active_connections: std.atomic.Value(usize) = .{ .raw = 0 };
 /// this many slots of their own.
 const max_streams = 256;
 var open_streams: std.atomic.Value(usize) = .{ .raw = 0 };
+/// Attach streams, which attach limits itself; counted so that an idle
+/// daemon does not exit under one.
+var open_attaches: std.atomic.Value(usize) = .{ .raw = 0 };
 /// The longest a wait may wait.
 const max_wait_ms = 10 * std.time.ms_per_min;
 var png_render_lock: std.Io.Mutex = .init;
@@ -118,7 +124,15 @@ pub const Options = struct {
     socket: ?[]const u8 = null,
     /// Supervised mode only: append the daemon's log here.
     log: ?[]const u8 = null,
+    /// Exit once no session has run for a minute, also when supervised.
+    idle_exit: bool = false,
+    /// Refresh the times of the socket's folder, the socket, and its lock
+    /// every hour, so age-based cleaning of /tmp leaves them alone.
+    keep_fresh: bool = false,
 };
+
+/// How long a daemon with --idle-exit waits without sessions.
+const idle_exit_flag_ms = std.time.ms_per_min;
 
 pub fn run(gpa: std.mem.Allocator, opts: Options) !void {
     prepareProcess();
@@ -143,18 +157,21 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !void {
     };
     budget.init();
     session.init(gpa, path);
-    _ = try std.Thread.spawn(.{}, housekeep, .{gpa});
-    _ = try std.Thread.spawn(.{}, unloadIdle, .{});
-    _ = try std.Thread.spawn(.{}, registry.trimmer, .{});
     shutdown_server = &server;
-    // Only now: startup failures above still reach the terminal.
+    // Only now: startup failures above still reach the terminal. Before
+    // the threads, which log.
     if (opts.socket != null) if (opts.log) |log_path| try redirectLog(log_path);
-    _ = try std.Thread.spawn(.{}, shutdownOnSignal, .{});
+    (try std.Thread.spawn(.{}, housekeep, .{gpa})).detach();
+    (try std.Thread.spawn(.{}, unloadIdle, .{})).detach();
+    (try std.Thread.spawn(.{}, registry.trimmer, .{})).detach();
+    (try std.Thread.spawn(.{}, compressIdle, .{})).detach();
+    (try std.Thread.spawn(.{}, shutdownOnSignal, .{})).detach();
+    if (opts.keep_fresh) (try std.Thread.spawn(.{}, keepFresh, .{path})).detach();
 
     std.log.info("tuppet daemon listening on {s}", .{path});
 
     // A supervised daemon lives as long as its supervisor wants.
-    const idle_exit: u64 = if (opts.socket == null and builtin.os.tag != .windows) idleExitMillis() else 0;
+    const idle_exit: u64 = if (builtin.os.tag == .windows) 0 else if (opts.idle_exit) idle_exit_flag_ms else if (opts.socket == null) idleExitMillis() else 0;
     var last_accept_error: ?anyerror = null;
     while (true) {
         const io = io_mod.io();
@@ -181,6 +198,23 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !void {
             continue;
         };
         worker.detach();
+    }
+}
+
+/// Touch the socket's folder, the socket, and its lock file now and every
+/// hour, without following links.
+fn keepFresh(path: [:0]const u8) void {
+    if (builtin.os.tag == .windows) return;
+    var buf: [ipc.max_path_len + 8:0]u8 = undefined;
+    while (true) {
+        const dir = std.fs.path.dirname(path) orelse "/";
+        const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}.lock", .{path}, 0) catch path;
+        var dir_buf: [ipc.max_path_len:0]u8 = undefined;
+        const dir_z = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{dir}, 0) catch path;
+        for ([_][:0]const u8{ dir_z, path, lock_path }) |p| {
+            if (std.c.utimensat(std.c.AT.FDCWD, p, null, std.c.AT.SYMLINK_NOFOLLOW) != 0) std.log.warn("cannot refresh the time of {s}", .{p});
+        }
+        std.Io.sleep(io_mod.io(), .fromSeconds(3600), .awake) catch return;
     }
 }
 
@@ -224,6 +258,15 @@ fn unloadIdle() void {
     }
 }
 
+/// Compress the history of quiet sessions every second, for as long as
+/// the target can.
+fn compressIdle() void {
+    while (true) {
+        std.Io.sleep(io_mod.io(), .fromSeconds(1), .awake) catch return;
+        if (!registry.compressIdle()) return;
+    }
+}
+
 /// Wait until a client connects. After `idle_ms` without sessions or
 /// clients, exit instead: closing the listener resets the connections
 /// still queued on it, which the daemon has not read, and their clients
@@ -239,9 +282,11 @@ fn waitForClient(server: *ipc.Server, idle_ms: u64) void {
         const ready = std.c.poll(&pfd, 1, @intCast(std.math.clamp(left_ms, 1, 1000)));
         if (ready > 0) return;
         if (ready < 0) continue;
-        if (session.unsettledCount() > 0 or active_connections.load(.acquire) > 0 or open_streams.load(.acquire) > 0) {
+        if (session.unsettledCount() > 0 or active_connections.load(.acquire) > 0 or open_streams.load(.acquire) > 0 or open_attaches.load(.acquire) > 0) {
             idle_since = io_mod.nowNanos();
         } else if (io_mod.nowNanos() - idle_since >= limit_ns) {
+            // A shutdown under way releases the endpoint and exits itself.
+            if (session.refuseStarts()) return;
             std.log.info("no sessions for {d} ms; exiting", .{idle_ms});
             server.deinit();
             std.process.exit(0);
@@ -370,7 +415,8 @@ fn shutDown(r: ?*Request, reset: bool) void {
         req.conn.flush();
     }
     std.log.info("shut down", .{});
-    if (shutdown_server) |server| server.deinit();
+    // The main thread may be accepting on it still.
+    if (shutdown_server) |server| server.withdraw();
     std.process.exit(0);
 }
 
@@ -516,17 +562,14 @@ fn handleConnection(persistent_gpa: std.mem.Allocator, owned_conn: ipc.Conn) voi
     };
     // The name outlives the request line.
     r.cmd = handlers.keys()[index];
-    const handler = handlers.values()[index];
-    // A stream, not a request: it must not hold one of the request slots
-    // for its whole life.
-    if (handler.stream) r.releaseSlot();
-    handler.run(&r);
+    handlers.values()[index].run(&r);
 }
 
+/// A stream (events, attach) must not hold one of the request slots for
+/// its whole life: it releases its slot once it counts as open, so that
+/// it always counts as one or the other.
 const Handler = struct {
     run: *const fn (r: *Request) void,
-    /// The connection stays open as a stream after the reply.
-    stream: bool = false,
 };
 
 fn handle(comptime f: fn (r: *Request) anyerror!void) Handler {
@@ -557,8 +600,15 @@ const handlers = std.StaticStringMap(Handler).initComptime(.{
     .{ "ack", handle(ack) },
     .{ "alert", handle(alertRequest) },
     .{ "shutdown", handle(shutdownRequest) },
-    .{ "events", Handler{ .run = handle(eventsStream).run, .stream = true } },
-    .{ "attach", Handler{ .run = handle(attachStream).run, .stream = true } },
+    .{ "events", handle(eventsStream) },
+    .{ "attach", handle(attachStream) },
+    .{ "update", handle(update) },
+    .{ "side", handle(side) },
+    .{ "flag", handle(flag) },
+    .{ "action", handle(action) },
+    .{ "lease", handle(leaseRequest) },
+    .{ "respawn", handle(respawn) },
+    .{ "commands", handle(commands) },
 });
 
 /// One request: its connection, its parsed line, and an arena that lives
@@ -807,6 +857,23 @@ const Request = struct {
         r.reply(w.reply());
     }
 
+    /// Keep the connection, after the reply, as a lease on `s`: the
+    /// hang-up watcher stops the session once the client goes, and closes
+    /// the connection when the session ends.
+    fn lease(r: *Request, s: *session.Session) void {
+        // Requests for a lease are refused off Linux before this.
+        if (builtin.os.tag != .linux) return;
+        r.conn.flush();
+        const fd = std.c.dup(r.conn.posix.socket.handle);
+        if (fd < 0) return std.log.err("session {d}: cannot keep its lease: no descriptor left", .{s.id});
+        hangup.lease(fd, s.id) catch |err| {
+            _ = std.c.close(fd);
+            return std.log.err("session {d}: cannot keep its lease: {}", .{ s.id, err });
+        };
+        // It may have ended before the lease was kept.
+        if (s.state.load(.acquire) == .exited) hangup.endLeases(s.id);
+    }
+
     /// Wait on `s`, whose reference this takes over, and reply with the
     /// outcome. Nothing is replied when the client hangs up first.
     fn waitOn(r: *Request, s: *session.Session, opts: evaluator.Options) !void {
@@ -869,7 +936,7 @@ fn runSession(r: *Request) !void {
     var record: ?session.RunRecord = null;
     if (req.record) |rec| {
         if (rec.path) |p| if (hasNul(p) or !std.fs.path.isAbsolute(p)) return r.fail(.bad_request, null, "recording path must be absolute, without NUL bytes", .{});
-        record = .{ .path = rec.path, .format = rec.format };
+        record = .{ .path = rec.path, .format = rec.format, .passwords = rec.passwords orelse false };
     }
     if (req.until) |until| {
         const timeout_ms = req.timeout_ms orelse return r.fail(.bad_request, null, "bad run request: until needs timeout_ms", .{});
@@ -889,11 +956,74 @@ fn runSession(r: *Request) !void {
             };
         }
     } else if (req.timeout_ms != null) return r.fail(.bad_request, null, "bad run request: timeout_ms needs until", .{});
+    var colors: ?[2]vt.color.RGB = null;
+    if (req.colors) |c| {
+        const fg = protocol.parseHexColor(c.fg) orelse return r.fail(.bad_request, null, "bad run request: colors.fg must be #rrggbb", .{});
+        const bg = protocol.parseHexColor(c.bg) orelse return r.fail(.bad_request, null, "bad run request: colors.bg must be #rrggbb", .{});
+        colors = .{ .{ .r = fg[0], .g = fg[1], .b = fg[2] }, .{ .r = bg[0], .g = bg[1], .b = bg[2] } };
+    }
+    var box: ?over.Start = null;
+    if (req.over) |o| {
+        if (req.if_exists != .fail) return r.fail(.bad_request, null, "bad run request: over goes with if_exists fail only", .{});
+        box = switch (try over.check(r.gpa, o, nullBackdrop(r.value))) {
+            .ok => |start| start,
+            .bad => |why| return r.fail(.bad_request, null, "bad run request: {s}", .{why}),
+        };
+    }
+    var joined = switch (try member.apply(r.gpa, .{}, .{ .group = req.group, .label = req.label, .accent = req.accent, .mark = req.mark, .meta = req.meta, .actions = req.actions })) {
+        .ok => |m| m,
+        .bad => |why| return r.fail(.bad_request, null, "bad run request: {s}", .{why}),
+    };
+    if (req.side_view != null and req.side_of == null) return r.fail(.bad_request, null, "bad run request: side_view goes with side_of", .{});
+    if (req.side_of) |ref| {
+        if (req.over != null) return r.fail(.bad_request, null, "bad run request: a box is no side session; give over or side_of", .{});
+        if (req.group != null) return r.fail(.bad_request, null, "bad run request: a side session belongs to the session it is tied to; give no group", .{});
+        const main = try r.acquireSession(ref) orelse return;
+        defer session.release(main);
+        if (main.state.load(.acquire) == .exited) return r.fail(.ended, try status.of(r.gpa, main), "session {d} has ended, so no side session is tied to it", .{main.id});
+        const main_member = try main.memberOf(r.gpa);
+        if (main_member.side_of != null) return r.fail(.bad_request, try status.of(r.gpa, main), "session {d} is a side session itself", .{main.id});
+        joined.side_of = main.id;
+        joined.side_view = req.side_view orelse .compact;
+    }
+    if (req.lease == true) {
+        if (req.until != null) return r.fail(.bad_request, null, "bad run request: lease goes without until", .{});
+        if (builtin.os.tag != .linux) return r.fail(.unsupported, null, "leases are supported on Linux only", .{});
+    }
+    // The id of the session underneath, with room for the box reserved
+    // on it. No reference on it is held across the start, which removes
+    // ended namesakes and waits for their references.
+    var under: ?u64 = null;
+    defer if (under) |id| over.unreserve(id);
+    if (req.over) |o| {
+        const u = try r.acquireSession(o.session) orelse return;
+        defer session.release(u);
+        if (u.over != null) return r.fail(.bad_request, try status.of(r.gpa, u), "session {d} is a box, and no box is shown over a box", .{u.id});
+        u.lockTerminal();
+        const room = if (u.state.load(.acquire) == .exited) error.Ended else u.boxes.reserve();
+        u.unlockTerminal();
+        room catch |err| return switch (err) {
+            error.Ended => r.fail(.ended, try status.of(r.gpa, u), "session {d} has ended, so no box is shown over it", .{u.id}),
+            error.Limit => r.fail(.limit, try status.of(r.gpa, u), "session {d} has {d} running boxes, the most it takes", .{ u.id, over.max_boxes }),
+        };
+        under = u.id;
+        box.?.over.id = u.id;
+        // A box looks like the session it is shown over.
+        if (colors == null) colors = u.defaultColors();
+    }
     if (req.if_exists != .fail) if (registry.acquireRunningNamed(name)) |namesake| {
         if (req.if_exists == .keep) return started(r, namesake, req, false);
         defer session.release(namesake);
         namesake.stop() catch |err| return r.failSession(namesake, err);
     };
+    // Numbers in a group and side ties are given one request at a time.
+    var tying = joined.group != null or joined.side_of != null;
+    if (tying) member.lock();
+    defer if (tying) member.unlock();
+    if (joined.group) |g| joined.number = try member.nextNumber(r.gpa, g);
+    const main_side: ?*session.Session = if (joined.side_of) |id| registry.acquireLoaded(id) else null;
+    defer if (main_side) |m| session.release(m);
+    if (main_side) |m| if (member.sideOf(m)) |other| return r.fail(.exists, try status.of(r.gpa, m), "session {d} has a side session already ({d})", .{ m.id, other });
     const s = session.Session.start(r.persistent_gpa, .{
         .argv = argv,
         .cols = cols,
@@ -904,6 +1034,9 @@ fn runSession(r: *Request) !void {
         .scrollback = scrollback,
         .record = record,
         .alerts = alerts,
+        .over = if (box) |b| b.over else null,
+        .colors = colors,
+        .member = joined,
     }) catch |err| {
         if (err == error.NameTaken) if (registry.acquireRunningNamed(name)) |namesake| {
             // Started by another request meanwhile.
@@ -913,9 +1046,31 @@ fn runSession(r: *Request) !void {
         };
         return startFailed(r, req, err);
     };
+    if (under) |id| {
+        under = null;
+        const kept = over.started(id, s);
+        events.publish(id, .changed, .initOne(.under));
+        // The session underneath ended while the box started.
+        if (!kept) {
+            over.stopLater(s, .under);
+        } else if (box.?.unseen_ms) |ms| s.armUnseen(ms);
+    }
+    if (main_side) |m| member.tie(m, s);
+    // Not held through the reply, nor through a wait that follows it.
+    if (tying) member.unlock();
+    tying = false;
     // Its screens may have pushed the sessions past the budget.
     registry.trimHistory();
     return started(r, s, req, true);
+}
+
+/// Whether a run request gives `over.backdrop` as null, which leaving it
+/// out does not.
+fn nullBackdrop(value: std.json.Value) bool {
+    const o = value.object.get("over") orelse return false;
+    if (o != .object) return false;
+    const backdrop = o.object.get("backdrop") orelse return false;
+    return backdrop == .null;
 }
 
 /// Reply with the status of the session a run started (or kept), whose
@@ -923,7 +1078,9 @@ fn runSession(r: *Request) !void {
 fn started(r: *Request, s: *session.Session, req: protocol.RunReq, new: bool) !void {
     const until = req.until orelse {
         defer session.release(s);
-        return replyRun(r, s);
+        try replyRun(r, s);
+        if (req.lease == true) r.lease(s);
+        return;
     };
     replyRun(r, s) catch |err| {
         session.release(s);
@@ -1094,7 +1251,9 @@ fn resize(r: *Request) !void {
         }),
         error.OverBudget => {
             var buf: [256]u8 = undefined;
+            s.lockTerminal();
             const asked = limits.sessionFloor(req.cols, req.rows) -| limits.sessionFloor(s.cols, s.rows);
+            s.unlockTerminal();
             return r.fail(.limit, try status.of(r.gpa, s), "cannot resize session {d} to {d}x{d}: {s}", .{ s.id, req.cols, req.rows, budget.describe(&buf, asked) });
         },
         else => return r.failSession(s, err),
@@ -1132,6 +1291,10 @@ fn input(r: *Request) !void {
         .bad => |why| return r.fail(.bad_request, null, "bad input request: {s}", .{why}),
     };
     if (req.require.hidden_input and builtin.os.tag == .windows) return r.fail(.unsupported, null, "require.hidden_input is not supported on Windows", .{});
+    if (req.require.prompt != null) if (batch.promptTextError(req.steps)) |why| {
+        const id = try r.resolve(req.session) orelse return;
+        return r.reply(protocol.InputFailure{ .code = .guard, .err = try std.fmt.allocPrint(r.gpa, "{s}; nothing was typed", .{why}), .status = try registry.statusOf(r.gpa, id), .guard = "prompt" });
+    };
     if (req.until) |until| {
         const timeout_ms = req.timeout_ms orelse return r.fail(.bad_request, null, "bad input request: until needs timeout_ms", .{});
         if (try r.badUntil(until, timeout_ms)) return;
@@ -1162,6 +1325,7 @@ fn input(r: *Request) !void {
             .hidden_input => try std.fmt.allocPrint(r.gpa, "session {d} is not reading hidden input (no password prompt), so this input was not typed", .{s.id}),
             .hit_seq => try std.fmt.allocPrint(r.gpa, "hit {d} is not the latest hit of session {d}; nothing was typed", .{ req.require.hit_seq.?, s.id }),
             .reply_to => try std.fmt.allocPrint(r.gpa, "hit {d} of session {d} was answered already, or is no longer kept; nothing was typed", .{ req.require.reply_to.?, s.id }),
+            .prompt => try std.fmt.allocPrint(r.gpa, "session {d}: {s}; nothing was typed", .{ s.id, out.prompt_why }),
         };
         return r.reply(protocol.InputFailure{ .code = .guard, .err = err, .status = try status.of(r.gpa, s), .guard = @tagName(guard) });
     }
@@ -1200,7 +1364,7 @@ fn recordRequest(r: *Request) !void {
         if (try r.unknownAlert(s, until)) return;
         const shown = start.path orelse "in the session's directory";
         var why: []const u8 = "the system refused to open it";
-        session.startRecording(s, .{ .path = start.path, .format = start.format, .input = start.input, .until = until, .max_ms = start.max_ms, .why = &why }) catch |err| {
+        session.startRecording(s, .{ .path = start.path, .format = start.format, .input = start.input, .passwords = start.passwords orelse false, .until = until, .max_ms = start.max_ms, .why = &why }) catch |err| {
             const st = try status.of(r.gpa, s);
             return switch (err) {
                 error.CantOpenFile => if (start.path != null)
@@ -1424,6 +1588,178 @@ fn ack(r: *Request) !void {
     r.reply(protocol.ResultsResp{ .results = results });
 }
 
+fn update(r: *Request) !void {
+    const req = try r.decode(protocol.UpdateReq) orelse return;
+    // Before the reference: a respawn that holds the lock waits for the
+    // references on the session it replaces.
+    member.lock();
+    defer member.unlock();
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    const old = try s.memberOf(r.gpa);
+    if (req.group != null and old.side_of != null) return r.fail(.bad_request, try status.of(r.gpa, s), "session {d} is a side session, which belongs to the session it is tied to; it takes no group", .{s.id});
+    var m = switch (try member.apply(r.gpa, old, .{ .group = req.group, .label = req.label, .accent = req.accent, .mark = req.mark, .meta = req.meta, .actions = req.actions })) {
+        .ok => |m| m,
+        .bad => |why| return r.fail(.bad_request, try status.of(r.gpa, s), "bad update request: {s}", .{why}),
+    };
+    if (m.group) |g| if (m.number == null) {
+        m.number = try member.nextNumber(r.gpa, g);
+    };
+    try member.set(s, m);
+    try r.replyStatus(s);
+}
+
+/// The side session `s` is, or the running one tied to it.
+fn sideSession(s: *session.Session, m: status.Member) ?*session.Session {
+    if (m.side_of != null) {
+        _ = registry.acquireLoaded(s.id) orelse return null;
+        return s;
+    }
+    return registry.acquireLoaded(member.sideOf(s) orelse return null);
+}
+
+fn side(r: *Request) !void {
+    const req = try r.decode(protocol.SideReq) orelse return;
+    if ((req.view != null) == req.request) return r.fail(.bad_request, null, "bad side request: give view or request, one of them", .{});
+    member.lock();
+    defer member.unlock();
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    const m = try s.memberOf(r.gpa);
+    const found = sideSession(s, m);
+    if (req.request) {
+        if (found) |f| {
+            session.release(f);
+            return r.fail(.bad_request, try status.of(r.gpa, s), "session {d} {s} a side session; set its view instead", .{ s.id, if (m.side_of != null) "is" else "has" });
+        }
+        events.publish(s.id, .side_requested, .{});
+        return r.replyStatus(s);
+    }
+    const sd = found orelse return r.fail(.bad_request, try status.of(r.gpa, s), "session {d} has no side session", .{s.id});
+    defer session.release(sd);
+    var sm = try sd.memberOf(r.gpa);
+    sm.side_view = req.view;
+    try member.set(sd, sm);
+    try r.replyStatus(sd);
+}
+
+fn flag(r: *Request) !void {
+    const req = try r.decode(protocol.FlagReq) orelse return;
+    if ((req.attention != null) == req.clear) return r.fail(.bad_request, null, "bad flag request: give attention or clear, one of them", .{});
+    member.lock();
+    defer member.unlock();
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    var m = try s.memberOf(r.gpa);
+    if (req.attention) |text| {
+        const clean = try status.cleanText(r.gpa, text, member.max_attention);
+        if (clean.len == 0) return r.fail(.bad_request, try status.of(r.gpa, s), "bad flag request: attention must not be empty", .{});
+        m.attention = clean;
+    } else m.attention = null;
+    try member.set(s, m);
+    try r.replyStatus(s);
+}
+
+fn action(r: *Request) !void {
+    const req = try r.decode(protocol.ActionReq) orelse return;
+    if (req.key.len != 1 or req.key[0] < 0x21 or req.key[0] > 0x7e) return r.fail(.bad_request, null, "bad action request: the key must be one printable ASCII character", .{});
+    if (req.value) |v| {
+        if (v.len > events.max_value) return r.fail(.bad_request, null, "bad action request: the value is longer than {d} bytes", .{events.max_value});
+        if (!std.unicode.utf8ValidateSlice(v)) return r.fail(.bad_request, null, "bad action request: the value is not valid UTF-8", .{});
+        for (v) |c| if (c < 0x20 or c == 0x7f) return r.fail(.bad_request, null, "bad action request: the value holds a control character", .{});
+    }
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    events.publishAction(s.id, req.key[0], req.value);
+    try r.replyStatus(s);
+}
+
+fn leaseRequest(r: *Request) !void {
+    const req = try r.decode(protocol.LeaseReq) orelse return;
+    if (builtin.os.tag != .linux) return r.fail(.unsupported, null, "leases are supported on Linux only", .{});
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    if (s.state.load(.acquire) == .exited) return r.fail(.ended, try status.of(r.gpa, s), "session {d} has ended; there is nothing to keep alive", .{s.id});
+    try r.replyStatus(s);
+    r.lease(s);
+}
+
+fn respawn(r: *Request) !void {
+    const req = try r.decode(protocol.RespawnReq) orelse return;
+    for (req.env, 0..) |entry, i| if (hasNul(entry) or std.mem.indexOfScalar(u8, entry, '=') == null) {
+        return r.fail(.bad_request, null, "bad respawn request: env[{d}] must be NAME=value, without NUL bytes", .{i});
+    };
+    const id = try r.resolve(req.session) orelse return;
+    // Read, and the reference dropped, before the start: it removes the
+    // ended session, which waits for every reference on it.
+    const old = try r.acquireId(id) orelse return;
+    var released = false;
+    defer if (!released) session.release(old);
+    if (old.state.load(.acquire) != .exited) return r.fail(.running, try status.of(r.gpa, old), "session {d} is still running; respawn starts an ended session's program again", .{id});
+    const t = try registry.templateOf(r.gpa, id) orelse return r.fail(.no_session, null, "no session with id {d}", .{id});
+    const old_gpa = old.gpa;
+    const seed = try old.screenBytes();
+    defer old_gpa.free(seed);
+    const kept = try old.memberOf(r.gpa);
+    const colors = old.defaultColors();
+    const side_id = member.sideOf(old);
+    session.release(old);
+    released = true;
+    member.lock();
+    defer member.unlock();
+    const s = session.Session.start(r.persistent_gpa, .{
+        .argv = t.argv,
+        .cols = t.cols,
+        .rows = t.rows,
+        .cwd = if (t.cwd.len > 0) t.cwd else null,
+        .name = t.name,
+        .env = req.env,
+        .scrollback = t.scrollback,
+        .alerts = t.alerts,
+        .colors = colors,
+        .member = kept,
+        .seed = seed,
+    }) catch |err| return startFailed(r, .{ .argv = t.argv, .name = t.name, .cwd = t.cwd, .cols = t.cols, .rows = t.rows }, err);
+    defer session.release(s);
+    // An unnamed one is no namesake that the start removed.
+    registry.remove(id) catch {};
+    if (side_id) |sid| if (registry.acquireLoaded(sid)) |sd| {
+        defer session.release(sd);
+        var sm = try sd.memberOf(r.gpa);
+        sm.side_of = s.id;
+        try member.set(sd, sm);
+        member.tie(s, sd);
+    };
+    // A side session that is respawned is tied to its session again.
+    if (kept.side_of) |main_id| if (registry.acquireLoaded(main_id)) |main| {
+        defer session.release(main);
+        if (main.state.load(.acquire) == .running and member.sideOf(main) == null) member.tie(main, s);
+    };
+    registry.trimHistory();
+    return replyRun(r, s);
+}
+
+fn commands(r: *Request) !void {
+    const req = try r.decode(protocol.CommandsReq) orelse return;
+    const last = req.last orelse marks.max_commands;
+    if (last < 1 or last > marks.max_commands) return r.fail(.bad_request, null, "bad commands request: last must be 1..{d}", .{marks.max_commands});
+    const s = try r.acquireSession(req.session) orelse return;
+    defer session.release(s);
+    const kept = blk: {
+        s.lockTerminal();
+        defer s.unlockTerminal();
+        const found = s.marks.last(last);
+        const out = try r.gpa.alloc(marks.Command, found.len);
+        for (found, out) |c, *o| {
+            o.* = c;
+            o.command = try r.gpa.dupe(u8, c.command);
+            o.output = try r.gpa.dupe(u8, c.output);
+        }
+        break :blk out;
+    };
+    r.reply(protocol.CommandsResp{ .commands = kept, .status = try status.of(r.gpa, s) });
+}
+
 fn eventsStream(r: *Request) !void {
     const req = try r.decode(protocol.EventsReq) orelse return;
     if (builtin.os.tag == .windows) return r.fail(.unsupported, null, "events are not supported on Windows", .{});
@@ -1436,6 +1772,7 @@ fn eventsStream(r: *Request) !void {
         return r.fail(.limit, null, "too many open waits and event streams (at most {d})", .{max_streams});
     }
     defer _ = open_streams.fetchSub(1, .acq_rel);
+    r.releaseSlot();
     // The stream keeps only its references.
     const refs = try dupeAll(r.persistent_gpa, given);
     defer freeAll(r.persistent_gpa, refs);
@@ -1472,8 +1809,13 @@ fn attachStream(r: *Request) !void {
         if (req.mode != .write) return r.fail(.bad_request, null, "bad attach request: cols and rows go with mode write", .{});
         if (limits.sizeError(cols, req.rows.?)) |why| return r.fail(.bad_request, null, "invalid size {d}x{d} ({s})", .{ cols, req.rows.?, why });
     }
+    if ((req.history orelse 0) > protocol.max_history_rows) return r.fail(.bad_request, null, "bad attach request: history must be 0 to {d} rows", .{protocol.max_history_rows});
+    if (req.history_from != null and (req.history orelse 0) == 0) return r.fail(.bad_request, null, "bad attach request: history_from goes with a history of 1 or more rows", .{});
     const s = try r.acquireSession(req.session) orelse return;
     defer session.release(s);
+    _ = open_attaches.fetchAdd(1, .acq_rel);
+    defer _ = open_attaches.fetchSub(1, .acq_rel);
+    r.releaseSlot();
     // The stream keeps only its label and the frames that came along.
     var kept = req;
     kept.session = "";

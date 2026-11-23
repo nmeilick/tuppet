@@ -43,11 +43,14 @@ const too_slow_line = "{\"type\":\"end\",\"reason\":\"too_slow\"}\n";
 const shutdown_line = "{\"type\":\"end\",\"reason\":\"shutdown\"}\n";
 
 /// What happened to a session.
-pub const Kind = enum(u8) { started, ended, removed, renamed, changed, seen, hit };
+pub const Kind = enum(u8) { started, ended, removed, renamed, changed, seen, hit, side_requested, side_view, action, command_ended };
 
 /// What a change frame names as changed.
-pub const Field = enum { seq, input, title, cwd, foreground, tty, writer, viewers, bell, notification, size };
+pub const Field = enum { seq, input, title, cwd, foreground, tty, writer, viewers, bell, notification, size, under, over, group, label, meta, actions, attention, side, shell };
 pub const Fields = std.EnumSet(Field);
+
+/// An action's value is at most this long.
+pub const max_value = 256;
 
 const Entry = struct {
     id: u64 = 0,
@@ -55,6 +58,12 @@ const Entry = struct {
     fields: Fields = .empty,
     /// The hit's number, for a hit.
     n: u64 = 0,
+    /// A command's exit code, for command_ended.
+    code: ?i32 = null,
+    /// An action's key and value.
+    key: u8 = 0,
+    value: [max_value]u8 = undefined,
+    value_len: ?u16 = null,
 };
 
 /// Guards the ring, `head`, and `subscribers`. Nobody holds it while
@@ -80,6 +89,23 @@ pub fn publish(id: u64, kind: Kind, fields: Fields) void {
 /// Tell the subscribers about hit `n` of session `id`.
 pub fn publishHit(id: u64, n: u64) void {
     put(.{ .id = id, .kind = .hit, .n = n });
+}
+
+/// Tell the subscribers that a command of session `id` ended with `code`.
+pub fn publishCommandEnded(id: u64, code: ?i32) void {
+    put(.{ .id = id, .kind = .command_ended, .code = code });
+}
+
+/// Tell the subscribers that the person chose action `key` of session
+/// `id`, with `value`, cut to `max_value` bytes.
+pub fn publishAction(id: u64, key: u8, value: ?[]const u8) void {
+    var e: Entry = .{ .id = id, .kind = .action, .key = key };
+    if (value) |v| {
+        const n = @min(v.len, max_value);
+        @memcpy(e.value[0..n], v[0..n]);
+        e.value_len = @intCast(n);
+    }
+    put(e);
 }
 
 fn put(e: Entry) void {
@@ -133,6 +159,10 @@ const Facts = struct {
     cols: u16,
     rows: u16,
     resize_seq: u64,
+    shell: status.Shell,
+    prompt_seq: u64,
+    last_exit: ?i32,
+    paste_mode: bool,
 
     fn of(s: *Session) Facts {
         const hash = std.hash.Wyhash.hash;
@@ -153,6 +183,10 @@ const Facts = struct {
             .cols = s.cols,
             .rows = s.rows,
             .resize_seq = s.resize_seq.load(.acquire),
+            .shell = s.marks.shell,
+            .prompt_seq = s.marks.prompt_seq,
+            .last_exit = s.marks.last_exit,
+            .paste_mode = s.terminal.modes.get(.bracketed_paste),
         };
     }
 
@@ -170,6 +204,7 @@ const Facts = struct {
         f.setPresent(.notification, a.notifications != b.notifications);
         // A resize and its undoing within one frame still count.
         f.setPresent(.size, a.cols != b.cols or a.rows != b.rows or a.resize_seq != b.resize_seq);
+        f.setPresent(.shell, a.shell != b.shell or a.prompt_seq != b.prompt_seq or !std.meta.eql(a.last_exit, b.last_exit) or a.paste_mode != b.paste_mode);
         return f;
     }
 };
@@ -439,6 +474,20 @@ const Subscriber = struct {
                 if (!t.matched) return;
                 sub.flushPending(e.id, t);
                 sub.hitFrame(e.id, e.n);
+            },
+            .side_requested, .side_view, .action, .command_ended => {
+                const t = sub.table.getPtr(e.id) orelse return;
+                if (!t.matched) return;
+                sub.flushPending(e.id, t);
+                const st = sub.statusOf(e.id) orelse return;
+                const a = sub.arena.allocator();
+                const line = switch (e.kind) {
+                    .action => protocol.stringifyAlloc(a, .{ .type = "action", .id = e.id, .key = &[1]u8{e.key}, .value = if (e.value_len) |n| e.value[0..n] else null, .status = st }),
+                    .command_ended => protocol.stringifyAlloc(a, .{ .type = "command-ended", .id = e.id, .code = e.code, .status = st }),
+                    .side_view => protocol.stringifyAlloc(a, .{ .type = "side-view", .id = e.id, .view = st.side_view, .status = st }),
+                    else => protocol.stringifyAlloc(a, .{ .type = "side-requested", .id = e.id, .status = st }),
+                } catch return;
+                sub.sendLine(line);
             },
         }
     }

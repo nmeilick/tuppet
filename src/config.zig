@@ -14,6 +14,19 @@
 //!     [attach]
 //!     bell = false
 //!     detach_key = "^]"
+//!     drawn = true
+//!     alt_screen = false
+//!     pass = "bell,notifications,clipboard,links"
+//!     box_pause = "1s"
+//!     switch_key = "F12"
+//!     menu_key = "Ctrl-]"
+//!     switch_marks = true
+//!
+//!     [side]
+//!     key = "F11"
+//!     sizes = ["compact", "half", "full"]
+//!     layout = "auto"
+//!     rows = 8
 //!
 //!     [png]
 //!     fonts = ["~/fonts/terminus.psf.gz", "default"]
@@ -28,6 +41,94 @@ const builtin = @import("builtin");
 const io_mod = @import("io.zig");
 const alert = @import("alert.zig");
 const fonts = @import("fonts.zig");
+const units = @import("units.zig");
+
+/// How long keys pause before a box opens by itself, by default.
+pub const default_box_pause_ms: u64 = 1000;
+
+/// A key that a drawn attach of a group takes for itself: a character or
+/// a control as the byte it sends, or a function key, F1 to F12, which it
+/// knows in the legacy, xterm, and kitty encodings.
+pub const Key = union(enum) {
+    byte: u8,
+    function: u4,
+
+    /// The key as its configuration names it: "F12", "Ctrl-]", "x".
+    pub fn name(k: Key, buf: []u8) []const u8 {
+        return (switch (k) {
+            .function => |n| std.fmt.bufPrint(buf, "F{d}", .{n}),
+            .byte => |b| if (b == 0x7f)
+                std.fmt.bufPrint(buf, "Ctrl-?", .{})
+            else if (b < 0x20)
+                std.fmt.bufPrint(buf, "Ctrl-{c}", .{b + '@'})
+            else
+                std.fmt.bufPrint(buf, "{c}", .{b}),
+        }) catch "";
+    }
+};
+
+/// F1 to F12, Ctrl-X, or what a detach key takes (^X, <C-x>, one
+/// character); null for anything else.
+pub fn parseKey(spec: []const u8) ?Key {
+    if (spec.len >= 2 and spec.len <= 3 and (spec[0] == 'F' or spec[0] == 'f')) {
+        const n = std.fmt.parseInt(u8, spec[1..], 10) catch return null;
+        return if (n >= 1 and n <= 12) .{ .function = @intCast(n) } else null;
+    }
+    return .{ .byte = parseDetachKey(spec) orelse return null };
+}
+
+/// What the side pane shows of a side session.
+pub const SideView = @import("status.zig").SideView;
+
+/// Where the side pane goes: below the front, beside it, only a strip in
+/// the bar, or the first of these that fits.
+pub const Layout = enum { auto, below, side, strip };
+
+/// `[side]`: the side pane of a drawn attach of a group.
+pub const Side = struct {
+    key: Key = .{ .function = 11 },
+    /// The views the side key steps through, compact first.
+    sizes: []const SideView = &.{ .compact, .half, .full },
+    layout: Layout = .auto,
+    /// The pane below the front: its rows, and the window's rows it needs.
+    rows: u16 = 8,
+    below_min: u16 = 34,
+    /// The pane beside the front: the columns the front keeps, and the
+    /// pane's.
+    front_min: u16 = 100,
+    pane_min: u16 = 44,
+};
+
+/// What a drawn attach passes on from the sessions it shows to the
+/// person's terminal.
+pub const Pass = struct {
+    bell: bool = true,
+    notifications: bool = true,
+    clipboard: bool = true,
+    links: bool = true,
+
+    pub const none: Pass = .{ .bell = false, .notifications = false, .clipboard = false, .links = false };
+};
+
+/// `bell,notifications,clipboard,links` in any order and number, or
+/// `none`; null when it is none of these.
+pub fn parsePass(text: []const u8) ?Pass {
+    if (std.mem.eql(u8, text, "none")) return .none;
+    var pass: Pass = .none;
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " ");
+        inline for (@typeInfo(Pass).@"struct".field_names) |field| {
+            if (std.mem.eql(u8, name, field)) {
+                @field(pass, field) = true;
+                break;
+            }
+        } else return null;
+    }
+    return pass;
+}
+/// `box_pause` is at most this.
+const max_box_pause_ms: u64 = 60 * 1000;
 
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
@@ -38,6 +139,24 @@ pub const Config = struct {
     bell: bool = true,
     /// The byte that detaches, when the file sets one.
     detach_key: ?u8 = null,
+    /// Attach drawn by default: `attach`, `run -a`, and the picker's
+    /// "take control", never the read-only viewer.
+    drawn: bool = false,
+    /// A drawn attach paints on the alternate screen instead of the
+    /// normal one, whose scrollback it otherwise keeps.
+    alt_screen: bool = false,
+    /// What a drawn attach passes on.
+    pass: Pass = .{},
+    /// In a drawn attach, Esc or the detach key sets an open box aside.
+    set_aside: bool = true,
+    /// In a drawn attach, how long keys pause before a box over the
+    /// session opens by itself.
+    box_pause_ms: u64 = default_box_pause_ms,
+    /// In a drawn attach of a group: the key that opens the switcher, and
+    /// whether a dim line in the scrollback marks a switch.
+    switch_key: Key = .{ .function = 12 },
+    switch_marks: bool = true,
+    side: Side = .{},
     /// `[png] fonts`: font list entries, as a font spec's.
     png_fonts: ?[]const []const u8 = null,
     png_font_size: ?u16 = null,
@@ -171,7 +290,7 @@ const Value = union(enum) {
 
 const Field = struct { key: []const u8, value: Value };
 
-const Section = enum { alerts, attach, png, png_presets };
+const Section = enum { alerts, attach, png, png_presets, side };
 
 /// Parse a detach key: ^X (caret notation), <C-x>, or a single
 /// character. Returns the byte the terminal sends for it.
@@ -181,6 +300,8 @@ pub fn parseDetachKey(spec: []const u8) ?u8 {
         controlByte(spec[1])
     else if (spec.len == 5 and std.ascii.startsWithIgnoreCase(spec, "<c-") and spec[4] == '>')
         controlByte(spec[3])
+    else if (spec.len == 6 and std.ascii.startsWithIgnoreCase(spec, "ctrl-"))
+        controlByte(spec[5])
     else if (spec.len == 1) spec[0] else null;
     return if (key == 0x1b) null else key;
 }
@@ -223,7 +344,7 @@ fn parse(config: *Config, name: []const u8, text: []const u8, diag: *Diagnostic)
                 if (!p.eat(']')) break :blk "expected ] after the section name";
                 if (!p.end()) break :blk "unexpected text after the section";
                 const named = std.meta.stringToEnum(Section, key);
-                const found: Section = if (std.mem.eql(u8, key, "png.presets")) .png_presets else if (named != null and named.? != .png_presets) named.? else break :blk try std.fmt.allocPrint(a, "unknown section [{s}] (known: [alerts], [attach], [png], [png.presets])", .{key});
+                const found: Section = if (std.mem.eql(u8, key, "png.presets")) .png_presets else if (named != null and named.? != .png_presets) named.? else break :blk try std.fmt.allocPrint(a, "unknown section [{s}] (known: [alerts], [attach], [side], [png], [png.presets])", .{key});
                 if (seen_sections.contains(found)) break :blk try std.fmt.allocPrint(a, "section [{s}] appears twice", .{key});
                 seen_sections.insert(found);
                 section = found;
@@ -250,10 +371,57 @@ fn parse(config: *Config, name: []const u8, text: []const u8, diag: *Diagnostic)
                     if (value != .boolean) break :blk "bell must be true or false";
                     config.bell = value.boolean;
                 } else if (std.mem.eql(u8, key, "detach_key")) {
+                    if (keys.contains("menu_key")) break :blk "menu_key and detach_key name the same key; give one of them";
                     if (value != .string) break :blk "detach_key needs a quoted string, such as \"^]\"";
                     config.detach_key = parseDetachKey(value.string) orelse
                         break :blk try std.fmt.allocPrint(a, "invalid detach_key '{s}' (use ^X, <C-x>, or one character)", .{value.string});
-                } else break :blk try std.fmt.allocPrint(a, "unknown key '{s}' in [attach] (known: bell, detach_key)", .{key}),
+                } else if (std.mem.eql(u8, key, "drawn")) {
+                    if (value != .boolean) break :blk "drawn must be true or false";
+                    config.drawn = value.boolean;
+                } else if (std.mem.eql(u8, key, "pass")) {
+                    config.pass = (if (value == .string) parsePass(value.string) else null) orelse
+                        break :blk "pass must be a quoted list of bell, notifications, clipboard, and links, or \"none\"";
+                } else if (std.mem.eql(u8, key, "alt_screen")) {
+                    if (value != .boolean) break :blk "alt_screen must be true or false";
+                    config.alt_screen = value.boolean;
+                } else if (std.mem.eql(u8, key, "set_aside")) {
+                    if (value != .boolean) break :blk "set_aside must be true or false";
+                    config.set_aside = value.boolean;
+                } else if (std.mem.eql(u8, key, "box_pause")) {
+                    const ms = if (value == .string) units.parseDuration(value.string, .no_days) else null;
+                    if (ms == null or ms.? > max_box_pause_ms) break :blk "box_pause must be a duration of at most 1m, such as \"1s\" or \"500ms\"";
+                    config.box_pause_ms = ms.?;
+                } else if (std.mem.eql(u8, key, "switch_key")) {
+                    config.switch_key = (if (value == .string) parseKey(value.string) else null) orelse
+                        break :blk "switch_key needs a quoted key: F1 to F12, Ctrl-X, ^X, or one character";
+                } else if (std.mem.eql(u8, key, "menu_key")) {
+                    if (keys.contains("detach_key")) break :blk "menu_key and detach_key name the same key; give one of them";
+                    config.detach_key = (if (value == .string) parseDetachKey(value.string) else null) orelse
+                        break :blk "menu_key needs a quoted key: Ctrl-X, ^X, <C-x>, or one character";
+                } else if (std.mem.eql(u8, key, "switch_marks")) {
+                    if (value != .boolean) break :blk "switch_marks must be true or false";
+                    config.switch_marks = value.boolean;
+                } else break :blk try std.fmt.allocPrint(a, "unknown key '{s}' in [attach] (known: bell, detach_key, menu_key, switch_key, switch_marks, drawn, alt_screen, pass, box_pause, set_aside)", .{key}),
+                .side => if (std.mem.eql(u8, key, "key")) {
+                    config.side.key = (if (value == .string) parseKey(value.string) else null) orelse
+                        break :blk "key needs a quoted key: F1 to F12, Ctrl-X, ^X, or one character";
+                } else if (std.mem.eql(u8, key, "sizes")) {
+                    const bad = "sizes must be a list that starts with \"compact\" and then has \"half\" or \"full\" or both, such as [\"compact\", \"half\", \"full\"]";
+                    if (value != .strings or value.strings.len < 2 or value.strings.len > 3) break :blk bad;
+                    const sizes = try a.alloc(SideView, value.strings.len);
+                    for (value.strings, sizes, 0..) |item, *s, i| {
+                        s.* = std.meta.stringToEnum(SideView, item) orelse break :blk bad;
+                        if ((i == 0) != (s.* == .compact) or (i > 0 and @backingInt(s.*) <= @backingInt(sizes[i - 1]))) break :blk bad;
+                    }
+                    config.side.sizes = sizes;
+                } else if (std.mem.eql(u8, key, "layout")) {
+                    config.side.layout = (if (value == .string) std.meta.stringToEnum(Layout, value.string) else null) orelse
+                        break :blk "layout must be \"auto\", \"below\", \"side\", or \"strip\"";
+                } else if (std.mem.eql(u8, key, "rows") or std.mem.eql(u8, key, "front_min") or std.mem.eql(u8, key, "pane_min")) {
+                    if (value != .integer or value.integer < 1 or value.integer > 1000) break :blk try std.fmt.allocPrint(a, "{s} must be a number from 1 to 1000", .{key});
+                    const n: u16 = @intCast(value.integer);
+                    if (key[0] == 'r') config.side.rows = n else if (key[0] == 'f') config.side.front_min = n else config.side.pane_min = n;
+                } else break :blk try std.fmt.allocPrint(a, "unknown key '{s}' in [side] (known: key, sizes, layout, rows, front_min, pane_min)", .{key}),
                 .png => if (std.mem.eql(u8, key, "fonts")) {
                     const list = try fontList(a, value, "fonts");
                     config.png_fonts = list.ok orelse break :blk list.err;
@@ -481,7 +649,9 @@ const Parser = struct {
                         'u', 'U' => {
                             const n: usize = if (e == 'u') 4 else 8;
                             if (p.i + n > p.text.len) return error.BadEscape;
-                            const cp = std.fmt.parseInt(u21, p.text[p.i..][0..n], 16) catch return error.BadEscape;
+                            const digits = p.text[p.i..][0..n];
+                            for (digits) |d| if (!std.ascii.isHex(d)) return error.BadEscape;
+                            const cp = std.fmt.parseInt(u21, digits, 16) catch return error.BadEscape;
                             p.i += n;
                             var buf: [4]u8 = undefined;
                             const len = std.unicode.utf8Encode(cp, &buf) catch return error.BadEscape;
@@ -503,6 +673,31 @@ fn parsed(text: []const u8, diag: *Diagnostic) !Config {
     return config;
 }
 
+test "the keys and the side pane of a group attach" {
+    var diag: Diagnostic = .{};
+    var config = try parsed(
+        \\[attach]
+        \\switch_key = "F10"
+        \\menu_key = "Ctrl-B"
+        \\[side]
+        \\key = "^G"
+        \\sizes = ["compact", "full"]
+        \\layout = "below"
+        \\rows = 6
+        \\
+    , &diag);
+    defer config.deinit();
+    try std.testing.expectEqual(Key{ .function = 10 }, config.switch_key);
+    try std.testing.expectEqual(@as(?u8, 0x02), config.detach_key);
+    try std.testing.expectEqual(Key{ .byte = 0x07 }, config.side.key);
+    try std.testing.expectEqual(@as(usize, 2), config.side.sizes.len);
+    try std.testing.expectEqual(Layout.below, config.side.layout);
+    try std.testing.expectEqual(@as(u16, 6), config.side.rows);
+    for ([_][]const u8{ "[attach]\nswitch_key = \"F13\"", "[attach]\nmenu_key = \"^]\"\ndetach_key = \"^]\"", "[side]\nsizes = [\"half\", \"full\"]" }) |text| {
+        try std.testing.expectError(error.BadConfig, parsed(text, &diag));
+    }
+}
+
 test "the config file takes alerts and attach settings, and fails with its file and line" {
     var diag: Diagnostic = .{};
     var config = try parsed(
@@ -514,10 +709,14 @@ test "the config file takes alerts and attach settings, and fails with its file 
         \\[attach]
         \\bell = false
         \\detach_key = "<C-a>"
+        \\drawn = true
+        \\box_pause = "250ms"
         \\
     , &diag);
     defer config.deinit();
     try std.testing.expect(!config.bell);
+    try std.testing.expect(config.drawn);
+    try std.testing.expectEqual(@as(u64, 250), config.box_pause_ms);
     try std.testing.expectEqual(@as(?u8, 0x01), config.detach_key);
     try std.testing.expectEqual(@as(usize, 3), config.alerts.len);
     try std.testing.expectEqualStrings("sudo.pw", config.alerts[1].name);
@@ -528,17 +727,20 @@ test "the config file takes alerts and attach settings, and fails with its file 
     const bad = [_]struct { text: []const u8, message: []const u8 }{
         .{ .text = "x = \"y\"", .message = "config.toml:1: 'x' comes before any section" },
         .{ .text = "[alerts]\n\na = x", .message = "config.toml:3: expected a value: a quoted string, a number, true, false, an array, or a table" },
-        .{ .text = "[pager]", .message = "config.toml:1: unknown section [pager] (known: [alerts], [attach], [png], [png.presets])" },
+        .{ .text = "[pager]", .message = "config.toml:1: unknown section [pager] (known: [alerts], [attach], [side], [png], [png.presets])" },
         .{ .text = "[attach]\nbell = \"no\"", .message = "config.toml:2: bell must be true or false" },
         .{ .text = "[attach]\ndetach_key = \"^^^\"", .message = "config.toml:2: invalid detach_key '^^^' (use ^X, <C-x>, or one character)" },
         .{ .text = "[attach]\ndetach_key = \"^[\"", .message = "config.toml:2: invalid detach_key '^[' (use ^X, <C-x>, or one character)" },
-        .{ .text = "[attach]\ntitle = true", .message = "config.toml:2: unknown key 'title' in [attach] (known: bell, detach_key)" },
+        .{ .text = "[attach]\ntitle = true", .message = "config.toml:2: unknown key 'title' in [attach] (known: bell, detach_key, menu_key, switch_key, switch_marks, drawn, alt_screen, pass, box_pause, set_aside)" },
+        .{ .text = "[attach]\nbox_pause = \"2m\"", .message = "config.toml:2: box_pause must be a duration of at most 1m, such as \"1s\" or \"500ms\"" },
         .{ .text = "[alerts]\na = \"x\"\na = \"y\"", .message = "config.toml:3: 'a' is given twice" },
         .{ .text = "[alerts]\na = \"x\" b", .message = "config.toml:2: unexpected text after the value" },
         .{ .text = "[alerts]\na = \"x", .message = "config.toml:2: a quoted string does not end on its line" },
         .{ .text = "[alerts]\nok = true", .message = "config.toml:2: alert 'ok' needs its text as a quoted string" },
         .{ .text = "[alerts]\n-a = \"x\"", .message = "config.toml:2: alert '-a': the alert name must start with a letter or digit" },
         .{ .text = "[alerts]\na = \"\xff\"", .message = "config.toml:2: the line is not valid UTF-8" },
+        .{ .text = "[alerts]\na = \"\\u+0e9\"", .message = "config.toml:2: invalid escape in a quoted string" },
+        .{ .text = "[alerts]\na = \"\\U0000_0e9\"", .message = "config.toml:2: invalid escape in a quoted string" },
     };
     for (bad) |case| {
         var d: Diagnostic = .{};

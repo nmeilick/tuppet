@@ -12,7 +12,7 @@
 //! Sequences are delimited the way a terminal's parser delimits them:
 //! control characters inside a sequence are executed without ending it,
 //! CAN and SUB abort it, ESC starts a new one, and strings (OSC, DCS,
-//! APC, PM, SOS) end with ST or BEL. An aborted sequence has no effect
+//! APC, PM, SOS) end with ST, an OSC also with BEL. An aborted sequence has no effect
 //! on a terminal, so it is dropped, apart from the control characters it
 //! carried; passing it on could join it with what follows a removed
 //! query. Parameters are compared by value, as a terminal reads them:
@@ -32,7 +32,8 @@ const std = @import("std");
 
 /// A sequence that reaches this size unfinished is cut there: anything
 /// but a string is aborted; a string that would be removed is discarded
-/// up to its end, and any other string is passed on. Whether it is
+/// up to its end, and any other string is passed on up to its end, which
+/// becomes ST if ESC starts a new sequence there. Whether it is
 /// removed is decided from what has arrived: APC, DCS queries, OSC color
 /// queries, and kitty clipboard and drag and drop requests always are,
 /// and OSC 52 when it asks for the clipboard.
@@ -52,10 +53,8 @@ pub const Filter = struct {
     pending: std.ArrayList(u8) = .empty,
     /// Where scanning `pending` resumes.
     scanned: usize = 1,
-    /// Discarding an oversized string up to its terminator.
-    discarding: bool = false,
-    /// While discarding: the previous chunk ended in ESC.
-    discard_esc: bool = false,
+    /// Inside a string cut off at `max_pending`, up to its terminator.
+    oversized: ?Oversized = null,
     /// Continuation bytes the current UTF-8 character still needs.
     utf8_left: u2 = 0,
     /// The range the next continuation byte must be in; narrower than
@@ -81,7 +80,7 @@ pub const Filter = struct {
     /// Whether the output so far ends between sequences and characters,
     /// where this terminal can be written to.
     pub fn idle(self: *const Filter) bool {
-        return self.pending.items.len == 0 and !self.discarding and self.utf8_left == 0 and !self.held_c2;
+        return self.pending.items.len == 0 and self.oversized == null and self.utf8_left == 0 and !self.held_c2;
     }
 
     /// Filter the next chunk of session output. The caller frees the
@@ -92,7 +91,7 @@ pub const Filter = struct {
         const decoded = try self.decode(gpa, chunk);
         defer gpa.free(decoded);
         var input: []const u8 = decoded;
-        if (self.discarding) input = input[try self.skipDiscarded(gpa, input)..];
+        if (self.oversized != null) input = input[try self.skipOversized(gpa, &out, input)..];
 
         // Bytes that followed a held sequence once it is resolved.
         var rest: ?[]u8 = null;
@@ -108,8 +107,8 @@ pub const Filter = struct {
 
         var i: usize = 0;
         while (i < input.len) {
-            if (self.discarding) {
-                i += try self.skipDiscarded(gpa, input[i..]);
+            if (self.oversized != null) {
+                i += try self.skipOversized(gpa, &out, input[i..]);
                 continue;
             }
             if (input[i] != 0x1b) {
@@ -144,12 +143,9 @@ pub const Filter = struct {
                 try splitControls(gpa, out, scratch, &clean, seq[0..len]);
                 const body = try ignoredRemoved(scratch, clean.items[2..]);
                 defer scratch.free(body);
-                if (removedString(clean.items[1], body, false)) {
-                    self.discarding = true;
-                    self.discard_esc = false;
-                } else {
-                    try out.appendSlice(gpa, clean.items);
-                }
+                const passed = !removedString(clean.items[1], body, false);
+                if (passed) try out.appendSlice(gpa, clean.items);
+                self.oversized = .{ .intro = clean.items[1], .passed = passed };
                 return len;
             },
             .incomplete => |at| {
@@ -220,35 +216,43 @@ pub const Filter = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    /// Skip the rest of a discarded string. Returns where its terminator
-    /// ends, or `bytes.len` while it continues.
-    fn skipDiscarded(self: *Filter, gpa: std.mem.Allocator, bytes: []const u8) !usize {
-        if (self.discard_esc and bytes.len > 0) {
-            self.discard_esc = false;
-            self.discarding = false;
-            if (bytes[0] == '\\') return 1;
-            // That ESC starts a new sequence.
-            try self.pending.append(gpa, 0x1b);
-            self.scanned = 1;
-            return 0;
-        }
-        for (bytes, 0..) |c, j| switch (c) {
-            0x07, 0x18, 0x1a => {
-                self.discarding = false;
+    /// Discard or pass on the rest of an oversized string. Returns where
+    /// its terminator ends, or `bytes.len` while it continues.
+    fn skipOversized(self: *Filter, gpa: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !usize {
+        const cut = &self.oversized.?;
+        // The ESC that may end the string came at the end of the chunk
+        // before.
+        const esc_before = cut.esc;
+        var j: usize = 0;
+        if (!esc_before) {
+            j = for (bytes, 0..) |c, at| switch (c) {
+                0x07 => if (cut.intro == ']') break at,
+                0x18, 0x1a, 0x1b => break at,
+                else => {},
+            } else bytes.len;
+            if (cut.passed) try appendText(gpa, out, bytes[0..j]);
+            if (j == bytes.len) return j;
+            if (bytes[j] != 0x1b) {
+                // BEL ends an OSC; CAN and SUB abort the string.
+                if (cut.passed) try out.append(gpa, bytes[j]);
+                self.oversized = null;
                 return j + 1;
-            },
-            0x1b => {
-                if (j + 1 == bytes.len) {
-                    self.discard_esc = true;
-                    return bytes.len;
-                }
-                self.discarding = false;
-                // ST ends the string; any other ESC starts a new sequence.
-                return if (bytes[j + 1] == '\\') j + 2 else j;
-            },
-            else => {},
-        };
-        return bytes.len;
+            }
+            j += 1;
+            cut.esc = true;
+        }
+        if (j == bytes.len) return j;
+        const passed = cut.passed;
+        self.oversized = null;
+        // ST ends the string. Any other ESC starts a new sequence, which
+        // ends the string for a terminal too, but may be removed here.
+        if (passed) try out.appendSlice(gpa, "\x1b\\");
+        if (bytes[j] == '\\') return j + 1;
+        // The new sequence is parsed from its ESC, here or held.
+        if (!esc_before) return j - 1;
+        try self.pending.append(gpa, 0x1b);
+        self.scanned = 1;
+        return j;
     }
 };
 
@@ -258,6 +262,15 @@ fn appendText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8)
     var parts = std.mem.splitScalar(u8, text, 0x05);
     while (parts.next()) |part| try out.appendSlice(gpa, part);
 }
+
+const Oversized = struct {
+    /// The string's introducer: only an OSC ends with BEL.
+    intro: u8,
+    /// Whether the string is passed on rather than discarded.
+    passed: bool,
+    /// The previous chunk ended in ESC.
+    esc: bool = false,
+};
 
 const Scan = union(enum) {
     /// The sequence's length.
@@ -310,7 +323,7 @@ fn scan(s: []const u8, from: usize) Scan {
                 }
                 return .{ .aborted = j };
             },
-            0x07 => if (string and j > k) return .{ .complete = j + 1 },
+            0x07 => if (intro == ']' and j > k) return .{ .complete = j + 1 },
             0x00...0x06, 0x08...0x17, 0x19, 0x1c...0x1f, 0x7f => {},
             else => {
                 if (string and j > k) continue;
@@ -332,7 +345,13 @@ fn scan(s: []const u8, from: usize) Scan {
 fn removedString(intro: u8, body: []const u8, complete: bool) bool {
     return switch (intro) {
         '_' => true,
-        'P' => std.mem.startsWith(u8, body, "+q") or std.mem.startsWith(u8, body, "$q"),
+        'P' => {
+            // A terminal reads parameters first and picks the request by
+            // what follows them. Cut off before "+q" or "$q" could be told
+            // apart, it may be one.
+            const rest = std.mem.trimStart(u8, body, "0123456789:;<=>?");
+            return (!complete and rest.len < 2) or std.mem.startsWith(u8, rest, "+q") or std.mem.startsWith(u8, rest, "$q");
+        },
         ']' => if (complete) isOscQuery(body) else oscQueryPrefix(body),
         else => false,
     };
@@ -510,7 +529,7 @@ fn oscQueryPrefix(body: []const u8) bool {
         52 => {
             const rest = body[semi + 1 ..];
             const data = std.mem.indexOfScalar(u8, rest, ';') orelse return true;
-            return std.mem.startsWith(u8, rest[data + 1 ..], "?");
+            return rest.len == data + 1 or rest[data + 1] == '?';
         },
         else => return false,
     }
@@ -658,6 +677,69 @@ test "an oversized string is discarded when removed and passed otherwise" {
         defer gpa.free(split);
         try std.testing.expectEqualStrings(whole, split);
     }
+}
+
+test "a DCS query with parameters before it is removed, and sixel passes" {
+    try expectFiltered(&.{"\x1bP1$qm\x1b\\\x1bP0+q544e\x1b\\\x1bP0;1q#0\x1b\\ok"}, "\x1bP0;1q#0\x1b\\ok");
+}
+
+test "BEL ends only an OSC" {
+    try expectFiltered(&.{"\x1bP\x07$qm\x1b\\\x1bP\x07+q544e\x1b\\\x1b_\x07Gi=1,a=q\x1b\\ok"}, "ok");
+}
+
+test "a clipboard read cut off right before its \"?\" is removed" {
+    const gpa = std.testing.allocator;
+    const padded = try gpa.alloc(u8, max_pending + 4);
+    defer gpa.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..7], "\x1b]52;c;");
+    @memcpy(padded[max_pending..], "?\x07ok");
+    try expectFiltered(&.{padded}, "ok");
+}
+
+test "a DCS query padded with ignored controls past the limit is removed" {
+    const gpa = std.testing.allocator;
+    const padded = try gpa.alloc(u8, max_pending + 7);
+    defer gpa.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..2], "\x1bP");
+    @memcpy(padded[max_pending..], "$qm\x1b\\ok");
+    try expectFiltered(&.{padded}, "ok");
+}
+
+test "an oversized string that is passed on stays open until it ends" {
+    const gpa = std.testing.allocator;
+    var filter: Filter = .{};
+    defer filter.deinit(gpa);
+    const title = try gpa.alloc(u8, max_pending + 10);
+    defer gpa.free(title);
+    @memset(title, 'A');
+    @memcpy(title[0..4], "\x1b]0;");
+    const open = try filter.feed(gpa, title);
+    defer gpa.free(open);
+    try std.testing.expectEqualStrings(title, open);
+    try std.testing.expect(!filter.idle());
+    // A removed query ends the string for the terminal, so ST takes its place.
+    const rest = try filter.feed(gpa, "\x1b[cok");
+    defer gpa.free(rest);
+    try std.testing.expectEqualStrings("\x1b\\ok", rest);
+    try std.testing.expect(filter.idle());
+}
+
+test "a sequence right after an oversized string in the same chunk is parsed" {
+    const gpa = std.testing.allocator;
+    var filter: Filter = .{};
+    defer filter.deinit(gpa);
+    const title = try gpa.alloc(u8, max_pending + 16);
+    defer gpa.free(title);
+    @memset(title, 'A');
+    @memcpy(title[0..4], "\x1b]0;");
+    const tail = "\x1b[1mbold\x1b[c";
+    @memcpy(title[title.len - tail.len ..], tail);
+    const out = try filter.feed(gpa, title);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.endsWith(u8, out, "AAA\x1b\\\x1b[1mbold"));
+    try std.testing.expect(filter.idle());
 }
 
 test "output does not depend on how it is split into chunks" {

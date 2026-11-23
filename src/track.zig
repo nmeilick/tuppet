@@ -130,6 +130,9 @@ pub const RowState = struct {
     hash: u64 = 0,
     /// What plain text shows.
     text_hash: u64 = 0,
+    /// The row's wrap flag at the latest hash. Ghostty can change the flag
+    /// without marking the row dirty, as when an erase skips a blank row.
+    wrap: bool = false,
     change_seq: u64 = 0,
     text_change_seq: u64 = 0,
     /// The last settle that found the row's text gone.
@@ -180,6 +183,13 @@ const ScreenTrack = struct {
         if (abs >= self.top or abs < self.top - @as(i64, @intCast(self.history_len))) return null;
         return &self.history[ringIndex(abs, self.history.len)];
     }
+
+    /// Know no row until a settle tracks the screen anew.
+    fn untrack(self: *ScreenTrack) void {
+        self.generation = null;
+        self.rows.clearRetainingCapacity();
+        self.history_len = 0;
+    }
 };
 
 fn ringIndex(abs: i64, len: usize) usize {
@@ -197,6 +207,9 @@ pub const Snapshot = struct {
     version: u64 = 0,
     /// Text past `snapshot_cap` is missing.
     truncated: bool = false,
+    /// The absolute row the cursor was on, where the input's echo goes;
+    /// null once a reflow lost it.
+    cursor_row: ?i64 = null,
     text: std.ArrayListUnmanaged(u8) = .empty,
     /// Ordered by `top`; lines never overlap.
     lines: std.ArrayListUnmanaged(SnapLine) = .empty,
@@ -360,6 +373,11 @@ pub const Tracker = struct {
     /// epoch bump, and the top row right after it, so a wait can tell
     /// which rows it had not checked and where to go on.
     renumbered: struct { before: i64 = 0, jumped: i64 = 0, after: i64 = 0 } = .{},
+    /// Rows of the primary screen's history numbered below this may have
+    /// the number of another row that was there before: they were in
+    /// history when its numbering jumped, when a resize pulled rows out of
+    /// it, or when the session was restored.
+    numbered_from: i64 = 0,
     snapshot: Snapshot = .{},
     watch: Watch,
 
@@ -403,6 +421,10 @@ pub const Tracker = struct {
         self.pin = try pages.trackPin(bottomLeft(pages));
         self.oldest = try pages.trackPin(pages.getTopLeft(.screen));
         self.markBottom(pages);
+        // The history of a restored screen counts as scrolled into it.
+        const history: i64 = @intCast(self.history_rows);
+        self.screens.getPtr(.primary).top = history;
+        self.numbered_from = history;
         var stamp: Stamp = .{ .counter = seqs, .seq = seq, .now = now };
         for ([_]Key{ .primary, .alternate }) |key| self.settleScreen(t, key, &stamp);
         return self;
@@ -461,6 +483,16 @@ pub const Tracker = struct {
 
     pub fn unsettled(self: *const Tracker) bool {
         return self.unsettled_since != null;
+    }
+
+    /// The number of the primary screen's top row, when the newest row of
+    /// the history Ghostty keeps has the number below it; null when the
+    /// count is lost. Settle first. History that lost rows at its front
+    /// since (a trim for the memory budget) keeps its numbers.
+    pub fn historyTop(self: *const Tracker, t: *const vt.Terminal) ?u64 {
+        const pages = &t.screens.get(.primary).?.pages;
+        if (self.pin == null or self.history_rows < pages.total_rows - pages.rows) return null;
+        return @intCast(@max(0, self.top(.primary)));
     }
 
     /// Record what the terminal shows now. Callers `notify` after
@@ -550,8 +582,10 @@ pub const Tracker = struct {
         const generation = t.screens.generation(key);
         if (st.generation != generation or st.rows.items.len != pages.rows) {
             self.watchGone(st.rows.items);
+            // Neither do the rows in history describe what is there now.
+            st.history_len = 0;
             st.rows.resize(self.gpa, pages.rows) catch {
-                st.generation = null;
+                st.untrack();
                 _ = stamp.get();
                 stamp.text = true;
                 return;
@@ -571,7 +605,7 @@ pub const Tracker = struct {
             const p = it.next() orelse break;
             const page = p.node.page();
             const row = pageRow(p);
-            if (!row.dirty and !page.dirty and rs.hash != 0 and y != cursor_y and y != shown_y) continue;
+            if (!row.dirty and !page.dirty and row.wrap == rs.wrap and rs.hash != 0 and y != cursor_y and y != shown_y) continue;
             row.dirty = false;
             update(rs, hashRow(page, row), stamp);
         }
@@ -638,6 +672,7 @@ pub const Tracker = struct {
         const jumped = self.jumped;
         st.top += @intCast(n);
         self.jumped += @intCast(n);
+        self.numbered_from = st.top;
         st.history_len = 0;
         @memset(st.rows.items, .{});
         self.renumber(before, jumped);
@@ -654,6 +689,9 @@ pub const Tracker = struct {
     /// rows above them scroll `k` rows into history.
     fn keepBelow(self: *Tracker, abs: i64, k: usize) void {
         if (self.snapshot.key != .primary) return;
+        if (self.snapshot.cursor_row) |*row| {
+            if (row.* >= abs) row.* += @intCast(k);
+        }
         for (self.snapshot.lines.items) |*line| {
             if (line.top >= abs) {
                 line.top += @intCast(k);
@@ -665,7 +703,8 @@ pub const Tracker = struct {
 
     /// Hash the rows that scrolled away from the top `h` rows once more:
     /// output may have changed them after the last settle and before they
-    /// left.
+    /// left. So too the rows on the screen that continue their lines,
+    /// which are matched whole as they leave.
     fn settleLeaving(self: *Tracker, st: *ScreenTrack, pages: *PageList, k: usize, h: usize, stamp: *Stamp) void {
         // Rows the scrollback dropped already.
         const gone = @min(k -| (pages.total_rows - pages.rows), h);
@@ -675,11 +714,14 @@ pub const Tracker = struct {
         const start = pages.getTopLeft(.active).up(k - gone) orelse return;
         const shown_y: ?usize = if (self.shown.key == .primary) self.shown.y else null;
         var it = start.rowIterator(.right_down, null);
-        for (st.rows.items[gone..leaving], gone..) |*rs, y| {
+        var wrapped = false;
+        for (st.rows.items[gone..h], gone..) |*rs, y| {
+            if (y >= leaving and !wrapped) break;
             const p = it.next() orelse break;
             const page = p.node.page();
             const row = pageRow(p);
-            if (!row.dirty and !page.dirty and shown_y != y) continue;
+            wrapped = row.wrap;
+            if (!row.dirty and !page.dirty and row.wrap == rs.wrap and shown_y != y) continue;
             row.dirty = false;
             update(rs, hashRow(page, row), stamp);
         }
@@ -749,17 +791,16 @@ pub const Tracker = struct {
         for ([_]Key{ .primary, .alternate }) |key| {
             const st = self.screens.getPtr(key);
             const screen = t.screens.get(key) orelse {
-                st.generation = null;
+                st.untrack();
                 continue;
             };
             const old = if (reflow.layouts.getPtr(key).*) |*layout| layout else {
-                st.generation = null;
-                st.reflow_lost = true;
+                self.loseReflow(key, st);
                 continue;
             };
             // A new screen took the anchor along with the old one.
             if (old.generation != t.screens.generation(key)) {
-                st.generation = null;
+                st.untrack();
                 continue;
             }
             defer screen.pages.untrackPin(old.anchor.?);
@@ -770,22 +811,38 @@ pub const Tracker = struct {
                     std.log.info("cannot keep row changes across a resize: {}", .{err})
                 else
                     std.log.err("cannot keep row changes across a resize: {}", .{err});
-                st.generation = null;
-                st.reflow_lost = true;
+                self.loseReflow(key, st);
                 stamp.text = true;
-                if (self.snapshot.key == key) {
-                    self.snapshot.lines.clearRetainingCapacity();
-                    self.snapshot.truncated = true;
-                }
             };
         }
         // A reflow keeps the top row's number, not those of the rows
         // above it.
         self.renumber(self.screens.get(.primary).top, self.jumped);
-        self.markBottom(&t.screens.get(.primary).?.pages);
+        // One that pulled rows out of history numbers the rows left there
+        // higher than before, and the rows it pulled out scroll back with
+        // numbers of their own.
+        const pages = &t.screens.get(.primary).?.pages;
+        const history = pages.total_rows - pages.rows;
+        if (history < self.history_rows) {
+            const pulled = @min(self.history_rows - history, pages.rows);
+            self.numbered_from = @max(self.numbered_from, self.screens.get(.primary).top + @as(i64, @intCast(pulled)));
+        }
+        self.markBottom(pages);
         self.shown = shownOf(t);
         self.finish(&stamp, now);
         return stamp.seq;
+    }
+
+    /// A reflow could not carry the rows of the screen `key` over: the
+    /// rows tracked anew at the next settle count as reflowed, and the
+    /// input snapshot no longer knows where its lines are.
+    fn loseReflow(self: *Tracker, key: Key, st: *ScreenTrack) void {
+        st.untrack();
+        st.reflow_lost = true;
+        if (self.snapshot.key != key) return;
+        self.snapshot.lines.clearRetainingCapacity();
+        self.snapshot.truncated = true;
+        self.snapshot.cursor_row = null;
     }
 
     fn remap(self: *Tracker, key: Key, st: *ScreenTrack, pages: *PageList, old: *Layout, stamp: *Stamp) !void {
@@ -835,6 +892,7 @@ pub const Tracker = struct {
             const h = hashRow(page, row);
             state.hash = h.full;
             state.text_hash = h.text;
+            state.wrap = h.wrap;
             state.reflowed = true;
             if (state.text_change_seq == stamp.seq and h.text == blank_text) state.blank_seq = stamp.seq.?;
         }
@@ -852,6 +910,8 @@ pub const Tracker = struct {
 
         const snap = &self.snapshot;
         if (snap.key != key or snap.generation != old.generation) return;
+        const cursor_row = snap.cursor_row;
+        snap.cursor_row = null;
         var kept: usize = 0;
         for (snap.lines.items) |line| {
             const index = line.top - old.top;
@@ -861,12 +921,15 @@ pub const Tracker = struct {
                 snap.displace(gpa, line);
                 continue;
             };
+            const held_cursor = if (cursor_row) |row| row >= line.top and row < line.top + line.rows else false;
             const ol = old.lines.items[oi];
             const nl = new.lines.items[ni];
             const offset = (@as(usize, @intCast(index)) - ol.first) * old.cols / new.cols;
             var moved = line;
-            moved.top = new.top + @as(i64, @intCast(nl.first + @min(offset, nl.rows - 1)));
-            moved.rows = @intCast(@max(1, std.math.divCeil(usize, line.rows * old.cols, new.cols) catch 1));
+            const row = @min(offset, nl.rows - 1);
+            moved.top = new.top + @as(i64, @intCast(nl.first + row));
+            const rows_ = std.math.divCeil(usize, line.rows * old.cols, new.cols) catch 1;
+            moved.rows = @intCast(std.math.clamp(rows_, 1, nl.rows - row));
             // Lines joined since the input share rows now; they must not overlap.
             if (kept > 0) {
                 const prev = &snap.lines.items[kept - 1];
@@ -876,6 +939,7 @@ pub const Tracker = struct {
                 }
                 prev.rows = @intCast(@min(prev.rows, moved.top - prev.top));
             }
+            if (held_cursor) snap.cursor_row = moved.top;
             snap.lines.items[kept] = moved;
             kept += 1;
         }
@@ -1020,6 +1084,9 @@ pub const Tracker = struct {
     fn watchLine(self: *Tracker, key: Key, line: Line, line_rows: []RowState, m: alert.Mask, stamp: *Stamp, later: bool) void {
         const w = &self.watch;
         const first = &line_rows[0];
+        // Rows that were first rows of lines until a wrap joined them on
+        // bring what those lines showed along.
+        for (line_rows[1..]) |rs| join(first, rs.alerts, rs.rearm, rs.alert_seq);
         const due = m & first.rearm & ~(first.alerts & first.rearm);
         var fresh = due;
         if (due != 0 and first.reflowed and stamp.now < w.held_until) {
@@ -1055,17 +1122,31 @@ pub const Tracker = struct {
         defer self.fireHeld(key, st, stamp);
         var it = LineIterator.init(pages.getTopLeft(.active));
         // A line right after one that changed may start where a wrap went
-        // away.
+        // away. If its rows did not change, the line above showed its text
+        // until now: `above` is that line's first row before this settle,
+        // and `above_shows` the alerts that line shows now.
         var after_change = false;
+        var above: RowState = .{};
+        var above_shows: alert.Mask = 0;
         while (it.next()) |line| {
             if (line.y + line.rows > st.rows.items.len) break;
             const line_rows = st.rows.items[line.y..][0..line.rows];
+            const first = &line_rows[0];
             const changed = all or changedAt(line_rows, seq.?);
+            const before = first.*;
             if (changed or after_change) if (self.lineMask(line, line_rows, pages.cols, if (all) null else seq)) |m| {
+                if (!changed) {
+                    // What it shows counts as seen, and what was due on
+                    // the line above and left it stays due here.
+                    const new = m & ~first.alerts;
+                    join(first, new, ~new | (new & above.alerts & above.rearm & ~above_shows), above.alert_seq);
+                }
                 self.watchLine(key, line, line_rows, m, stamp, true);
             };
-            self.watch.count(line_rows[0].alerts);
+            self.watch.count(first.alerts);
             after_change = changed;
+            above = before;
+            above_shows = first.alerts;
         }
     }
 
@@ -1107,15 +1188,19 @@ pub const Tracker = struct {
         const history = pages.total_rows - pages.rows;
         const gone = @min(k -| history, h);
         const leaving = @min(k, h);
-        const n = st.rows.items.len;
         self.watchGone(st.rows.items[0..gone]);
         self.watch.showing = @splat(0);
+        // The rows above this belong to lines that leave from the screen.
+        var matched = gone;
         if (gone < leaving) if (pages.getTopLeft(.active).up(k - gone)) |start| {
             var it = LineIterator.init(start);
             while (it.next()) |line| {
                 const y = gone + line.y;
                 if (y >= leaving) break;
-                const line_rows = st.rows.items[y..@min(y + line.rows, n)];
+                matched = y + line.rows;
+                // Rows from `h` on are no longer the ones `st.rows` has
+                // there: those below a scroll region stayed.
+                const line_rows = st.rows.items[y..@min(y + line.rows, h)];
                 if (stamp.seq) |seq| if (changedAt(line_rows, seq)) if (self.lineText(line)) |text| {
                     self.watchLine(.primary, line, line_rows, self.watch.set.mask(text), stamp, false);
                 };
@@ -1130,7 +1215,7 @@ pub const Tracker = struct {
         if (k <= h) return;
         // The rows that scrolled past between two settles that the
         // history still has.
-        const from = @max(h, k -| history);
+        const from = @max(h, k -| history, matched);
         if (from >= k) return;
         const start = pages.getTopLeft(.active).up(k - from) orelse return;
         var it = LineIterator.init(start);
@@ -1360,6 +1445,7 @@ pub const Tracker = struct {
         snap.seq = seq;
         snap.version +%= 1;
         snap.truncated = false;
+        snap.cursor_row = st.top + @as(i64, @intCast(t.screens.active.cursor.y));
         var it = LineIterator.init(t.screens.active.pages.getTopLeft(.active));
         while (it.next()) |line| {
             const start = snap.text.items.len;
@@ -1452,6 +1538,17 @@ fn changedAt(rows: []const RowState, seq: u64) bool {
     return false;
 }
 
+/// Fold into the first row of a line the alert state of text it took
+/// over: the alerts that text showed, their `rearm` bits, and `seq`, the
+/// settle at which one became due there. An alert still due on either
+/// side stays due; one seen on either side otherwise stays seen.
+fn join(first: *RowState, alerts: alert.Mask, rearm: alert.Mask, seq: u64) void {
+    const due = alerts & rearm;
+    first.rearm = (first.rearm & rearm) | (first.alerts & first.rearm) | due;
+    first.alerts |= alerts;
+    if (due != 0) first.alert_seq = @max(first.alert_seq, seq);
+}
+
 /// The row of old screen row `y` once the screen scrolled `k` rows, as
 /// hits count rows.
 fn rowNumber(y: usize, k: usize) i64 {
@@ -1459,6 +1556,7 @@ fn rowNumber(y: usize, k: usize) i64 {
 }
 
 fn update(rs: *RowState, h: Hashes, stamp: *Stamp) void {
+    rs.wrap = h.wrap;
     if (h.full == rs.hash) return;
     const seq = stamp.get();
     rs.change_seq = seq;
@@ -1693,7 +1791,7 @@ const TextHash = struct {
 
 const blank_text: u64 = (TextHash{}).finish();
 
-const Hashes = struct { full: u64, text: u64 };
+const Hashes = struct { full: u64, text: u64, wrap: bool };
 
 /// Both hashes of a row. Cells that show nothing at its end are left out.
 fn hashRow(page: *const Page, row: *Row) Hashes {
@@ -1726,7 +1824,7 @@ fn hashCells(comptime plain: bool, page: *const Page, cells: []const Cell, wrap:
         }
         feedCell(page, cell, &text);
     }
-    return .{ .full = full.final(), .text = text.finish() };
+    return .{ .full = full.final(), .text = text.finish(), .wrap = wrap };
 }
 
 /// The link's URI and explicit id; implicit ids are counters that differ
@@ -2365,4 +2463,108 @@ test "matching only the rows that changed finds what matching whole lines finds"
         _ = f.feed(out.items);
         try expectLineAlerts(f);
     }
+}
+
+test "a wrapped line whose end gains an alert as its first rows scroll away fires once" {
+    const f = try Fixture.create(10, 4, 10_000);
+    defer f.destroy();
+    _ = try f.tracker.addAlert(&f.term, .{ .name = "ask", .match = "ASK" });
+    _ = f.feed("a\r\nb\r\n0123456789xy");
+    try std.testing.expectEqual(@as(usize, 0), try takeHitCount(f));
+    _ = f.feed("ASK\r\n1\r\n2\r\n3");
+    try std.testing.expectEqual(@as(usize, 1), try takeHitCount(f));
+}
+
+test "a wrapped line that starts on the bottom row and scrolls past fires once" {
+    const f = try Fixture.create(10, 4, 10_000);
+    defer f.destroy();
+    _ = try f.tracker.addAlert(&f.term, .{ .name = "ask", .match = "ASK" });
+    _ = f.feed("a\r\nb\r\nc\r\n");
+    _ = f.feed("0123456789abcdefghijASK\r\n1\r\n2\r\n3");
+    try std.testing.expectEqual(@as(usize, 1), try takeHitCount(f));
+}
+
+test "a line that wraps past a scroll region leaves the alerts of the fixed footer alone" {
+    const f = try Fixture.create(10, 5, 10_000);
+    defer f.destroy();
+    _ = try f.tracker.addAlert(&f.term, .{ .name = "ask", .match = "ASK" });
+    _ = f.feed("\x1b[5;1HASK\x1b[1;4r\x1b[1;1H");
+    try std.testing.expectEqual(@as(usize, 1), try takeHitCount(f));
+    _ = f.feed("0123456789012345678901234567890123");
+    // The line wraps at the region's bottom row, which scrolls it.
+    _ = f.feed("\x1b[1;1HX\x1b[4;5H0123456789");
+    try std.testing.expectEqual(@as(usize, 0), try takeHitCount(f));
+}
+
+test "a soft wrap that breaks or forms next to an unchanged row fires nothing" {
+    const f = try Fixture.create(10, 4, 10_000);
+    defer f.destroy();
+    _ = try f.tracker.addAlert(&f.term, .{ .name = "ask", .match = "ASK" });
+    _ = f.feed("0123456789ASK");
+    try std.testing.expectEqual(@as(usize, 1), try takeHitCount(f));
+    // An erase ends the first row's wrap; the second row stays.
+    _ = f.feed("\x1b[1;1H\x1b[K");
+    try std.testing.expectEqual(@as(usize, 0), try takeHitCount(f));
+    try expectLineAlerts(f);
+    // The first row fills up and wraps onto it again, with the same text.
+    _ = f.feed("0123456789A");
+    try std.testing.expectEqual(@as(usize, 0), try takeHitCount(f));
+    try expectLineAlerts(f);
+}
+
+test "the input's row in a fixed footer keeps its number while the region above scrolls" {
+    const f = try Fixture.create(20, 5, 10_000);
+    defer f.destroy();
+    _ = f.feed("x\r\ny\r\nz\r\n\x1b[1;4r\x1b[5;1H$ ");
+    _ = f.tracker.takeInput(&f.term, 0);
+    _ = f.feed("\x1b[4;1Ha\r\nb\r\nc\r\n\x1b[5;3H");
+    try std.testing.expectEqual(@as(i64, 3), f.tracker.top(.primary));
+    try std.testing.expectEqual(@as(?i64, f.tracker.top(.primary) + 4), f.tracker.snapshot.cursor_row);
+}
+
+test "a narrower screen keeps the input's last line to the rows it has" {
+    const f = try Fixture.create(20, 4, 10_000);
+    defer f.destroy();
+    _ = f.feed("a\r\nb\r\nc\r\n$ ");
+    _ = f.tracker.takeInput(&f.term, 0);
+    try f.resize(10, 4);
+    _ = f.feed("x\r\nnew");
+    try std.testing.expectEqual(@as(usize, 0), f.tracker.snapshotLines(&f.term, .primary, 3, 1).len);
+}
+
+test "a resize the tracker could not follow forgets the rows and the input snapshot" {
+    const f = try Fixture.create(10, 4, 10_000);
+    defer f.destroy();
+    _ = f.feed("a\r\nb\r\nc\r\nd\r\ne\r\n$ ");
+    const top = f.tracker.top(.primary);
+    try std.testing.expect(f.tracker.rowAt(.primary, top - 1) != null);
+    // The screen changed size behind the tracker's back: the reflow
+    // finds it untracked.
+    try f.term.resize(std.testing.allocator, .{ .cols = 10, .rows = 6 });
+    _ = f.tracker.takeInput(&f.term, 0);
+    try f.resize(5, 6);
+    try std.testing.expectEqual(@as(?RowState, null), f.tracker.rowAt(.primary, top));
+    try std.testing.expectEqual(@as(?RowState, null), f.tracker.rowAt(.primary, top - 1));
+    try std.testing.expect(f.tracker.snapshot.truncated);
+    try std.testing.expectEqual(@as(usize, 0), f.tracker.snapshotLines(&f.term, .primary, 0, 6).len);
+    _ = f.feed("x");
+    try std.testing.expectEqual(@as(?RowState, null), f.tracker.rowAt(.primary, top - 1));
+    try f.expectConsistent();
+}
+
+test "a combining mark on a row the cursor left before the settle is seen" {
+    const f = try Fixture.create(20, 4, 10_000);
+    defer f.destroy();
+    // Ghostty marks the row dirty as the cursor leaves it, or as it
+    // scrolls up from under the cursor.
+    _ = f.feed("e\r\n\r\n");
+    var before = f.tracker.seq.raw;
+    var seq = f.feed("\x1b[1;2H\xcc\x81\x1b[4;1H");
+    try std.testing.expect(seq > before);
+    try std.testing.expectEqual(seq, f.row(0).text_change_seq);
+    _ = f.feed("e");
+    before = f.tracker.seq.raw;
+    seq = f.feed("\xcc\x81\r\n");
+    try std.testing.expect(seq > before);
+    try std.testing.expectEqual(seq, f.row(2).text_change_seq);
 }
