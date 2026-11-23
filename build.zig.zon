@@ -1,6 +1,6 @@
 .{
     .name = .tuppet,
-    .version = "0.4.0",
+    .version = "0.4.1",
     .minimum_zig_version = "0.17.1",
     .fingerprint = 0x606f63c02a5621a1,
     .dependencies = .{

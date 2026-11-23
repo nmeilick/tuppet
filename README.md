@@ -916,7 +916,7 @@ checkout's location.
 GitHub Actions runs on Ubuntu 24.04, pinned rather than `ubuntu-latest` so that a new runner image cannot change the
 build unannounced. It runs `make check` on each push to `main` and each pull request, builds and tests the lean and
 full builds, cross-compiles all three for every target, and checks with `test/static.sh` that each binary is
-self-contained. To release, set `.version` in `build.zig.zon` and push a matching tag such as `v0.4.0`: the release
+self-contained. To release, set `.version` in `build.zig.zon` and push a matching tag such as `v0.4.1`: the release
 workflow then runs the tests, builds the 18 archives with `make dist`, and publishes them with `SHA256SUMS` on the
 tag's GitHub release.
 
